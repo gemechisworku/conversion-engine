@@ -1,0 +1,53 @@
+# Copy to baseline.yaml and edit. Do not commit secrets.
+
+experiment_name: retail_dev_baseline_v1
+domain: retail
+task_split_name: base # or course-specific split name once registered in tau2
+
+# Paths are relative to this file's directory (harness/config/).
+tau2_root: ../../tau2-bench
+# Staff dev slice: JSON array of task id strings
+dev_task_ids_path: ../splits/dev_task_ids.json
+
+num_trials: 5
+# Use 1 with OpenRouter :free tiers; higher values multiply concurrent LLM calls and 429s.
+max_concurrency: 1
+
+# Retries when a run hits HTTP 429 / rate-limit (see README).
+openrouter_rate_limit_attempts: 12
+openrouter_rate_limit_backoff_base_seconds: 2.0
+openrouter_rate_limit_backoff_max_seconds: 120.0
+max_steps: 200
+max_errors: 10
+evaluation_type: all
+# NL judge for tasks with NL_ASSERTION in reward_basis (retail). Overrides tau2 default GPT.
+nl_assertions_llm: openrouter/REPLACE_ME_SMALL_OR_SAME_AS_AGENT
+nl_assertions_llm_args:
+  temperature: 0.0
+# Alternative (no NL LLM; scores differ from full benchmark): evaluation_type: all_ignore_basis
+
+agent_implementation: llm_agent
+user_implementation: user_simulator
+
+# LiteLLM model ids — replace with course-pinned OpenRouter strings
+agent_llm: openrouter/REPLACE_ME_QWEN_OR_DEEPSEEK
+user_llm: openrouter/REPLACE_ME_QWEN_OR_DEEPSEEK
+
+agent_llm_args:
+  temperature: 0.0
+user_llm_args:
+  temperature: 0.0
+
+# Artifacts (repo-root outputs/ when using ../../outputs from harness/config/)
+output_dir: ../../outputs
+trace_log_filename: trace_log.jsonl
+score_log_filename: score_log.json
+
+# Langfuse (optional): set keys in .env; enable sink in harness when implemented
+langfuse:
+  enabled: false
+  # public_key: ${LANGFUSE_PUBLIC_KEY}
+  # host: https://cloud.langfuse.com
+
+# Reproducibility metadata (harness fills git_sha at run time)
+notes: "Act I baseline — pinned dev-tier models"

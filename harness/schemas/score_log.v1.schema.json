@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local/harness/score_log.v1.schema.json",
+  "title": "harness_score_log_v1",
+  "type": "object",
+  "required": ["schema_version", "experiments"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0"
+    },
+    "experiments": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/experiment" }
+    }
+  },
+  "$defs": {
+    "experiment": {
+      "type": "object",
+      "required": [
+        "id",
+        "created_at",
+        "domain",
+        "task_ids_source",
+        "n_tasks",
+        "num_trials_per_task",
+        "n_simulations",
+        "mean_success",
+        "ci95",
+        "cost_usd",
+        "wall_time_seconds"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "description": "Stable slug, e.g. retail_dev_5trials_v1" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "description": { "type": "string" },
+        "domain": { "type": "string" },
+        "tau2_bench_git_sha": { "type": "string" },
+        "harness_git_sha": { "type": "string" },
+        "config": { "type": "object", "description": "Frozen copy or path+hash of baseline.yaml" },
+        "task_ids_source": {
+          "type": "string",
+          "description": "e.g. splits/dev_task_ids.json"
+        },
+        "task_ids": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Optional: omit if ids must stay private"
+        },
+        "n_tasks": { "type": "integer", "minimum": 1 },
+        "num_trials_per_task": { "type": "integer", "minimum": 1 },
+        "n_simulations": { "type": "integer", "minimum": 1 },
+        "success_definition": { "type": "string" },
+        "mean_success": { "type": "number", "minimum": 0, "maximum": 1 },
+        "ci95": {
+          "type": "object",
+          "required": ["low", "high", "method"],
+          "properties": {
+            "low": { "type": "number" },
+            "high": { "type": "number" },
+            "method": { "type": "string", "enum": ["bootstrap", "wilson", "normal_approx"] },
+            "bootstrap_B": { "type": "integer" },
+            "bootstrap_seed": { "type": "integer" }
+          }
+        },
+        "cost_usd": {
+          "type": "object",
+          "required": ["mean_per_simulation", "definition"],
+          "properties": {
+            "definition": {
+              "type": "string",
+              "description": "e.g. agent_plus_user_from_simulation_run"
+            },
+            "mean_per_simulation": { "type": "number" },
+            "p50_per_simulation": { "type": "number" },
+            "p95_per_simulation": { "type": "number" },
+            "total": { "type": "number" }
+          }
+        },
+        "wall_time_seconds": {
+          "type": "object",
+          "properties": {
+            "p50_per_simulation": { "type": "number" },
+            "p95_per_simulation": { "type": "number" },
+            "total_batch": { "type": "number" }
+          }
+        },
+        "reference": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" },
+            "published_mean": { "type": "number" },
+            "delta_vs_published": { "type": "number" },
+            "citation_url": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}

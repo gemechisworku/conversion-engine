@@ -1,0 +1,44 @@
+# Local baseline — edit models and Langfuse; paths relative to harness/config/
+
+experiment_name: retail_dev_baseline_v1
+domain: retail
+task_split_name: base
+
+tau2_root: ../../tau2-bench
+dev_task_ids_path: ../splits/dev_task_ids.json
+
+num_trials: 5
+# Use 1 for OpenRouter :free models (each sim hits agent + user LLMs; concurrency multiplies 429s).
+max_concurrency: 1
+max_steps: 200
+max_errors: 10
+evaluation_type: all
+# NL-assertion judge (retail tasks include NL_ASSERTION). Default τ-bench model is OpenAI GPT;
+# set this to your OpenRouter slug so you do not need OPENAI_API_KEY.
+nl_assertions_llm: openrouter/deepseek/deepseek-chat-v3-0324
+nl_assertions_llm_args:
+  temperature: 0.0
+
+openrouter_rate_limit_attempts: 12
+openrouter_rate_limit_backoff_base_seconds: 2.0
+openrouter_rate_limit_backoff_max_seconds: 120.0
+
+agent_implementation: llm_agent
+user_implementation: user_simulator
+
+agent_llm: openrouter/qwen/qwen3-coder-plus
+user_llm: openrouter/qwen/qwen3-coder-plus
+
+agent_llm_args:
+  temperature: 0.0
+user_llm_args:
+  temperature: 0.0
+
+output_dir: ../../outputs
+trace_log_filename: trace_log.jsonl
+score_log_filename: score_log.json
+
+langfuse:
+  enabled: true
+
+notes: "Act I baseline — pinned dev-tier models"

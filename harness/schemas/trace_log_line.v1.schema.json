@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local/harness/trace_log_line.v1.schema.json",
+  "title": "harness_trace_log_line_v1",
+  "type": "object",
+  "required": ["schema_version", "run_id", "recorded_at", "domain", "task_id", "trial_index", "simulation"],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0.0" },
+    "run_id": { "type": "string", "format": "uuid" },
+    "recorded_at": { "type": "string", "format": "date-time" },
+    "experiment_id": { "type": "string" },
+    "domain": { "type": "string" },
+    "task_id": { "type": "string" },
+    "trial_index": { "type": "integer", "minimum": 0 },
+    "tau2_bench_git_sha": { "type": "string" },
+    "harness_git_sha": { "type": "string" },
+    "models": {
+      "type": "object",
+      "properties": {
+        "agent_llm": { "type": "string" },
+        "user_llm": { "type": "string" }
+      }
+    },
+    "wall_time_seconds": { "type": "number" },
+    "langfuse_trace_id": { "type": "string" },
+    "simulation": {
+      "type": "object",
+      "description": "tau2 SimulationRun.model_dump() compatible JSON; may be large"
+    }
+  }
+}

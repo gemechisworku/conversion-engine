@@ -1,0 +1,25 @@
+# Act I baseline (≤400 words)
+
+## What was reproduced
+
+- **Benchmark:** τ-bench retail (`tau2-bench` @ {{ tau2_sha }}).
+- **Models:** agent `{{ agent_llm }}`; user `{{ user_llm }}`.
+- **Slice:** {{ n_tasks }} dev tasks × {{ num_trials }} trials ({{ n_simulations }} simulations).
+- **Success:** {{ success_definition }}.
+
+## Score and uncertainty
+
+- **Mean success:** {{ mean_success }} (95% CI {{ ci_low }}–{{ ci_high }}, {{ ci_method }}{% if bootstrap_B is defined %}, B={{ bootstrap_B }}, seed={{ bootstrap_seed }}{% endif %}).
+
+## Cost and latency
+
+- **Cost per simulation ({{ cost_definition }}):** mean ${{ cost_mean }}; p50 ${{ cost_p50 }}; p95 ${{ cost_p95 }}.
+- **Wall time per simulation:** p50 {{ wall_p50_s }}s; p95 {{ wall_p95_s }}s.
+
+## Reference comparison (soft target)
+
+- **Published reference:** {{ reference_note }}.
+
+## Unexpected behavior
+
+{{ anomalies }}

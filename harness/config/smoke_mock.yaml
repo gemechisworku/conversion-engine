@@ -1,0 +1,32 @@
+# Tiny harness self-test (mock domain, dummy user — no LLM cost).
+experiment_name: harness_smoke_mock
+domain: mock
+task_split_name: base
+tau2_root: ../../tau2-bench
+dev_task_ids_path: ../splits/smoke_mock_task_ids.json
+
+num_trials: 1
+max_concurrency: 1
+max_steps: 50
+max_errors: 10
+evaluation_type: all
+
+agent_implementation: llm_agent
+user_implementation: user_simulator
+
+agent_llm: gpt-4.1-mini
+user_llm: gpt-4.1-mini
+
+agent_llm_args:
+  temperature: 0.0
+user_llm_args:
+  temperature: 0.0
+
+output_dir: ../../outputs
+trace_log_filename: smoke_mock_trace.jsonl
+score_log_filename: smoke_mock_score.json
+
+langfuse:
+  enabled: false
+
+notes: "Harness wiring smoke (mock domain)"
