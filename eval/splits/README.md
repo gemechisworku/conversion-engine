@@ -10,7 +10,8 @@
 
 - JSON array of **20** string task IDs for the sealed held-out slice.
 - Per assignment: task **content** may remain undisclosed until Act IV; this repo should store **IDs only** if that is the rule.
-- Harness should support loading this file for **future** scoring without mixing ids into `trace_log.jsonl` for held-out until authorized.
+- Harness: set **`heldout_task_ids_path`** in `baseline.yaml`, then `harness run --mode heldout_prepare` (manifest + checks) and, when authorized, `HARNESS_HELDOUT_RUN=1` with `--mode heldout_run`. Trace shape is controlled by **`heldout_trace_policy`**.
+- **`heldout_task_ids.example.json`** — curriculum-shaped **example** (20 ids) disjoint from the bundled **`dev_task_ids.json`**; replace with staff ids for real scoring.
 
 ## Registering a τ-bench split (optional)
 

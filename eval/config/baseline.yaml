@@ -6,6 +6,8 @@ task_split_name: base
 
 tau2_root: ../../tau2-bench
 dev_task_ids_path: ../splits/dev_task_ids.json
+heldout_task_ids_path: ../splits/heldout_task_ids.example.json
+heldout_trace_policy: full
 
 num_trials: 5
 # Use 1 for OpenRouter :free models (each sim hits agent + user LLMs; concurrency multiplies 429s).
@@ -36,6 +38,9 @@ user_llm_args:
 
 output_dir: ../../outputs
 trace_log_filename: trace_log.jsonl
+trace_summary_log_enabled: true
+trace_summary_log_filename: trace_log_summary.jsonl
+trace_summary_max_instruction_chars: 500
 score_log_filename: score_log.json
 
 langfuse:

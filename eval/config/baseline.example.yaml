@@ -8,6 +8,10 @@ task_split_name: base # or course-specific split name once registered in tau2
 tau2_root: ../../tau2-bench
 # Staff dev slice: JSON array of task id strings
 dev_task_ids_path: ../splits/dev_task_ids.json
+# Optional: sealed held-out ids (see splits/README.md). Example file is disjoint from dev example.
+# heldout_task_ids_path: ../splits/heldout_task_ids.example.json
+# heldout_trace_policy: full   # full | metadata_only | none — applies only to held-out runs
+# expected_heldout_count: 20
 
 num_trials: 5
 # Use 1 with OpenRouter :free tiers; higher values multiply concurrent LLM calls and 429s.
@@ -41,7 +45,14 @@ user_llm_args:
 # Artifacts (repo-root outputs/ when using ../../outputs from harness/config/)
 output_dir: ../../outputs
 trace_log_filename: trace_log.jsonl
+# Short flat JSONL; appended after each task×trial (same moment as trace_log.jsonl).
+trace_summary_log_enabled: true
+trace_summary_log_filename: trace_log_summary.jsonl
+trace_summary_max_instruction_chars: 500
 score_log_filename: score_log.json
+# compact = same truncated simulation JSON as Langfuse output; full = full SimulationRun per line
+trace_simulation_payload: compact
+trace_export_max_chars: 120000
 
 # Langfuse (optional): set keys in .env; enable sink in harness when implemented
 langfuse:

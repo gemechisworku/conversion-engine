@@ -87,6 +87,27 @@ def doctor(
         console.print("OPENROUTER_API_KEY: [yellow]unset[/yellow] (required for OpenRouter models)")
 
     _openrouter_only_env_hints(settings)
+    if settings.heldout_task_ids_path is not None:
+        hp = settings.heldout_task_ids_path
+        if hp.is_file():
+            from harness.split_checks import assert_disjoint_or_raise
+
+            hid = load_task_id_list(hp)
+            console.print(f"heldout_task_ids: [green]{len(hid)}[/green] ({hp.name})")
+            if len(hid) != settings.expected_heldout_count:
+                console.print(
+                    f"[yellow]held-out count {len(hid)} != expected_heldout_count "
+                    f"({settings.expected_heldout_count})[/yellow]"
+                )
+            try:
+                assert_disjoint_or_raise(ids, hid, context="dev vs held-out")
+                console.print("dev / held-out overlap: [green]none (ok)[/green]")
+            except ValueError as e:
+                console.print(f"[red]{e}[/red]")
+                raise typer.Exit(code=1) from e
+        else:
+            console.print(f"[yellow]heldout_task_ids_path set but file missing:[/yellow] {hp}")
+
     if (
         settings.evaluation_type == "all"
         and settings.domain == "retail"
@@ -110,6 +131,9 @@ def doctor(
         console.print("Langfuse: [dim]disabled in baseline.yaml[/dim]")
 
     try:
+        console.print(
+            "[dim]Importing tau2 (LiteLLM, pandas, …) — first import after sync can take 30–120s on Windows…[/dim]"
+        )
         import tau2  # noqa: F401
 
         console.print("import tau2: [green]ok[/green]")
@@ -119,6 +143,7 @@ def doctor(
 
     from tau2.runner.helpers import get_tasks
 
+    console.print(f"[dim]Loading one task from domain [bold]{settings.domain}[/bold]…[/dim]")
     get_tasks(
         task_set_name=settings.domain,
         task_split_name=settings.task_split_name,
@@ -136,21 +161,41 @@ def run(
         "-c",
         help="Path to baseline.yaml",
     ),
+    resume: bool = typer.Option(
+        False,
+        "--resume",
+        help=(
+            "Skip task×trial pairs already recorded in trace_log_summary.jsonl for this run's "
+            "experiment_id (same baseline experiment_name + slice). Requires trace_summary_log_enabled."
+        ),
+    ),
     mode: str = typer.Option(
         "full",
         "--mode",
         "-m",
-        help="full | smoke | both (full=dev slice × num_trials; smoke=3 tasks×1; both=two score entries)",
+        help=(
+            "full|dev — dev slice × num_trials; smoke — 3 tasks×1; both — dev then smoke; "
+            "heldout_prepare — validate held-out ids + manifest (no sims); "
+            "heldout_run — held-out × num_trials (needs HARNESS_HELDOUT_RUN=1)"
+        ),
     ),
 ) -> None:
     """Run τ-bench baseline, append trace_log.jsonl, score_log.json, and Langfuse traces."""
-    if mode not in {"full", "smoke", "both"}:
-        console.print("[red]--mode must be full, smoke, or both[/red]")
+    valid = {
+        "full",
+        "dev",
+        "smoke",
+        "both",
+        "heldout_prepare",
+        "heldout_run",
+    }
+    if mode not in valid:
+        console.print(f"[red]--mode must be one of: {', '.join(sorted(valid))}[/red]")
         raise typer.Exit(code=1)
     settings = _load_config(config.resolve())
     setup_tau2_environment(tau2_root=settings.tau2_root)
 
-    if settings.langfuse.enabled:
+    if settings.langfuse.enabled and mode != "heldout_prepare":
         if not os.getenv("LANGFUSE_PUBLIC_KEY") or not os.getenv("LANGFUSE_SECRET_KEY"):
             console.print(
                 "[red]langfuse.enabled is true but LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY are missing.[/red]"
@@ -159,8 +204,18 @@ def run(
 
     from harness.runner import run_from_settings
 
+    if resume and mode != "heldout_prepare":
+        console.print(
+            "[cyan]Resume:[/cyan] will reuse previous [bold]eval_run_index[/bold] and skip "
+            f"task×trials already in [bold]{settings.trace_summary_log_filename}[/bold] for that index."
+        )
+
     try:
-        run_from_settings(settings, mode=mode)
+        manifest_path = run_from_settings(settings, mode=mode, resume=resume)
+        if manifest_path is not None:
+            console.print(
+                f"[bold green]heldout_prepare complete.[/bold green] Manifest: {manifest_path}"
+            )
     finally:
         if settings.langfuse.enabled:
             try:
@@ -170,10 +225,11 @@ def run(
             except Exception:
                 pass
 
-    console.print(
-        f"[bold green]Done.[/bold green] Traces: {settings.output_dir / settings.trace_log_filename} | "
-        f"Scores: {settings.output_dir / settings.score_log_filename}"
-    )
+    if mode != "heldout_prepare":
+        console.print(
+            f"[bold green]Done.[/bold green] Traces: {settings.output_dir / settings.trace_log_filename} | "
+            f"Scores: {settings.output_dir / settings.score_log_filename}"
+        )
 
 
 def main() -> None:

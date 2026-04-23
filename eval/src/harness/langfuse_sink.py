@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from typing import Any, Optional
@@ -10,21 +9,6 @@ from typing import Any, Optional
 from harness.config import LangfuseSettings
 
 logger = logging.getLogger(__name__)
-
-
-def _truncate_json(obj: dict[str, Any], max_chars: int = 100_000) -> dict[str, Any]:
-    raw = json.dumps(obj, default=str)
-    if len(raw) <= max_chars:
-        return obj
-    return {
-        "_truncated": True,
-        "_original_chars": len(raw),
-        "task_id": obj.get("task_id"),
-        "id": obj.get("id"),
-        "reward_info": obj.get("reward_info"),
-        "termination_reason": str(obj.get("termination_reason", "")),
-        "note": "Full payload in local trace_log.jsonl",
-    }
 
 
 class LangfuseSink:
@@ -64,10 +48,13 @@ class LangfuseSink:
         agent_llm: str,
         user_llm: str,
         wall_time_s: float,
-        sim_dump: dict[str, Any],
+        simulation_output: dict[str, Any],
     ) -> Optional[str]:
         """
         Create a Langfuse trace (root span + score) for one simulation.
+
+        ``simulation_output`` must be the **same** dict written to ``trace_log.jsonl`` under
+        ``simulation`` (already truncated when using compact mode).
 
         Langfuse v4 expects W3C-style **32 hex char** trace ids. τ-bench uses UUID strings,
         so we derive a valid id with ``create_trace_id(seed=tau2_run_id)`` (deterministic).
@@ -77,11 +64,10 @@ class LangfuseSink:
         if not self.enabled or self._client is None:
             return None
 
-        reward_info = sim_dump.get("reward_info") or {}
+        reward_info = simulation_output.get("reward_info") or {}
         reward = reward_info.get("reward")
         success = reward is not None and float(reward) >= 1.0
 
-        # Valid OTEL / Langfuse trace id (never pass raw UUID with dashes).
         lf_trace_id = self._client.create_trace_id(seed=tau2_run_id)
 
         metadata: dict[str, Any] = {
@@ -97,7 +83,6 @@ class LangfuseSink:
             "reward": reward,
         }
 
-        out_payload = _truncate_json(sim_dump, max_chars=120_000)
         trace_input = {
             "tau2_simulation_run_id": tau2_run_id,
             "task_id": task_id,
@@ -115,7 +100,7 @@ class LangfuseSink:
             name=span_name,
             as_type="span",
             input=trace_input,
-            output=out_payload,
+            output=simulation_output,
             metadata=metadata,
         ):
             pass

@@ -27,6 +27,7 @@ conversion-engine/
 │   │   ├── cli.py                 # typer: run, aggregate, doctor
 │   │   ├── config.py              # load baseline.yaml
 │   │   ├── runner.py              # invoke tau2 batch / per-sim API
+│   │   ├── trace_payload.py       # shared trace + Langfuse simulation JSON
 │   │   ├── trace_writer.py        # JSONL append
 │   │   ├── score_log.py           # score_log.json read/merge
 │   │   ├── metrics.py             # mean, 95% CI, p50/p95
@@ -60,7 +61,7 @@ conversion-engine/
 
 - Load `splits/dev_task_ids.json`; pass `--task-ids` or equivalent filter through the same code path τ-bench uses.
 - Fixed `max_concurrency` in config for comparable wall-clock.
-- After batch: compute **mean success** (binary: `reward_info.reward == 1.0` or rubric-defined threshold), **95% CI** (bootstrap over task-level means, B=10k, seed fixed), **cost** (sum `agent_cost` + `user_cost` per sim; document definition), **wall p50/p95** per simulation.
+- After batch: compute **`mean_success`** (successful tasks / (n_tasks × trials)), **95% CI** (bootstrap over tasks), **`pass@n`**, **cost** (sum `agent_cost` + `user_cost` per sim; document definition), **wall p50/p95** per simulation.
 - Append one object to `score_log.json` (`experiments[]` per `score_log.v1.schema.json`).
 
 ### Phase 3 — Small-scale reproduction entry
@@ -69,14 +70,14 @@ conversion-engine/
 
 ### Phase 4 — Langfuse
 
-- **Canonical traces:** always `trace_log.jsonl` (full `SimulationRun`).
-- **Langfuse:** `langfuse_sink.py` creates a **trace** per simulation with metadata (`task_id`, `trial`, `reward`, costs, duration, `run_id`, git sha). Attach full JSON as **observation** if under size limits; else attach **summary + path** to local JSONL line index.
+- **Canonical traces:** `trace_log.jsonl` — **one line per task×trial**; default **`trace_simulation_payload: compact`** (same truncated `simulation` JSON as Langfuse span **output**).
+- **Langfuse:** `langfuse_sink.py` uses the **identical** `simulation` dict as span **output** (no second truncation path). Optional **`full`** mode stores full `SimulationRun` in both trace and Langfuse.
 - Optional: enable LiteLLM → Langfuse via env-driven `USE_LANGFUSE` (§6) for token-level spans **in addition to** harness traces.
 
 ### Phase 5 — Held-out wiring (no task bodies)
 
-- `heldout_task_ids.json` present; harness supports `--mode dev|heldout_ids_only`.
-- If stock τ-bench cannot run without loading task definitions, **document** and gate held-out mode until staff harness provides Act IV — do not leak content into logs.
+- `heldout_task_ids.json` (or course path) + `heldout_task_ids_path` in YAML; **`--mode heldout_prepare`** validates ids, disjointness vs dev, and writes **`heldout_prepare_manifest.json`**.
+- **`--mode heldout_run`** runs the held-out slice behind **`HARNESS_HELDOUT_RUN=1`**; **`heldout_trace_policy`** (`full` \| `metadata_only` \| `none`) limits **`trace_log.jsonl`** / Langfuse payload shape. Stock τ-bench still loads task definitions in-process — true blind execution needs staff infra; see `README.md`.
 
 ### Phase 6 — Deliverables
 
@@ -90,7 +91,8 @@ conversion-engine/
 | Metric | Definition |
 |--------|----------------|
 | Success | Default: `simulation.reward_info.reward == 1.0` after normal termination (align with τ-bench early-exit rules). |
-| Pass@1 (5 trials) | For each task, success if **any** of 5 trials succeeds **or** if rubric defines “all 5 must pass” — **confirm with course**; default industry usage: per-trial binary then report **mean over all task×trial** with CI, or **per-task any-success** — **document chosen definition** in `score_log` entry. |
+| `mean_success` | **(Tasks with ≥1 success) / (n_tasks × trials)** — **[0, 1]**; **`ci95`** bootstraps **tasks**. |
+| `pass@n` in score_log | **Percentage (0–100)** of tasks that pass **on try n only** (`trial_index == n-1`). One `pass@n` + `ci95_pass@n` per n up to `num_trials_per_task`; CI bootstraps **tasks**. |
 | Cost per run | Recommend **agent + user** USD from τ-bench fields; note `0` if LiteLLM has no price table for model. |
 | Wall clock | Time around single `run_simulation` / one CLI invocation; report p50/p95 across sims. |
 | 95% CI | **Bootstrap** (preferred for small n) with fixed seed; report `ci_low`, `ci_high`, `B`, `seed`. |
@@ -130,7 +132,7 @@ If you must stay **zero-diff** on τ-bench, skip this and use **Langfuse SDK onl
 ## 7. Acceptance checklist (Act I)
 
 - [ ] Pinned models in `baseline.yaml`; same file used for both score_log entries.
-- [ ] `trace_log.jsonl`: one line per dev simulation; includes full serializable run payload.
+- [ ] `trace_log.jsonl`: one line per dev simulation; `simulation` matches Langfuse output (compact or full per config).
 - [ ] `score_log.json`: validates against `schemas/score_log.v1.schema.json`; ≥2 experiments.
 - [ ] `baseline.md`: word count ≤400; cites CI, cost, anomalies.
 - [ ] Langfuse: at least trace metadata per run (and/or LiteLLM callback enabled).
@@ -140,6 +142,6 @@ If you must stay **zero-diff** on τ-bench, skip this and use **Langfuse SDK onl
 
 ## 8. Open questions for staff / rubric
 
-- Exact **pass@1** definition across 5 trials.
+- **Resolved in harness:** `pass@1` = % tasks passing on first try only; `pass@n` = % passing on try n (see README / `metrics_definitions`).
 - Official **30 + 20** task id lists vs upstream 114-task retail.
 - Whether **held-out** execution must be blind at the **harness** level or only at grading.

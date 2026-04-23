@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import yaml
 from pydantic import BaseModel, Field
+
+HeldoutTracePolicy = Literal["full", "metadata_only", "none"]
+TraceSimulationPayloadMode = Literal["compact", "full"]
 
 from harness.paths import resolve_path
 
@@ -37,6 +40,12 @@ class BaselineSettings(BaseModel):
     domain: str = "retail"
     task_split_name: str = "base"
     dev_task_ids_path: Path
+    # Optional: 20-id sealed slice (see splits/README.md). Resolved in ``from_yaml``.
+    heldout_task_ids_path: Optional[Path] = None
+    # Applied only when running the held-out slice: trace / Langfuse payload shape.
+    heldout_trace_policy: HeldoutTracePolicy = "full"
+    # ``heldout_prepare`` checks the held-out file has exactly this many ids.
+    expected_heldout_count: int = 20
     tau2_root: Path = Field(
         default=Path("../tau2-bench"),
         description="Path to tau2-bench checkout (contains data/ and .env); resolved in from_yaml",
@@ -59,7 +68,17 @@ class BaselineSettings(BaseModel):
     user_llm_args: dict[str, Any] = Field(default_factory=dict)
     output_dir: Path = Field(default_factory=lambda: Path("../outputs"))
     trace_log_filename: str = "trace_log.jsonl"
+    # Flat, short JSONL — one line per task×trial as soon as that run finishes.
+    trace_summary_log_enabled: bool = True
+    trace_summary_log_filename: str = "trace_log_summary.jsonl"
+    trace_summary_max_instruction_chars: int = 500
     score_log_filename: str = "score_log.json"
+    # Monotonic counter file for eval_run_index (resume reuses previous index).
+    eval_run_state_filename: str = "harness_eval_run_state.json"
+    # ``compact`` = same truncated JSON as Langfuse span output (see trace_export_max_chars).
+    # ``full`` = full SimulationRun JSON per trace line (large files).
+    trace_simulation_payload: TraceSimulationPayloadMode = "compact"
+    trace_export_max_chars: int = 120_000
     langfuse: LangfuseSettings = Field(default_factory=LangfuseSettings)
     notes: str = ""
     seed: int = 300
@@ -83,6 +102,12 @@ class BaselineSettings(BaseModel):
         raw["tau2_root"] = resolve_path(raw["tau2_root"], base=base)
         raw["dev_task_ids_path"] = resolve_path(raw["dev_task_ids_path"], base=base)
         raw["output_dir"] = resolve_path(raw.get("output_dir", "../outputs"), base=base)
+
+        ht = raw.get("heldout_task_ids_path")
+        if ht:
+            raw["heldout_task_ids_path"] = resolve_path(str(ht), base=base)
+        else:
+            raw["heldout_task_ids_path"] = None
 
         lf = raw.get("langfuse") or {}
         raw["langfuse"] = LangfuseSettings(
