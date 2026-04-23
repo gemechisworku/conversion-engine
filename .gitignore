@@ -1,1 +1,8 @@
 /tau2-bench
+.env
+.env.*
+!.env.example
+__pycache__/
+.pytest_cache/
+*.pyc
+pytest-cache-files-*

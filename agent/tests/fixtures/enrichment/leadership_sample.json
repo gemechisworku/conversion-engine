@@ -1,0 +1,10 @@
+[
+  {
+    "company_name": "Acme AI",
+    "role_name": "CTO",
+    "person": "Jane Doe",
+    "change_type": "new_hire",
+    "change_date": "2026-03-01",
+    "source_url": "https://news.example/acme-cto"
+  }
+]

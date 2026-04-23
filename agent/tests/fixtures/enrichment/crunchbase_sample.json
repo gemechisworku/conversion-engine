@@ -1,0 +1,13 @@
+[
+  {
+    "company_id": "comp_123",
+    "company_name": "Acme AI",
+    "domain": "acme.ai",
+    "industry": "SaaS",
+    "funding_round": "Series A",
+    "funding_amount_usd": 12000000,
+    "funding_date": "2026-02-10",
+    "location": "Nairobi",
+    "source_url": "https://data.example/crunchbase/comp_123"
+  }
+]

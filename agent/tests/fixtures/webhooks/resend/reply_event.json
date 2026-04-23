@@ -1,0 +1,15 @@
+{
+  "type": "email.received",
+  "created_at": "2026-04-23T12:00:00Z",
+  "data": {
+    "id": "re_123",
+    "from": "prospect@example.com",
+    "to": [
+      "outreach@tenacious.example"
+    ],
+    "subject": "Re: Intro",
+    "text": "Can we discuss next week?",
+    "html": "<p>Can we discuss next week?</p>",
+    "created_at": "2026-04-23T11:59:58Z"
+  }
+}

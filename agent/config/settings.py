@@ -1,0 +1,84 @@
+"""Runtime settings loaded from environment variables."""
+
+from __future__ import annotations
+
+from functools import lru_cache
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    # Implements: FR-10, FR-15, FR-16
+    # Workflow: outreach_generation_and_review.md
+    # Schema: policy_decision.md
+    # API: policy_api.md
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=True,
+        populate_by_name=True,
+    )
+
+    challenge_mode: bool = Field(default=True, alias="CHALLENGE_MODE")
+    kill_switch_enabled: bool = Field(default=False, alias="KILL_SWITCH_ENABLED")
+    sink_routing_enabled: bool = Field(default=False, alias="SINK_ROUTING_ENABLED")
+
+    render_webhook_base_url: str = Field(default="", alias="RENDER_WEBHOOK_BASE_URL")
+    webhook_route_resend: str = Field(default="/webhooks/resend", alias="WEBHOOK_ROUTE_RESEND")
+    webhook_route_africastalking: str = Field(
+        default="/webhooks/africastalking",
+        alias="WEBHOOK_ROUTE_AFRICASTALKING",
+    )
+    webhook_route_calcom: str = Field(default="/webhooks/calcom", alias="WEBHOOK_ROUTE_CALCOM")
+
+    resend_api_key: str = Field(default="", alias="RESEND_API_KEY")
+    resend_from_email: str = Field(default="", alias="RESEND_FROM_EMAIL")
+    resend_api_url: str = Field(default="https://api.resend.com", alias="RESEND_API_URL")
+    resend_webhook_secret: str = Field(default="", alias="RESEND_WEBHOOK_SECRET")
+    resend_webhook_signature_header: str = Field(
+        default="resend-signature",
+        alias="RESEND_WEBHOOK_SIGNATURE_HEADER",
+    )
+
+    africastalking_username: str = Field(default="", alias="AFRICASTALKING_USERNAME")
+    africastalking_api_key: str = Field(default="", alias="AFRICASTALKING_API_KEY")
+    africastalking_shortcode: str = Field(default="", alias="AFRICASTALKING_SHORTCODE")
+    africastalking_webhook_secret: str = Field(default="", alias="AFRICASTALKING_WEBHOOK_SECRET")
+    africastalking_api_url: str = Field(
+        default="https://api.africastalking.com/version1/messaging",
+        alias="AFRICASTALKING_API_URL",
+    )
+
+    hubspot_mcp_base_url: str = Field(default="", alias="HUBSPOT_MCP_BASE_URL")
+    hubspot_mcp_api_key: str = Field(default="", alias="HUBSPOT_MCP_API_KEY")
+    hubspot_pipeline_id: str = Field(default="", alias="HUBSPOT_PIPELINE_ID")
+
+    calcom_api_url: str = Field(default="https://api.cal.com/v2", alias="CALCOM_API_URL")
+    calcom_api_key: str = Field(default="", alias="CALCOM_API_KEY")
+    calcom_event_type_id: str = Field(default="", alias="CALCOM_EVENT_TYPE_ID")
+    calcom_webhook_secret: str = Field(default="", alias="CALCOM_WEBHOOK_SECRET")
+
+    crunchbase_dataset_path: str = Field(default="", alias="CRUNCHBASE_DATASET_PATH")
+    crunchbase_dataset_url: str = Field(default="", alias="CRUNCHBASE_DATASET_URL")
+    layoffs_csv_path: str = Field(default="", alias="LAYOFFS_CSV_PATH")
+    layoffs_csv_url: str = Field(default="", alias="LAYOFFS_CSV_URL")
+    leadership_feed_url: str = Field(default="", alias="LEADERSHIP_FEED_URL")
+
+    langfuse_public_key: str = Field(default="", alias="LANGFUSE_PUBLIC_KEY")
+    langfuse_secret_key: str = Field(default="", alias="LANGFUSE_SECRET_KEY")
+    langfuse_host: str = Field(default="https://cloud.langfuse.com", alias="LANGFUSE_HOST")
+
+    http_timeout_seconds: float = Field(default=20.0, alias="HTTP_TIMEOUT_SECONDS")
+    log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+
+    def require(self, *field_names: str) -> None:
+        """Raise a ValueError if required settings are not configured."""
+        missing = [name for name in field_names if not getattr(self, name)]
+        if missing:
+            raise ValueError(f"Missing required settings: {', '.join(sorted(missing))}")
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    return Settings()
