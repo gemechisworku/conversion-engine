@@ -11,6 +11,7 @@
 * Should KB pages be stored in git, object storage, or both?
 * What model routing policy will be used per subagent?
 * What are the exact deployed webhook contracts (path, headers, signature algorithm, retry semantics) for Resend, Africa's Talking, and Cal.com?
+* For HubSpot remote MCP GA, which exact tool names and argument schemas should be treated as canonical for `crm_upsert_lead` and `crm_append_event` in this codebase?
 
 ## 3. Evaluation
 

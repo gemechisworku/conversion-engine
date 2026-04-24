@@ -190,8 +190,23 @@ cp .env.example .env
 * `AFRICASTALKING_USERNAME`, `AFRICASTALKING_API_KEY`: Africa's Talking dashboard -> Settings -> API Key.
 * `AFRICASTALKING_SHORTCODE`: sender ID/shortcode configured in Africa's Talking.
 * `AFRICASTALKING_API_URL`: keep default unless Africa's Talking provides a different regional endpoint.
-* `HUBSPOT_MCP_BASE_URL`, `HUBSPOT_MCP_API_KEY`: your deployed HubSpot MCP URL and auth token.
-* `CALCOM_API_KEY`, `CALCOM_EVENT_TYPE_ID`: Cal.com -> Developers -> API keys and event type.
+* `HUBSPOT_MCP_SERVER_URL`: HubSpot remote MCP endpoint (default: `https://mcp.hubspot.com`).
+* `HUBSPOT_MCP_ACCESS_TOKEN`: OAuth access token for HubSpot remote MCP.
+  `HUBSPOT_ACCESS_TOKEN` is also accepted as a compatibility alias.
+* `HUBSPOT_MCP_REFRESH_TOKEN`, `HUBSPOT_MCP_CLIENT_ID`, `HUBSPOT_MCP_CLIENT_SECRET`: optional token refresh path for long-lived runs.
+* `HUBSPOT_MCP_OAUTH_TOKEN_URL`: token refresh endpoint (default: `https://api.hubapi.com/oauth/v1/token`).
+* `HUBSPOT_MCP_PROTOCOL_VERSION`: MCP protocol version header (default: `2025-06-18`).
+* `HUBSPOT_MCP_TOOL_UPSERT_LEAD`, `HUBSPOT_MCP_TOOL_APPEND_EVENT`: explicit tool mapping (recommended).
+  You can discover valid names with `.\scripts\smoke-hubspot-tools.ps1`.
+  For many accounts, both can be set to `manage_crm_objects`.
+  Legacy bridge keys `HUBSPOT_MCP_BASE_URL` and `HUBSPOT_MCP_API_KEY` are no longer used.
+* `HUBSPOT_COMPANY_PROP_LAST_BOOKING_*` (optional): internal names of custom **company** properties
+  where confirmed booking fields are projected (`ID`, `START_AT`, `END_AT`, `TIMEZONE`, `URL`, `STATUS`).
+  Create these in HubSpot: Settings -> Data Management -> Properties -> Object: Company.
+  Use the property **internal name** in `.env` (not the display label).
+* `CALCOM_API_KEY`: Cal.com -> Developers -> API keys.
+* `CALCOM_EVENT_TYPE_ID`: numeric event type id (preferred when your API key can list event types).
+* `CALCOM_EVENT_TYPE_SLUG`, `CALCOM_USERNAME`: alternative selector when event type ids are not available via API.
 * `CALCOM_WEBHOOK_SECRET`: Cal.com webhook settings.
 * `CRUNCHBASE_DATASET_PATH` / `CRUNCHBASE_DATASET_URL`: path or URL for your Crunchbase snapshot used by enrichment.
 * `LAYOFFS_CSV_PATH` / `LAYOFFS_CSV_URL`: layoffs.fyi CSV source used by the layoffs adapter.
@@ -212,6 +227,32 @@ Notes:
 1. Read `/docs/implementation_plan.md`
 2. Follow `AGENTS.md` and `/specs/IMPLEMENTATION_PROTOCOL.md`
 3. Start with Phase 1 (Email Handler)
+
+### Live smoke commands
+
+From repo root, with `.env` configured and dependencies installed:
+
+```powershell
+# Email (Resend)
+.\scripts\smoke-email.ps1 -To "you@example.com"
+
+# SMS (Africa's Talking) - warm lead path
+.\scripts\smoke-sms.ps1 -To "+254700000001"
+
+# Booking + CRM sync (Cal.com -> HubSpot MCP)
+.\scripts\smoke-booking-sync.ps1 -ProspectEmail "prospect@example.com" -Timezone "UTC"
+
+# HubSpot-only booking event write (no Cal.com call)
+.\scripts\smoke-hubspot-booking.ps1 -LeadId "lead_123" -BookingId "booking_123"
+
+# HubSpot remote MCP tool discovery
+.\scripts\smoke-hubspot-tools.ps1
+```
+
+Notes:
+* live side-effect commands are blocked when `CHALLENGE_MODE=true` and `SINK_ROUTING_ENABLED=false`.
+* use `-Cold` on SMS script and `-Unconfirmed` on booking script to validate policy-block behavior.
+* use `-SkipCrm` on booking sync when validating Cal.com independently from HubSpot.
 
 ---
 

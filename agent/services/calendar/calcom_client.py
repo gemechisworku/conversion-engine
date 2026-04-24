@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -41,28 +42,53 @@ class CalComService:
 
     async def get_available_slots(self, request: AvailabilityRequest) -> list[CalendarSlot]:
         self._settings.require("calcom_api_key")
-        url = f"{self._settings.calcom_api_url.rstrip('/')}/schedule/slots"
-        payload = {
-            "lead_id": request.lead_id,
-            "timezone": request.timezone,
-            "window_start": request.window_start.isoformat(),
-            "window_end": request.window_end.isoformat(),
-        }
-        raw = await self._post_with_retry(
+        selector = self._resolve_event_selector()
+        url = f"{self._settings.calcom_api_url.rstrip('/')}/slots"
+        response, raw = await self._request_with_retry(
+            method="GET",
             url=url,
-            headers=self._headers(idempotency_key=f"slots:{request.lead_id}:{request.window_start.isoformat()}"),
-            json=payload,
+            headers=self._headers(
+                idempotency_key=f"slots:{request.lead_id}:{request.window_start.isoformat()}",
+                api_version="2024-09-04",
+            ),
+            params={
+                "start": self._to_utc_iso(request.window_start),
+                "end": self._to_utc_iso(request.window_end),
+                "timeZone": request.timezone,
+                "format": "range",
+                **selector,
+            },
         )
-        data = raw.get("data", {})
-        slots_data = data.get("slots", []) if isinstance(data, dict) else []
+        if response.status_code >= 400:
+            error = ErrorEnvelope(
+                error_code="SOURCE_UNAVAILABLE",
+                error_message=f"Cal.com slots lookup failed with HTTP {response.status_code}.",
+                retryable=response.status_code >= 500,
+                details={"response": raw},
+            )
+            log_trace_event(
+                event_type="calendar_slots_failed",
+                trace_id=request.trace_id,
+                lead_id=request.lead_id,
+                status="failure",
+                payload={"timezone": request.timezone},
+                error=error.model_dump(),
+            )
+            raise RuntimeError(f"Cal.com slots lookup failed with HTTP {response.status_code}.")
+
+        slots_data = raw.get("data", {}) if isinstance(raw.get("data"), dict) else {}
         slots: list[CalendarSlot] = []
-        for entry in slots_data:
-            if not isinstance(entry, dict):
+        for day_slots in slots_data.values():
+            if not isinstance(day_slots, list):
                 continue
-            slot_id = str(entry.get("slot_id") or entry.get("id") or "").strip()
-            start_at = self._parse_dt(entry.get("start_at") or entry.get("start"))
-            end_at = self._parse_dt(entry.get("end_at") or entry.get("end"))
-            if slot_id and start_at and end_at:
+            for entry in day_slots:
+                if not isinstance(entry, dict):
+                    continue
+                start_at = self._parse_dt(entry.get("start") or entry.get("start_at"))
+                end_at = self._parse_dt(entry.get("end") or entry.get("end_at"))
+                if not start_at or not end_at:
+                    continue
+                slot_id = str(entry.get("slot_id") or entry.get("id") or start_at.isoformat()).strip()
                 slots.append(CalendarSlot(slot_id=slot_id, start_at=start_at, end_at=end_at))
         log_trace_event(
             event_type="calendar_slots_loaded",
@@ -90,6 +116,7 @@ class CalComService:
             )
 
         self._settings.require("calcom_api_key")
+        selector = self._resolve_event_selector()
         decisions = self._policy_service.check_email_send(trace_id=request.trace_id, lead_id=request.lead_id)
         blocked = next((decision for decision in decisions if not decision.is_allowed), None)
         if blocked:
@@ -108,21 +135,44 @@ class CalComService:
                 error=error,
             )
 
-        payload = {
-            "lead_id": request.lead_id,
-            "slot_id": request.slot_id,
-            "confirmed_by_prospect": True,
-            "start_at": request.starts_at.isoformat(),
-            "end_at": request.ends_at.isoformat(),
-            "timezone": request.timezone,
-            "attendee": {"email": request.prospect_email, "name": request.prospect_name},
-            "event_type_id": self._settings.calcom_event_type_id or None,
+        payload: dict[str, Any] = {
+            "start": self._to_utc_iso(request.starts_at),
+            "attendee": {
+                "email": request.prospect_email,
+                "timeZone": request.timezone,
+                "name": self._resolve_attendee_name(request.prospect_name),
+            },
+            "metadata": {
+                "lead_id": request.lead_id,
+                "slot_id": request.slot_id,
+                "trace_id": request.trace_id,
+            },
+            **selector,
         }
-        raw = await self._post_with_retry(
-            url=f"{self._settings.calcom_api_url.rstrip('/')}/schedule/book",
-            headers=self._headers(idempotency_key=request.idempotency_key),
+
+        response, raw = await self._request_with_retry(
+            method="POST",
+            url=f"{self._settings.calcom_api_url.rstrip('/')}/bookings",
+            headers=self._headers(idempotency_key=request.idempotency_key, api_version="2026-02-25"),
             json=payload,
         )
+        if response.status_code >= 400:
+            error = ErrorEnvelope(
+                error_code="BOOKING_FAILED",
+                error_message=f"Cal.com returned HTTP {response.status_code}.",
+                retryable=response.status_code >= 500,
+                details={"response": raw},
+            )
+            return BookingResult(
+                lead_id=request.lead_id,
+                slot_id=request.slot_id,
+                status="failed",
+                timezone=request.timezone,
+                confirmed_by_prospect=True,
+                error=error,
+                raw_response=raw,
+            )
+
         status = str(raw.get("data", {}).get("status") or raw.get("status") or "confirmed")
         if status.lower() in {"failure", "failed"}:
             error = ErrorEnvelope(
@@ -142,8 +192,8 @@ class CalComService:
             )
 
         data = raw.get("data", {}) if isinstance(raw.get("data"), dict) else raw
-        booking_id = str(data.get("booking_id") or data.get("id") or "").strip() or None
-        calendar_ref = str(data.get("calendar_ref") or data.get("booking_url") or "").strip() or None
+        booking_id = str(data.get("booking_id") or data.get("uid") or data.get("id") or "").strip() or None
+        calendar_ref = str(data.get("booking_url") or data.get("location") or data.get("calendar_ref") or "").strip() or None
         result = BookingResult(
             booking_id=booking_id,
             lead_id=request.lead_id,
@@ -165,24 +215,32 @@ class CalComService:
         )
         return result
 
-    async def _post_with_retry(
+    async def _request_with_retry(
         self,
         *,
+        method: str,
         url: str,
         headers: dict[str, str],
-        json: dict[str, Any],
-    ) -> dict[str, Any]:
+        json: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> tuple[httpx.Response, dict[str, Any]]:
         attempt = 0
         last_error: Exception | None = None
         while attempt <= self._max_retries:
             attempt += 1
             try:
-                response = await self._post(url=url, headers=headers, json=json)
+                response = await self._request(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    json=json,
+                    params=params,
+                )
                 if response.is_success:
-                    return self._safe_json(response)
+                    return response, self._safe_json(response)
                 if response.status_code >= 500 and attempt <= self._max_retries:
                     continue
-                return self._safe_json(response)
+                return response, self._safe_json(response)
             except (httpx.TimeoutException, httpx.HTTPError) as exc:
                 last_error = exc
                 if attempt <= self._max_retries:
@@ -190,23 +248,27 @@ class CalComService:
                 raise
         raise RuntimeError(f"Unexpected calendar retry loop failure: {last_error}")
 
-    async def _post(
+    async def _request(
         self,
         *,
+        method: str,
         url: str,
         headers: dict[str, str],
-        json: dict[str, Any],
+        json: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
     ) -> httpx.Response:
         if self._http_client is not None:
-            return await self._http_client.post(url, headers=headers, json=json)
+            return await self._http_client.request(method, url, headers=headers, json=json, params=params)
         async with httpx.AsyncClient(timeout=self._settings.http_timeout_seconds) as client:
-            return await client.post(url, headers=headers, json=json)
+            return await client.request(method, url, headers=headers, json=json, params=params)
 
-    def _headers(self, *, idempotency_key: str) -> dict[str, str]:
+    def _headers(self, *, idempotency_key: str, api_version: str) -> dict[str, str]:
         return {
             "Authorization": f"Bearer {self._settings.calcom_api_key}",
+            "Accept": "application/json",
             "Content-Type": "application/json",
             "Idempotency-Key": idempotency_key,
+            "cal-api-version": api_version,
         }
 
     @staticmethod
@@ -228,6 +290,36 @@ class CalComService:
             return datetime.fromisoformat(text)
         except ValueError:
             return None
+
+    @staticmethod
+    def _to_utc_iso(value: datetime) -> str:
+        dt = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        return dt.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+    @staticmethod
+    def _coerce_event_type_id(value: str) -> int | str:
+        text = str(value).strip()
+        return int(text) if text.isdigit() else text
+
+    def _resolve_event_selector(self) -> dict[str, Any]:
+        event_type_id = str(self._settings.calcom_event_type_id or "").strip()
+        if event_type_id:
+            return {"eventTypeId": self._coerce_event_type_id(event_type_id)}
+
+        event_type_slug = str(self._settings.calcom_event_type_slug or "").strip()
+        username = str(self._settings.calcom_username or "").strip()
+        if event_type_slug and username:
+            return {"eventTypeSlug": event_type_slug, "username": username}
+
+        raise ValueError(
+            "Missing Cal.com event selector. Configure either CALCOM_EVENT_TYPE_ID "
+            "or CALCOM_EVENT_TYPE_SLUG with CALCOM_USERNAME."
+        )
+
+    @staticmethod
+    def _resolve_attendee_name(name: str | None) -> str:
+        cleaned = (name or "").strip()
+        return cleaned if cleaned else "Prospect"
 
 
 async def book_and_sync_crm(
@@ -263,4 +355,3 @@ async def book_and_sync_crm(
         idempotency_key=f"{lead_id}:{booking_request.slot_id}",
     )
     return LinkedBookingResult(booking=booking, crm_write=crm_write)
-

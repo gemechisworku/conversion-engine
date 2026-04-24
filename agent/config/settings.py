@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,6 +18,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=True,
         populate_by_name=True,
+        extra="ignore",
     )
 
     challenge_mode: bool = Field(default=True, alias="CHALLENGE_MODE")
@@ -50,13 +51,50 @@ class Settings(BaseSettings):
         alias="AFRICASTALKING_API_URL",
     )
 
-    hubspot_mcp_base_url: str = Field(default="", alias="HUBSPOT_MCP_BASE_URL")
-    hubspot_mcp_api_key: str = Field(default="", alias="HUBSPOT_MCP_API_KEY")
+    hubspot_mcp_server_url: str = Field(default="https://mcp.hubspot.com", alias="HUBSPOT_MCP_SERVER_URL")
+    hubspot_mcp_access_token: str = Field(
+        default="",
+        alias="HUBSPOT_MCP_ACCESS_TOKEN",
+        validation_alias=AliasChoices("HUBSPOT_MCP_ACCESS_TOKEN", "HUBSPOT_ACCESS_TOKEN"),
+    )
+    hubspot_mcp_refresh_token: str = Field(default="", alias="HUBSPOT_MCP_REFRESH_TOKEN")
+    hubspot_mcp_client_id: str = Field(default="", alias="HUBSPOT_MCP_CLIENT_ID")
+    hubspot_mcp_client_secret: str = Field(default="", alias="HUBSPOT_MCP_CLIENT_SECRET")
+    hubspot_mcp_oauth_token_url: str = Field(
+        default="https://api.hubapi.com/oauth/v1/token",
+        alias="HUBSPOT_MCP_OAUTH_TOKEN_URL",
+    )
+    hubspot_mcp_protocol_version: str = Field(default="2025-06-18", alias="HUBSPOT_MCP_PROTOCOL_VERSION")
+    hubspot_mcp_tool_upsert_lead: str = Field(default="", alias="HUBSPOT_MCP_TOOL_UPSERT_LEAD")
+    hubspot_mcp_tool_append_event: str = Field(default="", alias="HUBSPOT_MCP_TOOL_APPEND_EVENT")
     hubspot_pipeline_id: str = Field(default="", alias="HUBSPOT_PIPELINE_ID")
+    hubspot_company_prop_last_booking_id: str = Field(default="", alias="HUBSPOT_COMPANY_PROP_LAST_BOOKING_ID")
+    hubspot_company_prop_last_booking_start_at: str = Field(
+        default="",
+        alias="HUBSPOT_COMPANY_PROP_LAST_BOOKING_START_AT",
+    )
+    hubspot_company_prop_last_booking_end_at: str = Field(
+        default="",
+        alias="HUBSPOT_COMPANY_PROP_LAST_BOOKING_END_AT",
+    )
+    hubspot_company_prop_last_booking_timezone: str = Field(
+        default="",
+        alias="HUBSPOT_COMPANY_PROP_LAST_BOOKING_TIMEZONE",
+    )
+    hubspot_company_prop_last_booking_url: str = Field(
+        default="",
+        alias="HUBSPOT_COMPANY_PROP_LAST_BOOKING_URL",
+    )
+    hubspot_company_prop_last_booking_status: str = Field(
+        default="",
+        alias="HUBSPOT_COMPANY_PROP_LAST_BOOKING_STATUS",
+    )
 
     calcom_api_url: str = Field(default="https://api.cal.com/v2", alias="CALCOM_API_URL")
     calcom_api_key: str = Field(default="", alias="CALCOM_API_KEY")
     calcom_event_type_id: str = Field(default="", alias="CALCOM_EVENT_TYPE_ID")
+    calcom_event_type_slug: str = Field(default="", alias="CALCOM_EVENT_TYPE_SLUG")
+    calcom_username: str = Field(default="", alias="CALCOM_USERNAME")
     calcom_webhook_secret: str = Field(default="", alias="CALCOM_WEBHOOK_SECRET")
 
     crunchbase_dataset_path: str = Field(default="", alias="CRUNCHBASE_DATASET_PATH")
