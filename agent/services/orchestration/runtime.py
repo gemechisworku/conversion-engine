@@ -15,6 +15,7 @@ from agent.graphs.transitions import InvalidStateTransitionError, validate_lead_
 from agent.repositories.state_repo import SQLiteStateRepository
 from agent.services.common.schemas import ErrorEnvelope
 from agent.services.crm.hubspot_mcp import HubSpotMCPService
+from agent.services.conversation.email_llm import interpret_inbound_email_and_draft_reply
 from agent.services.enrichment.schemas import EnrichmentArtifact
 from agent.services.observability.events import log_processing_step, log_trace_event
 from agent.services.orchestration.schemas import (
@@ -238,7 +239,10 @@ class OrchestrationRuntime:
                 message_id=request.message_id,
                 direction="inbound",
                 content=request.content,
-                metadata={"received_at": request.received_at.isoformat()},
+                metadata={
+                    "received_at": request.received_at.isoformat(),
+                    "subject": request.subject,
+                },
             )
             act2_context = await self._run_act2_enrichment_before_reply(
                 lead_id=request.lead_id,
@@ -254,7 +258,61 @@ class OrchestrationRuntime:
             )
             intent = self._classify_intent(request.content)
             next_action = self._next_action(intent=intent)
-            next_state = "scheduling" if next_action == "schedule" else "qualifying"
+            email_interp = None
+            llm = self._enrichment_services.get("llm")
+            if (
+                request.channel.lower() == "email"
+                and llm is not None
+                and getattr(llm, "configured", False)
+            ):
+                briefs_all = self._state_repo.get_briefs(lead_id=request.lead_id) or {}
+                hiring = briefs_all.get("hiring_signal_brief")
+                recent_ctx = self._recent_outbound_email_snippet(lead_id=request.lead_id)
+                company_nm = request.company_name or ""
+                email_interp = await interpret_inbound_email_and_draft_reply(
+                    settings=self._settings,
+                    llm=llm,
+                    company_name=company_nm,
+                    inbound_subject=request.subject or "(no subject)",
+                    inbound_body=request.content,
+                    recent_outbound_context=recent_ctx,
+                    hiring_signal_brief=hiring if isinstance(hiring, dict) else {},
+                    trace_id=trace_id,
+                    lead_id=request.lead_id,
+                )
+                if email_interp is not None:
+                    intent = email_interp.intent
+                    next_action = email_interp.next_best_action
+                    allowed_actions = {
+                        "schedule",
+                        "qualify",
+                        "clarify",
+                        "handle_objection",
+                        "nurture",
+                        "escalate",
+                    }
+                    if next_action not in allowed_actions:
+                        next_action = self._next_action(intent=intent)
+                    self._state_repo.append_message(
+                        lead_id=request.lead_id,
+                        channel="email",
+                        message_id=f"suggested_email_reply_{uuid4().hex[:12]}",
+                        direction="outbound",
+                        content=email_interp.suggested_reply_body,
+                        metadata={
+                            "kind": "suggested_reply_email",
+                            "subject": email_interp.suggested_reply_subject,
+                            "reply_to_message_id": request.message_id,
+                            "intent": intent,
+                            "llm_confidence": email_interp.confidence,
+                        },
+                    )
+            if next_action == "escalate":
+                next_state = "handoff_required"
+            elif next_action == "schedule":
+                next_state = "scheduling"
+            else:
+                next_state = "qualifying"
             log_processing_step(
                 component="orchestration",
                 step="handle_reply.route",
@@ -264,6 +322,8 @@ class OrchestrationRuntime:
                 intent=intent,
                 next_action=next_action,
                 next_state=next_state,
+                channel=request.channel,
+                llm_email=email_interp is not None,
             )
             validate_lead_transition(from_state="reply_received", to_state=next_state)
 
@@ -355,11 +415,21 @@ class OrchestrationRuntime:
                 trace_id=trace_id,
                 next_action=next_action,
             )
+            reply_data: dict[str, Any] = {
+                "lead_id": request.lead_id,
+                "state": "reply_received",
+                "next_action": next_action,
+                "inbound_intent": intent,
+            }
+            if email_interp is not None:
+                reply_data["suggested_reply_subject"] = email_interp.suggested_reply_subject
+                reply_data["suggested_reply_body"] = email_interp.suggested_reply_body
+                reply_data["llm_reply_confidence"] = email_interp.confidence
             return ResponseEnvelope(
                 request_id=request_id,
                 trace_id=trace_id,
                 status="accepted",
-                data={"lead_id": request.lead_id, "state": "reply_received", "next_action": next_action},
+                data=reply_data,
             )
         except InvalidStateTransitionError as exc:
             log_processing_step(
@@ -486,6 +556,16 @@ class OrchestrationRuntime:
                 message=str(exc),
                 retryable=False,
             )
+
+    def _recent_outbound_email_snippet(self, *, lead_id: str) -> str | None:
+        rows = self._state_repo.list_messages(lead_id=lead_id, limit=16)
+        for row in rows:
+            if row.get("channel") == "email" and row.get("direction") == "outbound":
+                meta = row.get("metadata") or {}
+                subject = str(meta.get("subject") or "") if isinstance(meta, dict) else ""
+                body = str(row.get("content") or "")
+                return f"Subject: {subject}\n\n{body[:4000]}"
+        return None
 
     def get_state(self, *, lead_id: str) -> ResponseEnvelope:
         request_id = f"req_{uuid4().hex[:10]}"

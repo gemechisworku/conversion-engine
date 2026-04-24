@@ -97,6 +97,8 @@ class Settings(BaseSettings):
     calcom_username: str = Field(default="", alias="CALCOM_USERNAME")
     calcom_webhook_secret: str = Field(default="", alias="CALCOM_WEBHOOK_SECRET")
 
+    tenacious_sales_data_path: str = Field(default="", alias="TENACIOUS_SALES_DATA_PATH")
+
     crunchbase_dataset_path: str = Field(default="", alias="CRUNCHBASE_DATASET_PATH")
     crunchbase_dataset_url: str = Field(default="", alias="CRUNCHBASE_DATASET_URL")
     layoffs_csv_path: str = Field(default="", alias="LAYOFFS_CSV_PATH")

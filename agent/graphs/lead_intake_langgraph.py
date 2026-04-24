@@ -60,11 +60,14 @@ def compile_lead_intake_graph(deps: LeadIntakeGraphDeps):
             company_name=state.get("company_name"),
             company_domain=state.get("company_domain"),
         )
+        enrich_services = deps.services_for_enrich()
+        enrich_services["trace_id"] = state.get("trace_id", "")
+        enrich_services["lead_id"] = state.get("lead_id", "")
         enriched, artifact = await run_lead_intake(
             state=lead_state,
             company_name=state["company_name"],
             company_domain=state["company_domain"],
-            services=deps.services_for_enrich(),
+            services=enrich_services,
         )
         log_processing_step(
             component="graphs.lead_intake",

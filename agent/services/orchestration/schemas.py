@@ -39,6 +39,7 @@ class LeadReplyRequest(BaseModel):
     channel: str
     message_id: str
     content: str
+    subject: str | None = None
     from_email: str | None = None
     from_number: str | None = None
     company_name: str | None = None

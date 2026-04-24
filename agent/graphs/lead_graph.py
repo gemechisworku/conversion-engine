@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from agent.config.settings import Settings
 from agent.graphs.state import LeadGraphState
 from agent.graphs.transitions import validate_lead_transition
 from agent.services.enrichment.ai_maturity import score_ai_maturity_with_llm
 from agent.services.enrichment.hiring_brief import build_hiring_signal_brief_with_llm
-from agent.services.enrichment.icp_classifier import classify_icp
+from agent.services.enrichment.icp_classifier import classify_icp, classify_icp_with_care
 from agent.services.enrichment.schemas import EnrichmentArtifact
 from agent.tools.enrichment_tools import enrich_company
 
@@ -39,7 +40,20 @@ async def run_lead_intake(
         artifact=artifact,
         llm=services.get("llm"),
     )
-    classification = classify_icp(artifact=artifact, ai_maturity=ai_maturity)
+    settings_obj = services.get("settings")
+    llm_client = services.get("llm")
+    trace_hint = str(services.get("trace_id") or "")
+    if isinstance(settings_obj, Settings) and llm_client is not None:
+        classification = await classify_icp_with_care(
+            artifact=artifact,
+            ai_maturity=ai_maturity,
+            llm=llm_client,
+            settings=settings_obj,
+            trace_id=trace_hint or None,
+            lead_id=state.lead_id,
+        )
+    else:
+        classification = classify_icp(artifact=artifact, ai_maturity=ai_maturity)
     gap_brief = await services["competitor_gap"].build_brief(
         lead_id=state.lead_id,
         company_id=state.company_id,

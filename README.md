@@ -298,6 +298,37 @@ Optional: **`--idempotency-key`** for repeatable HubSpot writes. If **`--company
 
 **Expected result:** stderr shows `agent.orchestration` / `agent.graphs.lead_intake` log lines when `LOG_LEVEL=INFO`; stdout ends with JSON including `"status": "accepted"`, `"data": { "lead_id": "...", "state": "brief_ready" }`, and `"trace_id": "..."`.
 
+### End-to-end Python (orchestration + stages + optional email + reply)
+
+**`agent/scripts/run_e2e_lead.py`** chains **`process_lead`**, four **`advance_state`** steps to **`awaiting_reply`**, optionally **one Resend send**, then **`handle_reply`** unless you pass **`--no-reply`**. With **`OPENROUTER_API_KEY`** set, the first-touch email uses **`tenacious_sales_data/`** (style guide, cold sequence, ICP doc, bench snippet) via an LLM; **`handle_reply`** defaults to **`--reply-channel email`** and runs an LLM on the inbound body (plus optional **`--reply-subject`**). OpenRouter **`usage`** tokens are logged under **`agent.openrouter`** (`llm.tokens`) and **`llm_token_usage`** trace events.
+
+**Dry path (no Resend; still runs HubSpot readiness when CRM is configured):**
+
+```powershell
+Set-Location "d:\FDE-Training\week-10\conversion-engine"
+$env:LOG_LEVEL = "INFO"
+python agent/scripts/run_e2e_lead.py `
+  --company-id "your-company-slug" `
+  --company-name "Your Company Name" `
+  --company-domain "yourdomain.com" `
+  --no-reply
+```
+
+**Full path (email reply + Act II pre-reply enrichment):** default channel is **email** so you can paste real thread text; use **`--reply-channel sms`** for SMS-only tests.
+
+```powershell
+python agent/scripts/run_e2e_lead.py `
+  --company-id "your-company-slug" `
+  --company-name "Your Company Name" `
+  --company-domain "yourdomain.com" `
+  --send-email --to-email "you@example.com" `
+  --prospect-email "you@example.com" `
+  --reply-subject "Re: your note" `
+  --reply-content "Thanks — yes, Thursday 2pm works. What is the calendar link?"
+```
+
+**Live first-touch email after stages (Resend + policy):** **`--send-email --to-email`** (see above). Requires **`RESEND_*`**, **`OPENROUTER_API_KEY`** for LLM drafts, and live policy rules as for `python agent/scripts/live_smoke.py email`. After send, the script logs the outbound in **`message_log`** so **`handle_reply`** can load prior email context for the reply LLM. Optional **`TENACIOUS_SALES_DATA_PATH`** overrides the default **`./tenacious_sales_data`** root.
+
 Notes:
 * live side-effect commands are blocked when `CHALLENGE_MODE=true` and `SINK_ROUTING_ENABLED=false`.
 * use `-Cold` on SMS script and `-Unconfirmed` on booking script to validate policy-block behavior.

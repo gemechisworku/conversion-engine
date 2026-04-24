@@ -40,6 +40,7 @@ def _deps() -> LeadIntakeGraphDeps:
     http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     crunchbase = CrunchbaseAdapter(settings=settings)
     services = {
+        "settings": settings,
         "crunchbase": crunchbase,
         "jobs": JobsPlaywrightCollector(settings=settings, http_client=http_client),
         "layoffs": LayoffsAdapter(settings=settings),

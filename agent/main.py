@@ -63,6 +63,7 @@ def build_orchestration_runtime() -> OrchestrationRuntime:
     state_repo = build_state_repo()
     crunchbase, jobs, layoffs, leadership, merger, competitor_gap, llm = build_enrichment_services()
     enrichment_services = {
+        "settings": settings,
         "crunchbase": crunchbase,
         "jobs": jobs,
         "layoffs": layoffs,
