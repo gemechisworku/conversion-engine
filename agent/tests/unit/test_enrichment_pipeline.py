@@ -91,8 +91,57 @@ def test_merger_produces_complete_schema_and_partial_confidence() -> None:
         leadership_changes=None,
     )
 
-    assert set(artifact.signals.keys()) == {"crunchbase", "job_posts", "layoffs", "leadership_changes"}
+    assert set(artifact.signals.keys()) == {
+        "crunchbase",
+        "job_posts",
+        "layoffs",
+        "leadership_changes",
+        "tech_stack",
+    }
     assert artifact.merged_confidence["leadership_signal"] <= 0.2
+
+
+def test_jobs_adapter_respects_robots_block() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nDisallow: /careers\n")
+        return httpx.Response(200, text="<div>ML Engineer</div>", headers={"Content-Type": "text/html"})
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    collector = JobsPlaywrightCollector(settings=_settings(), http_client=http_client)
+    snapshot = asyncio.run(collector.collect(company_domain="acme.ai", company_name="Acme AI"))
+    asyncio.run(http_client.aclose())
+    summary = snapshot.summary if isinstance(snapshot.summary, dict) else {}
+
+    assert "https://acme.ai/careers" in summary["robots_blocked_urls"]
+
+
+def test_crunchbase_collect_includes_recent_funding_events() -> None:
+    path = Path("outputs/test-fixtures/recent_funding.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        """
+        [{
+          "id": "funded_co",
+          "name": "Funded Co",
+          "website": "https://funded.example",
+          "industries": "[{\\"id\\":\\"fintech\\",\\"value\\":\\"FinTech\\"}]",
+          "funding_rounds_list": "[{\\"investment_type\\":\\"Series A\\",\\"announced_on\\":\\"2026-03-01\\",\\"money_raised\\":{\\"value_usd\\":5000000}}]",
+          "builtwith_tech": "[{\\"name\\":\\"OpenAI\\"}]"
+        }]
+        """.strip(),
+        encoding="utf-8",
+    )
+    snapshot = asyncio.run(
+        CrunchbaseAdapter(settings=_settings(crunchbase_dataset_path=str(path))).collect(
+            company_id="funded_co",
+            company_domain="funded.example",
+        )
+    )
+    summary = snapshot.summary if isinstance(snapshot.summary, dict) else {}
+
+    assert summary["funding_events_180d"][0]["round"] == "Series A"
+    assert "OpenAI" in summary["tech_stack"]
 
 
 def test_jobs_module_has_no_interactive_auth_flow() -> None:
@@ -101,4 +150,3 @@ def test_jobs_module_has_no_interactive_auth_flow() -> None:
     blocked_patterns = ["page.fill(", "input[type=password]", "solve_", "anti-bot", "stealth"]
     for pattern in blocked_patterns:
         assert pattern not in content
-

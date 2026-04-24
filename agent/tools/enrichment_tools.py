@@ -21,10 +21,15 @@ async def enrich_company(
     leadership: LeadershipChangeDetector,
     merger: EnrichmentPipeline,
 ) -> EnrichmentArtifact:
+    crunchbase_row = await crunchbase.resolve_record(
+        company_id=company_id,
+        company_name=company_name,
+        company_domain=company_domain,
+    )
     crunchbase_signal = await crunchbase.collect(company_id=company_id, company_domain=company_domain)
-    jobs_signal = await jobs.collect(company_domain=company_domain)
-    layoffs_signal = await layoffs.collect(company_name=company_name)
-    leadership_signal = await leadership.collect(company_name=company_name)
+    jobs_signal = await jobs.collect(company_domain=company_domain, company_name=company_name)
+    layoffs_signal = await layoffs.collect(company_name=company_name, crunchbase_row=crunchbase_row)
+    leadership_signal = await leadership.collect(company_name=company_name, crunchbase_row=crunchbase_row)
     return merger.merge(
         company_id=company_id,
         crunchbase=crunchbase_signal,
@@ -32,4 +37,3 @@ async def enrich_company(
         layoffs=layoffs_signal,
         leadership_changes=leadership_signal,
     )
-

@@ -4,6 +4,8 @@ param(
   [string]$ProspectName = "",
   [string]$Timezone = "UTC",
   [string]$LeadId = "",
+  [string]$CompanyName = "",
+  [string]$CompanyDomain = "",
   [string]$SlotId = "",
   [string]$Start = "",
   [string]$End = "",
@@ -25,6 +27,12 @@ if ($ProspectName) {
 }
 if ($LeadId) {
   $argsList += @("--lead-id", $LeadId)
+}
+if ($CompanyName) {
+  $argsList += @("--company-name", $CompanyName)
+}
+if ($CompanyDomain) {
+  $argsList += @("--company-domain", $CompanyDomain)
 }
 if ($SlotId) {
   $argsList += @("--slot-id", $SlotId)

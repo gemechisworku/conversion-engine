@@ -328,6 +328,8 @@ async def book_and_sync_crm(
     booking_request: BookingRequest,
     calcom_service: CalComService,
     hubspot_service: HubSpotMCPService,
+    company_name: str | None = None,
+    company_domain: str | None = None,
 ) -> LinkedBookingResult:
     # Implements: FR-11, FR-12
     # Workflow: scheduling_and_booking.md
@@ -347,6 +349,8 @@ async def book_and_sync_crm(
         starts_at=booking.starts_at,
         ends_at=booking.ends_at,
         confirmed_by_prospect=booking.confirmed_by_prospect,
+        company_name=company_name,
+        company_domain=company_domain,
     )
     crm_write = await hubspot_service.record_booking(
         lead_id=lead_id,

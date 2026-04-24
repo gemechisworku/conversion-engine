@@ -24,11 +24,12 @@ def _settings(**overrides: object) -> Settings:
     return Settings(**defaults)
 
 
-def _request() -> OutboundEmailRequest:
+def _request(*, review_status: str = "approved") -> OutboundEmailRequest:
     return OutboundEmailRequest(
         lead_id="lead_123",
         draft_id="draft_123",
         review_id="review_123",
+        review_status=review_status,
         trace_id="trace_123",
         idempotency_key="idem_123",
         to_email="prospect@example.com",
@@ -43,6 +44,7 @@ def test_send_email_success_returns_normalized_result() -> None:
         assert request.headers["Idempotency-Key"] == "idem_123"
         payload = await request.aread()
         assert b"Quick intro" in payload
+        assert b"X-Tenacious-Status" in payload
         return httpx.Response(202, json={"id": "re_msg_123"})
 
     http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -123,3 +125,18 @@ def test_send_email_retries_transient_failure_then_succeeds() -> None:
     assert result.accepted is True
     assert result.provider_message_id == "re_msg_retry"
     assert state["calls"] == 2
+
+
+def test_send_email_blocked_without_approved_review() -> None:
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(202, json={"id": "unused"})))
+    client = ResendEmailClient(
+        settings=_settings(),
+        policy_service=OutboundPolicyService(_settings()),
+        http_client=http_client,
+    )
+    result = asyncio.run(client.send_email(_request(review_status="pending")))
+    asyncio.run(http_client.aclose())
+
+    assert result.accepted is False
+    assert result.error is not None
+    assert result.error.error_code == "POLICY_BLOCKED"

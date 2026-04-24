@@ -20,6 +20,7 @@ class OutboundEmailRequest(BaseModel):
     lead_id: str
     draft_id: str
     review_id: str
+    review_status: Literal["approved", "approved_with_edits", "pending", "rejected", "blocked_by_policy"] = "approved"
     trace_id: str
     idempotency_key: str
     to_email: str

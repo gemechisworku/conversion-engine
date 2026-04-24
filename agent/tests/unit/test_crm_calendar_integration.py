@@ -990,3 +990,45 @@ def test_hubspot_marks_tool_iserror_as_failed() -> None:
     assert result.error is not None
     assert result.error.error_code == "CRM_SYNC_FAILED"
     assert "A non-empty list of objects" in result.error.error_message
+
+
+def test_hubspot_tool_readiness_requires_minimum_count() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        method = payload.get("method")
+        if method == "initialize":
+            return httpx.Response(
+                200,
+                headers={"Mcp-Session-Id": "sess_tools"},
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}},
+                },
+            )
+        if method == "notifications/initialized":
+            return httpx.Response(202)
+        if method == "tools/list":
+            tools = [{"name": f"tool_{idx}"} for idx in range(9)]
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {"tools": tools},
+                },
+            )
+        raise AssertionError(f"unexpected MCP method: {method}")
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    settings = _settings(hubspot_mcp_required_tool_count=9)
+    service = HubSpotMCPService(
+        settings=settings,
+        policy_service=OutboundPolicyService(settings),
+        http_client=http_client,
+    )
+    readiness = asyncio.run(service.verify_tool_readiness())
+    asyncio.run(http_client.aclose())
+
+    assert readiness["ready"] is True
+    assert readiness["discovered_count"] >= 9

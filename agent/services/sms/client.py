@@ -12,6 +12,7 @@ from agent.services.common.schemas import ErrorEnvelope, ProviderSendResult
 from agent.services.observability.events import log_trace_event
 from agent.services.policy.channel_policy import can_use_sms
 from agent.services.policy.outbound_policy import OutboundPolicyService
+from agent.repositories.state_repo import SQLiteStateRepository
 from agent.services.sms.router import SMSRouter
 from agent.services.sms.schemas import InboundSMSEvent, OutboundSMSRequest
 from agent.services.sms.webhook import AfricasTalkingWebhookParser
@@ -32,6 +33,7 @@ class SMSService:
         parser: AfricasTalkingWebhookParser,
         router: SMSRouter,
         http_client: httpx.AsyncClient | None = None,
+        state_repo: SQLiteStateRepository | None = None,
         max_retries: int = 2,
     ) -> None:
         self._settings = settings
@@ -39,13 +41,47 @@ class SMSService:
         self._parser = parser
         self._router = router
         self._http_client = http_client
+        self._state_repo = state_repo
         self._max_retries = max_retries
 
     async def send_warm_lead_sms(self, request: OutboundSMSRequest) -> ProviderSendResult:
         self._settings.require("africastalking_username", "africastalking_api_key")
+        metadata = request.metadata or {}
         decisions = self._policy_service.check_email_send(trace_id=request.trace_id, lead_id=request.lead_id)
+        decisions.append(
+            self._policy_service.check_review_approval(
+                trace_id=request.trace_id,
+                lead_id=request.lead_id,
+                review_id=request.review_id,
+                review_status=request.review_status,
+            )
+        )
+        decisions.append(
+            self._policy_service.check_claim_grounding(
+                trace_id=request.trace_id,
+                lead_id=request.lead_id,
+                unsupported_claims=bool(metadata.get("unsupported_claims", False)),
+            )
+        )
+        decisions.append(
+            self._policy_service.check_bench_commitment(
+                trace_id=request.trace_id,
+                lead_id=request.lead_id,
+                message=request.message,
+                bench_verified=bool(metadata.get("bench_verified", False)),
+            )
+        )
         channel_decision = can_use_sms(lead_state=request.lead_channel_state, trace_id=request.trace_id)
         decisions.append(channel_decision)
+        if self._state_repo is not None and not self._state_repo.is_sms_allowed(lead_id=request.lead_id):
+            decisions.append(
+                self._policy_service.check_escalation_trigger(
+                    trace_id=request.trace_id,
+                    lead_id=request.lead_id,
+                    needs_human_handoff=True,
+                    reason="SMS blocked due to STOP/UNSUB consent state.",
+                )
+            )
         blocked = next((decision for decision in decisions if not decision.is_allowed), None)
         if blocked:
             error = ErrorEnvelope(
@@ -109,6 +145,8 @@ class SMSService:
                         status="success",
                         payload={"provider_message_id": provider_message_id, "draft_id": request.draft_id},
                     )
+                    if self._state_repo is not None:
+                        self._state_repo.bind_phone(lead_id=request.lead_id, phone_number=request.to_number)
                     return result
 
                 retryable = response.status_code >= 500
@@ -150,8 +188,19 @@ class SMSService:
         payload: dict[str, Any],
         headers: dict[str, str] | None,
         raw_body: bytes | str | None = None,
+        lead_id: str | None = None,
     ) -> InboundSMSEvent:
         event = self._parser.parse(payload=payload, headers=headers, raw_body=raw_body)
+        if self._state_repo is not None:
+            resolved_lead_id = lead_id or self._state_repo.find_lead_by_phone(phone_number=event.from_number)
+            if resolved_lead_id:
+                if event.event_type in {"command_stop", "command_unsub"}:
+                    self._state_repo.set_sms_consent(lead_id=resolved_lead_id, allowed=False)
+                elif event.event_type == "command_help":
+                    # Keep explicit consent as-is; help is informational.
+                    pass
+                if event.from_number:
+                    self._state_repo.bind_phone(lead_id=resolved_lead_id, phone_number=event.from_number)
         await self._router.route(event)
         return event
 

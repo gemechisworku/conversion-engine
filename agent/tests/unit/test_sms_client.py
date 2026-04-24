@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
+from uuid import uuid4
+
 import httpx
 
 from agent.config.settings import Settings
+from agent.repositories.state_repo import SQLiteStateRepository
 from agent.services.policy.channel_policy import LeadChannelState
 from agent.services.policy.outbound_policy import OutboundPolicyService
 from agent.services.sms.client import SMSService
@@ -26,11 +30,12 @@ def _settings(**overrides: object) -> Settings:
     return Settings(**defaults)
 
 
-def _request(*, warm: bool) -> OutboundSMSRequest:
+def _request(*, warm: bool, review_status: str = "approved") -> OutboundSMSRequest:
     return OutboundSMSRequest(
         lead_id="lead_1",
         draft_id="draft_sms_1",
         review_id="review_sms_1",
+        review_status=review_status,
         trace_id="trace_sms_1",
         idempotency_key="idem_sms_1",
         to_number="+254700000001",
@@ -43,13 +48,18 @@ def _request(*, warm: bool) -> OutboundSMSRequest:
     )
 
 
-def _service(settings: Settings, http_client: httpx.AsyncClient | None = None) -> SMSService:
+def _service(
+    settings: Settings,
+    http_client: httpx.AsyncClient | None = None,
+    state_repo: SQLiteStateRepository | None = None,
+) -> SMSService:
     return SMSService(
         settings=settings,
         policy_service=OutboundPolicyService(settings),
         parser=AfricasTalkingWebhookParser(settings),
         router=SMSRouter(),
         http_client=http_client,
+        state_repo=state_repo,
     )
 
 
@@ -137,3 +147,29 @@ def test_outbound_sms_retries_then_succeeds() -> None:
     assert result.accepted is True
     assert result.provider_message_id == "ATXid_retry"
     assert state["calls"] == 2
+
+
+def test_outbound_sms_blocked_without_approved_review() -> None:
+    settings = _settings()
+    service = _service(settings)
+
+    result = asyncio.run(service.send_warm_lead_sms(_request(warm=True, review_status="pending")))
+
+    assert result.accepted is False
+    assert result.error is not None
+    assert result.error.error_code == "POLICY_BLOCKED"
+    assert "review" in result.error.error_message.lower()
+
+
+def test_outbound_sms_blocked_after_stop_consent() -> None:
+    db_path = Path(f"outputs/test_sms_state_{uuid4().hex}.db")
+    repo = SQLiteStateRepository(db_path=str(db_path))
+    repo.set_sms_consent(lead_id="lead_1", allowed=False)
+    settings = _settings()
+    service = _service(settings, state_repo=repo)
+
+    result = asyncio.run(service.send_warm_lead_sms(_request(warm=True)))
+
+    assert result.accepted is False
+    assert result.error is not None
+    assert result.error.error_code == "POLICY_BLOCKED"

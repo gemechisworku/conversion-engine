@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from uuid import uuid4
 
 from agent.config.settings import Settings
+from agent.repositories.state_repo import SQLiteStateRepository
 from agent.services.policy.outbound_policy import OutboundPolicyService
 from agent.services.sms.client import SMSService
 from agent.services.sms.router import SMSRouter
@@ -64,3 +66,50 @@ def test_inbound_sms_routed_downstream() -> None:
 
     assert event.event_type == "inbound_sms"
     assert routed == ["inbound_sms"]
+
+
+def test_sms_stop_command_parsed() -> None:
+    parser = AfricasTalkingWebhookParser(_settings())
+    event = parser.parse(
+        payload={
+            "id": "ATXid_stop",
+            "from": "+254700000001",
+            "to": "+254700000999",
+            "text": "STOP",
+            "date": "2026-04-23T12:30:00Z",
+        },
+        headers={},
+    )
+    assert event.event_type == "command_stop"
+
+
+def test_stop_command_updates_sms_consent_state() -> None:
+    settings = _settings()
+    db_path = Path(f"outputs/test_sms_webhook_state_{uuid4().hex}.db")
+    repo = SQLiteStateRepository(db_path=str(db_path))
+    repo.set_sms_consent(lead_id="lead_sms_cmd", allowed=True)
+
+    service = SMSService(
+        settings=settings,
+        policy_service=OutboundPolicyService(settings),
+        parser=AfricasTalkingWebhookParser(settings),
+        router=SMSRouter(),
+        state_repo=repo,
+    )
+
+    event = asyncio.run(
+        service.handle_inbound_sms(
+            payload={
+                "id": "ATXid_stop",
+                "from": "+254700000009",
+                "to": "+254700000999",
+                "text": "STOP",
+                "date": "2026-04-23T12:30:00Z",
+            },
+            headers={},
+            lead_id="lead_sms_cmd",
+        )
+    )
+
+    assert event.event_type == "command_stop"
+    assert repo.is_sms_allowed(lead_id="lead_sms_cmd") is False

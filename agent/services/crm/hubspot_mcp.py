@@ -121,6 +121,62 @@ class HubSpotMCPService:
             success_status="event_recorded",
         )
 
+    async def append_event(
+        self,
+        *,
+        lead_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        trace_id: str,
+        idempotency_key: str,
+    ) -> CRMWriteResult:
+        body = {
+            "lead_id": lead_id,
+            "event_type": event_type,
+            "event_key": idempotency_key,
+            "payload": payload,
+        }
+        return await self._write(
+            operation="append_event",
+            payload=body,
+            trace_id=trace_id,
+            lead_id=lead_id,
+            idempotency_key=idempotency_key,
+            success_status="event_recorded",
+        )
+
+    async def set_stage(
+        self,
+        *,
+        lead_id: str,
+        stage: str,
+        trace_id: str,
+        idempotency_key: str,
+    ) -> CRMWriteResult:
+        return await self.append_event(
+            lead_id=lead_id,
+            event_type="lead_stage_updated",
+            payload={"stage": stage},
+            trace_id=trace_id,
+            idempotency_key=idempotency_key,
+        )
+
+    async def attach_brief_refs(
+        self,
+        *,
+        lead_id: str,
+        brief_refs: list[str],
+        trace_id: str,
+        idempotency_key: str,
+    ) -> CRMWriteResult:
+        return await self.append_event(
+            lead_id=lead_id,
+            event_type="brief_refs_attached",
+            payload={"brief_refs": brief_refs},
+            trace_id=trace_id,
+            idempotency_key=idempotency_key,
+        )
+
     async def list_tools(self) -> list[str]:
         tools = await self._list_tools()
         names: list[str] = []
@@ -129,6 +185,30 @@ class HubSpotMCPService:
             if isinstance(name, str) and name.strip():
                 names.append(name)
         return sorted(set(names))
+
+    async def verify_tool_readiness(self) -> dict[str, Any]:
+        tools = await self.list_tools()
+        required_tools_csv = self._settings.hubspot_mcp_required_tools_csv.strip()
+        missing: list[str] = []
+        if required_tools_csv:
+            required = [item.strip() for item in required_tools_csv.split(",") if item.strip()]
+            missing = [name for name in required if name not in tools]
+            ready = len(missing) == 0
+            return {
+                "ready": ready,
+                "required": required,
+                "discovered": tools,
+                "missing": missing,
+            }
+        required_count = max(1, int(self._settings.hubspot_mcp_required_tool_count))
+        ready = len(tools) >= required_count
+        return {
+            "ready": ready,
+            "required_count": required_count,
+            "discovered_count": len(tools),
+            "discovered": tools,
+            "missing_count": max(0, required_count - len(tools)),
+        }
 
     async def _write(
         self,
@@ -431,7 +511,12 @@ class HubSpotMCPService:
         event_type = self._coerce_str(payload.get("event_type")) if isinstance(payload, dict) else None
         event_key = self._coerce_str(payload.get("event_key")) if isinstance(payload, dict) else None
         event_payload = payload.get("payload", {}) if isinstance(payload, dict) else {}
-        anchor_company_id = await self._ensure_event_anchor_company(lead_id=lead_id)
+        company_name, company_domain = self._company_context_from_event_payload(event_payload)
+        anchor_company_id = await self._ensure_event_anchor_company(
+            lead_id=lead_id,
+            company_name=company_name,
+            company_domain=company_domain,
+        )
         note_body = self._render_event_note_body(
             lead_id=lead_id,
             event_type=event_type,
@@ -468,7 +553,12 @@ class HubSpotMCPService:
         if not isinstance(event_payload, dict):
             return None
 
-        anchor_company_id = await self._ensure_event_anchor_company(lead_id=lead_id)
+        company_name, company_domain = self._company_context_from_event_payload(event_payload)
+        anchor_company_id = await self._ensure_event_anchor_company(
+            lead_id=lead_id,
+            company_name=company_name,
+            company_domain=company_domain,
+        )
         properties = self._event_projection_properties(event_type=event_type, event_payload=event_payload)
         if not properties:
             return None
@@ -537,6 +627,17 @@ class HubSpotMCPService:
             properties["description"] = f"enrichment: funding={funding}; hiring={hiring}; leadership={leadership}"
             return properties
 
+        if event_type == "lead_stage_updated":
+            stage = HubSpotMCPService._coerce_str(event_payload.get("stage")) or "unknown"
+            properties["description"] = f"lead_stage={stage}"
+            return properties
+
+        if event_type == "brief_refs_attached":
+            refs = event_payload.get("brief_refs")
+            if isinstance(refs, list) and refs:
+                properties["description"] = f"brief_refs={','.join(str(item) for item in refs)}"
+                return properties
+
         return {}
 
     @staticmethod
@@ -594,9 +695,40 @@ class HubSpotMCPService:
         }
         return json.dumps(summary, ensure_ascii=True)
 
-    async def _ensure_event_anchor_company(self, *, lead_id: str | None) -> int:
+    async def _ensure_event_anchor_company(
+        self,
+        *,
+        lead_id: str | None,
+        company_name: str | None = None,
+        company_domain: str | None = None,
+    ) -> int:
         if not lead_id:
             raise ValueError("Booking/event payload is missing lead_id, cannot build HubSpot associations.")
+
+        target_company_id = await self._find_company_by_domain_or_name(domain=company_domain, name=company_name)
+        if target_company_id is not None:
+            return target_company_id
+
+        if company_name or company_domain:
+            properties: dict[str, str] = {
+                "description": f"event_anchor_for_lead_id={lead_id}",
+            }
+            if company_name:
+                properties["name"] = company_name
+            if company_domain:
+                properties["domain"] = company_domain
+            create_args = {
+                "createRequest": {
+                    "objects": [
+                        {
+                            "objectType": "companies",
+                            "properties": properties,
+                        }
+                    ]
+                },
+                "confirmationStatus": "CONFIRMATION_WAIVED_FOR_SESSION",
+            }
+            return await self._create_anchor_company(create_args=create_args)
 
         anchor_name = f"Lead {lead_id}"
         existing_id = await self._find_company_by_domain_or_name(domain=None, name=anchor_name)
@@ -617,6 +749,9 @@ class HubSpotMCPService:
             },
             "confirmationStatus": "CONFIRMATION_WAIVED_FOR_SESSION",
         }
+        return await self._create_anchor_company(create_args=create_args)
+
+    async def _create_anchor_company(self, *, create_args: dict[str, Any]) -> int:
         create_result = await self._call_tool(name="manage_crm_objects", arguments=create_args)
         if self._tool_error_message(create_result):
             raise _MCPCallError(
@@ -645,7 +780,8 @@ class HubSpotMCPService:
                     return int(object_id.strip())
 
         # Fallback lookup in case create response omits explicit IDs.
-        fallback_id = await self._find_company_by_domain_or_name(domain=None, name=anchor_name)
+        fallback_name = self._company_name_from_create_args(create_args)
+        fallback_id = await self._find_company_by_domain_or_name(domain=None, name=fallback_name)
         if fallback_id is not None:
             return fallback_id
         raise _MCPCallError(
@@ -653,6 +789,40 @@ class HubSpotMCPService:
             retryable=False,
             details={"tool_result": create_result},
         )
+
+    @staticmethod
+    def _company_name_from_create_args(create_args: dict[str, Any]) -> str | None:
+        create_request = create_args.get("createRequest")
+        if not isinstance(create_request, dict):
+            return None
+        objects = create_request.get("objects")
+        if not isinstance(objects, list) or not objects:
+            return None
+        first = objects[0]
+        if not isinstance(first, dict):
+            return None
+        properties = first.get("properties")
+        if not isinstance(properties, dict):
+            return None
+        return HubSpotMCPService._coerce_str(properties.get("name"))
+
+    @staticmethod
+    def _company_context_from_event_payload(event_payload: Any) -> tuple[str | None, str | None]:
+        if not isinstance(event_payload, dict):
+            return None, None
+        company_name = HubSpotMCPService._coerce_str(event_payload.get("company_name"))
+        company_domain = HubSpotMCPService._coerce_str(event_payload.get("company_domain"))
+        if company_name or company_domain:
+            return company_name, company_domain
+        enrichment_brief = event_payload.get("enrichment_brief")
+        if isinstance(enrichment_brief, dict):
+            firmographics = enrichment_brief.get("firmographics")
+            if isinstance(firmographics, dict):
+                return (
+                    HubSpotMCPService._coerce_str(firmographics.get("company_name")),
+                    HubSpotMCPService._coerce_str(firmographics.get("domain")),
+                )
+        return None, None
 
     async def _find_company_by_domain_or_name(self, *, domain: str | None, name: str | None) -> int | None:
         filters: list[dict[str, Any]] = []

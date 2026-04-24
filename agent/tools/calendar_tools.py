@@ -7,8 +7,16 @@ from agent.services.calendar.schemas import AvailabilityRequest, BookingRequest,
 from agent.services.crm.hubspot_mcp import HubSpotMCPService
 
 
+def resolve_timezone(*, explicit_timezone: str | None, fallback_timezone: str = "UTC") -> str:
+    return (explicit_timezone or "").strip() or fallback_timezone
+
+
 async def get_calendar_slots(*, service: CalComService, request: AvailabilityRequest) -> list[CalendarSlot]:
     return await service.get_available_slots(request)
+
+
+def propose_slots(*, slots: list[CalendarSlot], limit: int = 3) -> list[CalendarSlot]:
+    return slots[: max(1, limit)]
 
 
 async def book_discovery_call(*, service: CalComService, request: BookingRequest) -> BookingResult:
@@ -28,4 +36,3 @@ async def book_and_sync(
         calcom_service=calcom_service,
         hubspot_service=hubspot_service,
     )
-

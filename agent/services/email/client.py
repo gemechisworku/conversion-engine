@@ -38,9 +38,34 @@ class ResendEmailClient:
 
     async def send_email(self, request: OutboundEmailRequest) -> ProviderSendResult:
         self._settings.require("resend_api_key")
+        metadata = request.metadata or {}
         policy_decisions = self._policy_service.check_email_send(
             trace_id=request.trace_id,
             lead_id=request.lead_id,
+        )
+        policy_decisions.append(
+            self._policy_service.check_review_approval(
+                trace_id=request.trace_id,
+                lead_id=request.lead_id,
+                review_id=request.review_id,
+                review_status=request.review_status,
+            )
+        )
+        policy_decisions.append(
+            self._policy_service.check_claim_grounding(
+                trace_id=request.trace_id,
+                lead_id=request.lead_id,
+                unsupported_claims=bool(metadata.get("unsupported_claims", False)),
+            )
+        )
+        combined_body = f"{request.subject}\n{request.text_body or ''}\n{request.html_body or ''}"
+        policy_decisions.append(
+            self._policy_service.check_bench_commitment(
+                trace_id=request.trace_id,
+                lead_id=request.lead_id,
+                message=combined_body,
+                bench_verified=bool(metadata.get("bench_verified", False)),
+            )
         )
         blocked = next((decision for decision in policy_decisions if not decision.is_allowed), None)
         if blocked:
@@ -70,7 +95,11 @@ class ResendEmailClient:
             "from": request.from_email or self._settings.resend_from_email,
             "to": [request.to_email],
             "subject": request.subject,
-            "headers": {"X-Lead-Id": request.lead_id, "X-Draft-Id": request.draft_id},
+            "headers": {
+                "X-Lead-Id": request.lead_id,
+                "X-Draft-Id": request.draft_id,
+                "X-Tenacious-Status": str(metadata.get("tenacious_status", "draft")),
+            },
         }
         if not payload["from"]:
             error = ErrorEnvelope(

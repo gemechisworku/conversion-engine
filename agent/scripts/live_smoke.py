@@ -179,6 +179,8 @@ async def run_booking_sync(args: argparse.Namespace) -> None:
         booking_request=request,
         calcom_service=calcom,
         hubspot_service=hubspot,
+        company_name=args.company_name or None,
+        company_domain=args.company_domain or None,
     )
     print(json.dumps(linked.model_dump(mode="json"), indent=2))
 
@@ -219,7 +221,8 @@ async def run_hubspot_tools(_: argparse.Namespace) -> None:
     _ensure_hubspot_is_configured()
     hubspot = build_hubspot_service()
     tools = await hubspot.list_tools()
-    print(json.dumps({"count": len(tools), "tools": tools}, indent=2))
+    readiness = await hubspot.verify_tool_readiness()
+    print(json.dumps({"count": len(tools), "tools": tools, "readiness": readiness}, indent=2))
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -247,6 +250,8 @@ def _build_parser() -> argparse.ArgumentParser:
     booking.add_argument("--prospect-name", default=None)
     booking.add_argument("--timezone", default="UTC")
     booking.add_argument("--lead-id", default="", help="Optional fixed lead_id for traceability.")
+    booking.add_argument("--company-name", default="", help="Optional company name for HubSpot event association.")
+    booking.add_argument("--company-domain", default="", help="Optional company domain for HubSpot event association.")
     booking.add_argument("--slot-id", default="", help="Optional explicit slot id.")
     booking.add_argument("--start", default="", help="Optional booking start datetime ISO8601.")
     booking.add_argument("--end", default="", help="Optional booking end datetime ISO8601.")
@@ -281,7 +286,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Mark booking payload as unconfirmed.",
     )
 
-    subparsers.add_parser("hubspot-tools", help="List available remote HubSpot MCP tools.")
+    hubspot_tools = subparsers.add_parser("hubspot-tools", help="List available remote HubSpot MCP tools.")
+    hubspot_tools.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail when tool readiness check is not satisfied.",
+    )
 
     return parser
 
@@ -304,6 +314,11 @@ def main() -> None:
         return
     if args.command == "hubspot-tools":
         asyncio.run(run_hubspot_tools(args))
+        if getattr(args, "strict", False):
+            hubspot = build_hubspot_service()
+            readiness = asyncio.run(hubspot.verify_tool_readiness())
+            if not readiness.get("ready", False):
+                raise SystemExit(f"HubSpot MCP readiness failed: {json.dumps(readiness)}")
         return
     raise SystemExit(f"Unknown command: {args.command}")
 

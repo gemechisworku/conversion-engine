@@ -54,3 +54,107 @@ class OutboundPolicyService:
             self.check_sink_routing(trace_id=trace_id, lead_id=lead_id),
         ]
 
+    def check_review_approval(
+        self,
+        *,
+        trace_id: str,
+        lead_id: str,
+        review_id: str,
+        review_status: str,
+    ) -> PolicyDecision:
+        if not review_id.strip():
+            return PolicyDecision(
+                policy_type="claim_validation",
+                decision="blocked",
+                reason="Missing review_id; outbound send requires completed review.",
+                trace_id=trace_id,
+                lead_id=lead_id,
+            )
+        if review_status not in {"approved", "approved_with_edits"}:
+            return PolicyDecision(
+                policy_type="claim_validation",
+                decision="blocked",
+                reason=f"Review status '{review_status}' is not send-eligible.",
+                trace_id=trace_id,
+                lead_id=lead_id,
+            )
+        return PolicyDecision(
+            policy_type="claim_validation",
+            decision="pass",
+            reason="Review approval check passed.",
+            trace_id=trace_id,
+            lead_id=lead_id,
+        )
+
+    def check_bench_commitment(
+        self,
+        *,
+        trace_id: str,
+        lead_id: str,
+        message: str,
+        bench_verified: bool,
+    ) -> PolicyDecision:
+        commitment_terms = ("exact team", "5-person", "can start next week", "guaranteed capacity")
+        lowered = message.lower()
+        if any(term in lowered for term in commitment_terms) and not bench_verified:
+            return PolicyDecision(
+                policy_type="bench_commitment",
+                decision="blocked",
+                reason="Bench commitment language detected without verification.",
+                trace_id=trace_id,
+                lead_id=lead_id,
+            )
+        return PolicyDecision(
+            policy_type="bench_commitment",
+            decision="pass",
+            reason="Bench commitment check passed.",
+            trace_id=trace_id,
+            lead_id=lead_id,
+        )
+
+    def check_claim_grounding(
+        self,
+        *,
+        trace_id: str,
+        lead_id: str,
+        unsupported_claims: bool,
+    ) -> PolicyDecision:
+        if unsupported_claims:
+            return PolicyDecision(
+                policy_type="claim_validation",
+                decision="blocked",
+                reason="Unsupported claims were flagged for this draft.",
+                trace_id=trace_id,
+                lead_id=lead_id,
+            )
+        return PolicyDecision(
+            policy_type="claim_validation",
+            decision="pass",
+            reason="Claim grounding check passed.",
+            trace_id=trace_id,
+            lead_id=lead_id,
+        )
+
+    def check_escalation_trigger(
+        self,
+        *,
+        trace_id: str,
+        lead_id: str,
+        needs_human_handoff: bool,
+        reason: str = "",
+    ) -> PolicyDecision:
+        if needs_human_handoff:
+            return PolicyDecision(
+                policy_type="escalation",
+                decision="escalate",
+                reason=reason or "Human handoff required by policy trigger.",
+                trace_id=trace_id,
+                lead_id=lead_id,
+            )
+        return PolicyDecision(
+            policy_type="escalation",
+            decision="pass",
+            reason="No escalation trigger detected.",
+            trace_id=trace_id,
+            lead_id=lead_id,
+        )

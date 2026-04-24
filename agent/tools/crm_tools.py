@@ -47,3 +47,34 @@ async def crm_record_booking(
         idempotency_key=idempotency_key,
     )
 
+
+async def crm_set_stage(
+    *,
+    service: HubSpotMCPService,
+    lead_id: str,
+    stage: str,
+    trace_id: str,
+    idempotency_key: str,
+) -> CRMWriteResult:
+    return await service.set_stage(
+        lead_id=lead_id,
+        stage=stage,
+        trace_id=trace_id,
+        idempotency_key=idempotency_key,
+    )
+
+
+async def crm_attach_brief_refs(
+    *,
+    service: HubSpotMCPService,
+    lead_id: str,
+    brief_refs: list[str],
+    trace_id: str,
+    idempotency_key: str,
+) -> CRMWriteResult:
+    return await service.attach_brief_refs(
+        lead_id=lead_id,
+        brief_refs=brief_refs,
+        trace_id=trace_id,
+        idempotency_key=idempotency_key,
+    )

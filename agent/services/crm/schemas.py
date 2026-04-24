@@ -53,6 +53,8 @@ class CRMBookingPayload(BaseModel):
     starts_at: datetime | None = None
     ends_at: datetime | None = None
     confirmed_by_prospect: bool = True
+    company_name: str | None = None
+    company_domain: str | None = None
 
 
 class CRMWriteResult(BaseModel):
@@ -67,4 +69,3 @@ class CRMWriteResult(BaseModel):
     @property
     def succeeded(self) -> bool:
         return self.error is None and self.status in {"upserted", "event_recorded", "updated"}
-

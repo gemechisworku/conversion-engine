@@ -47,6 +47,14 @@ class AfricasTalkingWebhookParser:
             text = self._coerce(payload.get("text") or payload.get("message") or payload.get("content"))
             message_id = self._coerce(payload.get("id") or payload.get("messageId") or payload.get("message_id"))
             received_at = self._coerce_datetime(payload.get("date") or payload.get("createdAt"))
+            if text:
+                normalized_text = text.strip().upper()
+                if normalized_text == "STOP":
+                    event_type = "command_stop"
+                elif normalized_text == "HELP":
+                    event_type = "command_help"
+                elif normalized_text == "UNSUB":
+                    event_type = "command_unsub"
             if event_type == "inbound_sms" and (not from_number or not to_number or not text):
                 return self._malformed_event(payload, "Inbound SMS payload missing from/to/text.")
 
@@ -125,4 +133,3 @@ class AfricasTalkingWebhookParser:
                 except ValueError:
                     pass
         return datetime.now(UTC)
-

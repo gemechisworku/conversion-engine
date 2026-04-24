@@ -200,6 +200,8 @@ cp .env.example .env
   You can discover valid names with `.\scripts\smoke-hubspot-tools.ps1`.
   For many accounts, both can be set to `manage_crm_objects`.
   Legacy bridge keys `HUBSPOT_MCP_BASE_URL` and `HUBSPOT_MCP_API_KEY` are no longer used.
+* `HUBSPOT_MCP_REQUIRED_TOOLS_CSV`: optional comma-separated strict MCP tool list for readiness validation.
+* `HUBSPOT_MCP_REQUIRED_TOOL_COUNT`: fallback strict minimum discovered tool count (default `9`).
 * `HUBSPOT_COMPANY_PROP_LAST_BOOKING_*` (optional): internal names of custom **company** properties
   where confirmed booking fields are projected (`ID`, `START_AT`, `END_AT`, `TIMEZONE`, `URL`, `STATUS`).
   Create these in HubSpot: Settings -> Data Management -> Properties -> Object: Company.
@@ -209,11 +211,23 @@ cp .env.example .env
 * `CALCOM_EVENT_TYPE_SLUG`, `CALCOM_USERNAME`: alternative selector when event type ids are not available via API.
 * `CALCOM_WEBHOOK_SECRET`: Cal.com webhook settings.
 * `CRUNCHBASE_DATASET_PATH` / `CRUNCHBASE_DATASET_URL`: path or URL for your Crunchbase snapshot used by enrichment.
+  For Act II, use the provided local ODM export: `tenacious_sales_data/crunchbase-companies-information.csv`.
 * `LAYOFFS_CSV_PATH` / `LAYOFFS_CSV_URL`: layoffs.fyi CSV source used by the layoffs adapter.
 * `LEADERSHIP_FEED_URL`: JSON feed or local JSON file path for leadership-change detection.
+* `CFPB_API_URL`: CFPB public complaint API endpoint used only when the matched company is financial services.
+* `CFPB_RESULT_LIMIT`: maximum CFPB complaints fetched for top-issue extraction.
+* `ACT2_EVIDENCE_DIR`: directory where pre-reply Act II briefs are written as `enrichment_brief.json`,
+  `compliance_brief.json`, and `news_brief.json`, and where lead-intake briefs are written as
+  `hiring_signal_brief.json`, `competitor_gap_brief.json`, `ai_maturity_score.json`, and
+  `enrichment_artifact.json`.
+* `OPENROUTER_API_KEY`: OpenRouter dashboard -> Keys. Used only after deterministic evidence collection to
+  synthesize/validate AI maturity, hiring-signal, and competitor-gap outputs. If unavailable, deterministic
+  schema-valid outputs are still produced with softened confidence notes.
+* `OPENROUTER_MODEL`: model slug used for JSON synthesis, default `openai/gpt-4.1-mini`.
 * `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`: Langfuse project settings -> API keys.
 * `RENDER_WEBHOOK_BASE_URL`: base URL of your deployed webhook server on Render.
 * `WEBHOOK_ROUTE_RESEND`, `WEBHOOK_ROUTE_AFRICASTALKING`, `WEBHOOK_ROUTE_CALCOM`: deployed path values.
+* `STATE_DB_PATH`: SQLite runtime state store used for session/conversation/consent persistence.
 
 Notes:
 
@@ -247,6 +261,9 @@ From repo root, with `.env` configured and dependencies installed:
 
 # HubSpot remote MCP tool discovery
 .\scripts\smoke-hubspot-tools.ps1
+
+# Act II end-to-end smoke: orchestration + pre-reply enrichment + SMS + booking
+.\scripts\smoke-act2-live.ps1 -ProspectEmail "prospect@example.com" -SmsTo "+251900000000" -SmsInteractions 1
 ```
 
 Notes:

@@ -21,6 +21,7 @@ class OutboundSMSRequest(BaseModel):
     lead_id: str
     draft_id: str
     review_id: str
+    review_status: Literal["approved", "approved_with_edits", "pending", "rejected", "blocked_by_policy"] = "approved"
     trace_id: str
     idempotency_key: str
     to_number: str
@@ -38,7 +39,15 @@ class InboundSMSEvent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     provider: Literal["africastalking"] = "africastalking"
-    event_type: Literal["inbound_sms", "delivery_report", "unknown", "malformed"]
+    event_type: Literal[
+        "inbound_sms",
+        "delivery_report",
+        "command_stop",
+        "command_help",
+        "command_unsub",
+        "unknown",
+        "malformed",
+    ]
     provider_message_id: str | None = None
     from_number: str | None = None
     to_number: str | None = None
@@ -47,4 +56,3 @@ class InboundSMSEvent(BaseModel):
     raw_payload_ref: str
     error: ErrorEnvelope | None = None
     raw_payload: dict[str, Any] = Field(default_factory=dict)
-

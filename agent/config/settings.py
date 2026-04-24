@@ -102,6 +102,21 @@ class Settings(BaseSettings):
     layoffs_csv_path: str = Field(default="", alias="LAYOFFS_CSV_PATH")
     layoffs_csv_url: str = Field(default="", alias="LAYOFFS_CSV_URL")
     leadership_feed_url: str = Field(default="", alias="LEADERSHIP_FEED_URL")
+    cfpb_api_url: str = Field(
+        default="https://www.consumerfinance.gov/data-research/consumer-complaints/search/api/v1/",
+        alias="CFPB_API_URL",
+    )
+    cfpb_result_limit: int = Field(default=100, alias="CFPB_RESULT_LIMIT")
+    act2_evidence_dir: str = Field(default="outputs/evidence/act2_enrichment", alias="ACT2_EVIDENCE_DIR")
+    openrouter_api_key: str = Field(default="", alias="OPENROUTER_API_KEY")
+    openrouter_api_url: str = Field(
+        default="https://openrouter.ai/api/v1/chat/completions",
+        alias="OPENROUTER_API_URL",
+    )
+    openrouter_model: str = Field(default="openai/gpt-4.1-mini", alias="OPENROUTER_MODEL")
+    state_db_path: str = Field(default="outputs/runtime_state.db", alias="STATE_DB_PATH")
+    hubspot_mcp_required_tools_csv: str = Field(default="", alias="HUBSPOT_MCP_REQUIRED_TOOLS_CSV")
+    hubspot_mcp_required_tool_count: int = Field(default=9, alias="HUBSPOT_MCP_REQUIRED_TOOL_COUNT")
 
     langfuse_public_key: str = Field(default="", alias="LANGFUSE_PUBLIC_KEY")
     langfuse_secret_key: str = Field(default="", alias="LANGFUSE_SECRET_KEY")

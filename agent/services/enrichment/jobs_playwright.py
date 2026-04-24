@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+from urllib.parse import urlparse
+from urllib.robotparser import RobotFileParser
 from datetime import UTC, datetime
 from typing import Any
 
@@ -28,13 +30,21 @@ class JobsPlaywrightCollector:
         self._settings = settings
         self._http_client = http_client
 
-    async def collect(self, *, company_domain: str) -> SignalSnapshot:
+    async def collect(self, *, company_domain: str, company_name: str | None = None) -> SignalSnapshot:
+        slug = self._slug(company_name or company_domain)
         urls = [
             f"https://{company_domain}/careers",
             f"https://{company_domain}/jobs",
+            f"https://builtin.com/company/{slug}/jobs",
+            f"https://wellfound.com/company/{slug}/jobs",
         ]
         html_pages: list[tuple[str, str]] = []
+        blocked_urls: list[str] = []
         for url in urls:
+            allowed = await self._robots_allowed(url=url)
+            if not allowed:
+                blocked_urls.append(url)
+                continue
             html = await self._fetch_html(url=url)
             if html:
                 html_pages.append((url, html))
@@ -47,8 +57,10 @@ class JobsPlaywrightCollector:
                     "role_titles": [],
                     "scrape_timestamp": datetime.now(UTC).isoformat(),
                     "source_urls": urls,
+                    "robots_blocked_urls": blocked_urls,
+                    "window_days": 60,
                 },
-                confidence=0.3,
+                confidence=0.35 if blocked_urls else 0.3,
                 source_refs=[SourceRef(source_name="jobs_playwright", source_url=url) for url in urls],
             )
 
@@ -63,6 +75,8 @@ class JobsPlaywrightCollector:
                 "role_titles": role_titles[:25],
                 "scrape_timestamp": datetime.now(UTC).isoformat(),
                 "source_urls": [url for url, _ in html_pages],
+                "robots_blocked_urls": blocked_urls,
+                "window_days": 60,
             },
             confidence=confidence,
             source_refs=[SourceRef(source_name="jobs_playwright", source_url=url) for url, _ in html_pages],
@@ -75,7 +89,41 @@ class JobsPlaywrightCollector:
                 return response.text
         except httpx.HTTPError:
             pass
+        if self._http_client is None:
+            return await self._fetch_html_with_playwright(url=url)
         return None
+
+    async def _fetch_html_with_playwright(self, *, url: str) -> str | None:
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            return None
+        try:
+            async with async_playwright() as playwright:
+                browser = await playwright.chromium.launch(headless=True)
+                page = await browser.new_page(user_agent="TenaciousConversionEngineBot")
+                await page.goto(url, wait_until="domcontentloaded", timeout=int(self._settings.http_timeout_seconds * 1000))
+                html = await page.content()
+                await browser.close()
+                return html
+        except Exception:
+            return None
+
+    async def _robots_allowed(self, *, url: str) -> bool:
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            return False
+        robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
+        try:
+            response = await self._get(url=robots_url)
+        except httpx.HTTPError:
+            return True
+        if not response.is_success:
+            return True
+        parser = RobotFileParser()
+        parser.set_url(robots_url)
+        parser.parse(response.text.splitlines())
+        return parser.can_fetch("TenaciousConversionEngineBot", url)
 
     async def _get(self, *, url: str) -> httpx.Response:
         if self._http_client is not None:
@@ -107,3 +155,9 @@ class JobsPlaywrightCollector:
     def _is_ai_adjacent(title: str) -> bool:
         lower = title.lower()
         return any(token in lower for token in ("ai", "ml", "machine learning", "data"))
+
+    @staticmethod
+    def _slug(value: str) -> str:
+        parsed = urlparse(value if "://" in value else f"https://{value}")
+        base = (parsed.netloc or parsed.path).removeprefix("www.").split(".")[0]
+        return re.sub(r"[^a-z0-9]+", "-", base.lower()).strip("-") or "company"
