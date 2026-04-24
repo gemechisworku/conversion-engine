@@ -10,9 +10,10 @@ from langgraph.graph import END, StateGraph
 
 from agent.graphs.lead_graph import run_lead_intake
 from agent.graphs.state import LeadGraphState
+from agent.nodes.crm_sync import crm_sync_lead_intake_node
+from agent.nodes.intake import intake_initialize_node
 from agent.repositories.state_repo import SQLiteStateRepository
-from agent.services.crm.hubspot_mcp import HubSpotMCPService, map_enrichment_to_crm_payload
-from agent.services.crm.schemas import CRMLeadPayload
+from agent.services.crm.hubspot_mcp import HubSpotMCPService
 from agent.services.enrichment.schemas import EnrichmentArtifact
 from agent.services.observability.events import log_processing_step
 
@@ -47,6 +48,16 @@ class LeadIntakeGraphDeps:
 
 def compile_lead_intake_graph(deps: LeadIntakeGraphDeps):
     graph: StateGraph = StateGraph(LeadIntakeGraphState)
+
+    async def intake_node(state: LeadIntakeGraphState) -> dict[str, Any]:
+        log_processing_step(
+            component="graphs.lead_intake",
+            step="intake.start",
+            message="Validating lead intake graph input",
+            lead_id=state.get("lead_id"),
+            trace_id=state.get("trace_id"),
+        )
+        return await intake_initialize_node(dict(state))
 
     async def enrich_node(state: LeadIntakeGraphState) -> dict[str, Any]:
         lead_state = LeadGraphState.model_validate(state["lead_state"])
@@ -85,70 +96,13 @@ def compile_lead_intake_graph(deps: LeadIntakeGraphDeps):
         }
 
     async def crm_sync_node(state: LeadIntakeGraphState) -> dict[str, Any]:
-        if deps.hubspot is None:
-            log_processing_step(
-                component="graphs.lead_intake",
-                step="crm_sync.skip",
-                message="HubSpot not configured; skipping CRM sync node",
-                lead_id=state.get("lead_id"),
-                trace_id=state.get("trace_id"),
-            )
-            return {"crm_synced": False}
-        log_processing_step(
-            component="graphs.lead_intake",
-            step="crm_sync.start",
-            message="Syncing lead to HubSpot (upsert, enrichment payload, stage, brief refs)",
-            lead_id=state.get("lead_id"),
-            trace_id=state.get("trace_id"),
-            idempotency_key=state.get("idempotency_key"),
-        )
-        enriched = LeadGraphState.model_validate(state["enriched_state"])
-        artifact = EnrichmentArtifact.model_validate(state["artifact"])
-        lead_id = state["lead_id"]
-        await deps.hubspot.upsert_contact(
-            contact=CRMLeadPayload(
-                lead_id=lead_id,
-                company_id=state["company_id"],
-                company_name=state["company_name"],
-                company_domain=state["company_domain"] or None,
-            ),
-            trace_id=state["trace_id"],
-            idempotency_key=state["idempotency_key"],
-        )
-        await deps.hubspot.append_enrichment(
-            lead_id=lead_id,
-            enrichment=map_enrichment_to_crm_payload(
-                lead_id=lead_id,
-                enrichment_artifact=artifact.model_dump(mode="json"),
-            ),
-            trace_id=state["trace_id"],
-            idempotency_key=f"{state['idempotency_key']}:enrichment",
-        )
-        await deps.hubspot.set_stage(
-            lead_id=lead_id,
-            stage="brief_ready",
-            trace_id=state["trace_id"],
-            idempotency_key=f"{state['idempotency_key']}:stage",
-        )
-        await deps.hubspot.attach_brief_refs(
-            lead_id=lead_id,
-            brief_refs=enriched.brief_refs,
-            trace_id=state["trace_id"],
-            idempotency_key=f"{state['idempotency_key']}:brief_refs",
-        )
-        log_processing_step(
-            component="graphs.lead_intake",
-            step="crm_sync.done",
-            message="HubSpot CRM sync completed",
-            lead_id=lead_id,
-            trace_id=state.get("trace_id"),
-            brief_refs_count=len(enriched.brief_refs),
-        )
-        return {"crm_synced": True}
+        return await crm_sync_lead_intake_node(state=dict(state), hubspot=deps.hubspot)
 
+    graph.add_node("intake", intake_node)
     graph.add_node("enrich", enrich_node)
     graph.add_node("crm_sync", crm_sync_node)
-    graph.set_entry_point("enrich")
+    graph.set_entry_point("intake")
+    graph.add_edge("intake", "enrich")
     graph.add_edge("enrich", "crm_sync")
     graph.add_edge("crm_sync", END)
     return graph.compile()

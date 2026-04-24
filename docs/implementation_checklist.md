@@ -20,30 +20,31 @@ This table maps the plan to concrete locations and status. **Done** = matches ru
 | **Phase 4** | Four signal sources + merger | `agent/services/enrichment/` | Done |
 | **Phase 4** | Playwright compliance (no login) | `jobs_playwright.py` | Done — re-verify on change |
 | **Phase 4** | Act II / CFPB / news research | `act2_pipeline.py`, `web_research/` | Done (extensions) |
-| **Phase 5** | **LangGraph** lead intake (enrich → CRM) | `agent/graphs/lead_intake_langgraph.py` | **Done** (this iteration) |
+| **Phase 5** | **LangGraph** lead intake (intake → enrich → CRM) | `agent/graphs/lead_intake_langgraph.py` | **Done** (this iteration) |
 | **Phase 5** | **LangGraph** scheduling (book → transition) | `agent/graphs/scheduling_langgraph.py` | **Done** (this iteration) |
-| **Phase 5** | Lead graph: draft → review → send | — | Missing |
-| **Phase 5** | Reply graph: branch clarify / objection / schedule / escalate | `reply_graph.py` (thin) | Partial |
-| **Phase 5** | Full `nodes/` matrix (intake, outreach, crm_sync, …) | `agent/nodes/` | Partial (3 modules) |
-| **Phase 5** | `prompts/` | — | Missing |
-| **Phase 6** | Langfuse traces | Settings only; `observability/events.py` | Partial |
+| **Phase 5** | Lead graph: draft → review → send | `outreach_flow.py`, `outreach_langgraph.py` (draft-only), `tone_claim_reviewer.py`, `POST /outreach/*` | **Done** — spec `outreach_api.md` surface + advance hooks (`brief_ready→drafting` draft, `drafting→in_review` review, `in_review→queued_to_send` send) |
+| **Phase 5** | Reply graph: branch clarify / objection / schedule / escalate | `reply_langgraph.py` (`emit_branch_playbook`), `reply_graph.py` | **Done** (playbook pending_actions per branch) |
+| **Phase 5** | Full `nodes/` matrix (intake, enrichment, scoring, classification, outreach, review, crm_sync, scheduling, reply, escalation) | `agent/nodes/*.py`, `agent/nodes/__init__.py` | **Done** — thin delegates; graphs call `run_lead_intake` / flow services |
+| **Phase 5** | `prompts/` | `agent/prompts/reviewer_system.txt`, `agent/prompts/README.md` | **Done** (reviewer system prompt externalized) |
+| **Phase 6** | Langfuse traces | `langfuse_llm.py`; per-adapter spans in `enrichment_tools.enrich_company`; workflow spans on AI maturity, ICP, gap brief, hiring brief in `lead_graph.py`; outreach/reply graphs | **Partial** — deeper nesting optional elsewhere |
 | **Phase 6** | **Pipeline / graph progress logs** | `log_processing_step` in `observability/events.py`; used by `runtime.py`, `lead_intake_langgraph.py`, `scheduling_langgraph.py`, `web_research/runner.py` | **Done** (stdout via stdlib logging) |
 | **Phase 6** | Retries / idempotency everywhere | HubSpot calls use keys | Partial |
 | **Phase 6** | Integration tests (fixtures) | Some CRM/calendar | Partial |
 | **Phase 7** | Competitor gap / AI maturity | `competitor_gap.py`, `ai_maturity.py` | Done |
-| **Phase 7** | Reviewer node, memory, evidence graph | — | Missing |
+| **Phase 7** | Reviewer node, memory, evidence graph | `tone_claim_reviewer.py`, `reviewer_tools.py`; `state_repo.evidence_graph_edges` + `append_evidence_edge` / `list_evidence_edges`; brief + outreach claim edges from `lead_graph` / `outreach_flow`; `GET /memory/evidence/{lead_id}` | **Done** (SQLite evidence store + API) |
 
 ## What was added in the latest iteration
 
-- **`lead_intake_langgraph`**: LangGraph `StateGraph` with nodes `enrich` → `crm_sync` (HubSpot optional), invoked from `OrchestrationRuntime.process_lead`.
+- **`lead_intake_langgraph`**: LangGraph `StateGraph` with nodes **`intake` → `enrich` → `crm_sync`** (HubSpot optional), thin CRM via `nodes/crm_sync.py`, invoked from `OrchestrationRuntime.process_lead`.
 - **`scheduling_langgraph`**: LangGraph with nodes `book_and_sync` → `transition`, invoked from `run_scheduling`.
+- **`lead_graph.run_lead_intake`**: Langfuse workflow spans around scoring / ICP / gap / hiring brief; `enrich_company` per-adapter spans when settings + trace present; evidence edges after brief persist.
+- **`GET /memory/evidence/{lead_id}`**: lists `evidence_graph_edges` for a known lead.
 
-## Suggested next steps (not implemented here)
+## Suggested next steps (remaining gaps)
 
-1. LangGraph nodes for **outreach draft → review → send** and wire `advance_state` or a new graph runner.
-2. Expand **reply** routing into conditional LangGraph edges.
-3. **Langfuse** SDK wrapper + trace propagation.
-4. **`prompts/`** and reviewer specialist per plan.
+1. Reviewer **LLM + tool loop** vs full `tone_and_claim_reviewer_spec.md` (additional tools / KB integration beyond stubs).
+2. Evidence graph **query UX** (pagination, filter by `edge_type`, export) if product needs it.
+3. **Langfuse** full hierarchy (nested generations inside each enrichment span) if observability SLOs require it.
 
 ## Test commands and guide
 
@@ -62,7 +63,7 @@ Run the full agent unit suite:
 python -m pytest tests/unit/ -q --tb=line
 ```
 
-**Expected:** **71** tests passed when run from `agent/` (all `tests/unit/`).
+**Expected:** All `tests/unit/` tests pass when run from `agent/` (run `python -m pytest tests/unit/ -q` for the current count).
 
 ### 2) Act II live smoke (optional, needs env)
 
@@ -102,7 +103,7 @@ Set-Location "d:\FDE-Training\week-10\conversion-engine\agent"
 python -m pytest tests/unit/test_orchestration_runtime.py::test_process_lead_generates_brief_ready_state -v -s 2>&1 | Select-String "agent\."
 ```
 
-**Expected:** Lines containing `[process_lead.start]`, `[graph]`, `[enrich.start]`, `[enrich.done]`, `[crm_sync.skip]` or `[crm_sync.*]`, and `[process_lead.graph_done]` when HubSpot is absent (unit test uses `hubspot_service=None`).
+**Expected:** Lines containing `[process_lead.start]`, `[intake.start]`, `[enrich.start]`, `[enrich.done]`, `[crm_sync.skip]` or `[crm_sync.*]`, and `[process_lead.graph_done]` when HubSpot is absent (unit test uses `hubspot_service=None`).
 
 ---
 

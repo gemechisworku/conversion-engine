@@ -9,6 +9,7 @@ import httpx
 
 from agent.config.settings import Settings
 from agent.services.common.schemas import ErrorEnvelope, ProviderSendResult
+from agent.services.email.rfc_ids import merge_references_header, normalize_message_id
 from agent.services.email.router import EmailEventRouter
 from agent.services.email.schemas import InboundEmailEvent, OutboundEmailRequest
 from agent.services.email.webhook import ResendWebhookParser
@@ -91,15 +92,26 @@ class ResendEmailClient:
                 error=error,
             )
 
+        resend_headers: dict[str, str] = {
+            "X-Lead-Id": request.lead_id,
+            "X-Draft-Id": request.draft_id,
+            "X-Tenacious-Status": str(metadata.get("tenacious_status", "draft")),
+        }
+        if metadata.get("email_thread_id"):
+            resend_headers["X-Email-Thread-Id"] = str(metadata["email_thread_id"])
+        if request.in_reply_to:
+            irt = normalize_message_id(request.in_reply_to.strip())
+            if irt:
+                resend_headers["In-Reply-To"] = irt
+        if request.references:
+            merged_refs = merge_references_header(request.references)
+            if merged_refs:
+                resend_headers["References"] = merged_refs
         payload: dict[str, Any] = {
             "from": request.from_email or self._settings.resend_from_email,
             "to": [request.to_email],
             "subject": request.subject,
-            "headers": {
-                "X-Lead-Id": request.lead_id,
-                "X-Draft-Id": request.draft_id,
-                "X-Tenacious-Status": str(metadata.get("tenacious_status", "draft")),
-            },
+            "headers": resend_headers,
         }
         if not payload["from"]:
             error = ErrorEnvelope(
@@ -253,10 +265,12 @@ class EmailService:
         client: ResendEmailClient,
         parser: ResendWebhookParser,
         router: EmailEventRouter,
+        state_repo: Any | None = None,
     ) -> None:
         self._client = client
         self._parser = parser
         self._router = router
+        self._state_repo = state_repo
 
     async def send_email(self, request: OutboundEmailRequest) -> ProviderSendResult:
         return await self._client.send_email(request)
@@ -270,4 +284,8 @@ class EmailService:
     ) -> InboundEmailEvent:
         event = self._parser.parse(payload=payload, headers=headers, raw_body=raw_body)
         await self._router.route(event)
+        if self._state_repo is not None:
+            from agent.services.email.threading import persist_inbound_resend_webhook
+
+            await persist_inbound_resend_webhook(state_repo=self._state_repo, event=event)
         return event

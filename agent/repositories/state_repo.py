@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any, Iterator
 from uuid import uuid4
 
+from agent.services.email.rfc_ids import merge_references_header, normalize_message_id
+
 
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
@@ -118,6 +120,43 @@ class SQLiteStateRepository:
                     artifact_paths TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS email_threads (
+                    thread_id TEXT PRIMARY KEY,
+                    lead_id TEXT NOT NULL,
+                    last_inbound_rfc_message_id TEXT,
+                    references_header TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_email_threads_lead_id ON email_threads(lead_id);
+
+                CREATE TABLE IF NOT EXISTS outreach_draft_state (
+                    lead_id TEXT PRIMARY KEY,
+                    draft_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_send_idempotency TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS orchestration_idempotency (
+                    idempotency_key TEXT PRIMARY KEY,
+                    response_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS evidence_graph_edges (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    lead_id TEXT NOT NULL,
+                    trace_id TEXT NOT NULL,
+                    edge_type TEXT NOT NULL,
+                    claim_ref TEXT,
+                    brief_id TEXT,
+                    source_ref TEXT,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_evidence_lead_id ON evidence_graph_edges(lead_id);
+                CREATE INDEX IF NOT EXISTS idx_evidence_trace_id ON evidence_graph_edges(trace_id);
                 """
             )
 
@@ -306,6 +345,98 @@ class SQLiteStateRepository:
             for row in rows
         ]
 
+    def ensure_email_thread(self, *, lead_id: str) -> str:
+        """Return the newest thread_id for this lead, creating one if needed."""
+        now = _utc_now()
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT thread_id FROM email_threads
+                WHERE lead_id = ?
+                ORDER BY datetime(updated_at) DESC
+                LIMIT 1
+                """,
+                (lead_id,),
+            ).fetchone()
+            if row is not None:
+                return str(row["thread_id"])
+            thread_id = f"emthr_{uuid4().hex[:12]}"
+            conn.execute(
+                """
+                INSERT INTO email_threads (
+                    thread_id, lead_id, last_inbound_rfc_message_id, references_header, created_at, updated_at
+                ) VALUES (?, ?, NULL, '', ?, ?)
+                """,
+                (thread_id, lead_id, now, now),
+            )
+            return thread_id
+
+    def get_email_thread_reply_headers(self, *, lead_id: str) -> tuple[str | None, str | None]:
+        """(In-Reply-To target, References) for the next outbound, from the latest thread row."""
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT last_inbound_rfc_message_id, references_header
+                FROM email_threads
+                WHERE lead_id = ?
+                ORDER BY datetime(updated_at) DESC
+                LIMIT 1
+                """,
+                (lead_id,),
+            ).fetchone()
+        if row is None:
+            return None, None
+        last_in = row["last_inbound_rfc_message_id"]
+        refs = row["references_header"] or ""
+        return (last_in, refs or None)
+
+    def email_thread_record_inbound(
+        self,
+        *,
+        lead_id: str,
+        inbound_rfc_message_id: str,
+        prior_references_fragment: str | None,
+    ) -> str:
+        """Upsert thread for lead and merge References; set last inbound Message-Id. Returns thread_id."""
+        now = _utc_now()
+        mid = normalize_message_id(inbound_rfc_message_id)
+        if not mid:
+            return self.ensure_email_thread(lead_id=lead_id)
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT thread_id, references_header FROM email_threads
+                WHERE lead_id = ?
+                ORDER BY datetime(updated_at) DESC
+                LIMIT 1
+                """,
+                (lead_id,),
+            ).fetchone()
+            if row is None:
+                thread_id = f"emthr_{uuid4().hex[:12]}"
+                merged = merge_references_header(prior_references_fragment, mid)
+                conn.execute(
+                    """
+                    INSERT INTO email_threads (
+                        thread_id, lead_id, last_inbound_rfc_message_id, references_header, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (thread_id, lead_id, mid, merged, now, now),
+                )
+                return thread_id
+            thread_id = str(row["thread_id"])
+            existing = str(row["references_header"] or "")
+            merged = merge_references_header(existing, prior_references_fragment, mid)
+            conn.execute(
+                """
+                UPDATE email_threads
+                SET last_inbound_rfc_message_id = ?, references_header = ?, updated_at = ?
+                WHERE thread_id = ?
+                """,
+                (mid, merged, now, thread_id),
+            )
+            return thread_id
+
     def set_sms_consent(self, *, lead_id: str, allowed: bool) -> None:
         with self._conn() as conn:
             conn.execute(
@@ -474,3 +605,120 @@ class SQLiteStateRepository:
             "artifact_paths": json.loads(row["artifact_paths"]),
             "updated_at": row["updated_at"],
         }
+
+    def upsert_outreach_draft(self, *, lead_id: str, draft: dict[str, Any]) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO outreach_draft_state (lead_id, draft_json, updated_at, last_send_idempotency)
+                VALUES (?, ?, ?, NULL)
+                ON CONFLICT(lead_id) DO UPDATE SET
+                    draft_json=excluded.draft_json,
+                    updated_at=excluded.updated_at
+                """,
+                (lead_id, json.dumps(draft), _utc_now()),
+            )
+
+    def get_outreach_draft(self, *, lead_id: str) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT draft_json, last_send_idempotency, updated_at FROM outreach_draft_state WHERE lead_id = ?",
+                (lead_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "draft": json.loads(row["draft_json"]),
+            "last_send_idempotency": row["last_send_idempotency"],
+            "updated_at": row["updated_at"],
+        }
+
+    def mark_outreach_sent_idempotency(self, *, lead_id: str, idempotency_key: str) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """
+                UPDATE outreach_draft_state
+                SET last_send_idempotency = ?, updated_at = ?
+                WHERE lead_id = ?
+                """,
+                (idempotency_key, _utc_now(), lead_id),
+            )
+
+    def get_idempotency_response(self, *, idempotency_key: str) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT response_json FROM orchestration_idempotency WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["response_json"])
+
+    def put_idempotency_response(self, *, idempotency_key: str, response: dict[str, Any]) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO orchestration_idempotency (idempotency_key, response_json, created_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(idempotency_key) DO NOTHING
+                """,
+                (idempotency_key, json.dumps(response), _utc_now()),
+            )
+
+    def append_evidence_edge(
+        self,
+        *,
+        lead_id: str,
+        trace_id: str,
+        edge_type: str,
+        claim_ref: str | None = None,
+        brief_id: str | None = None,
+        source_ref: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        """Append one evidence-graph edge (specs/observability_and_logging.md §3.3)."""
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO evidence_graph_edges (
+                    lead_id, trace_id, edge_type, claim_ref, brief_id, source_ref, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    lead_id,
+                    trace_id,
+                    edge_type,
+                    claim_ref,
+                    brief_id,
+                    source_ref,
+                    json.dumps(payload or {}),
+                    _utc_now(),
+                ),
+            )
+
+    def list_evidence_edges(self, *, lead_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, lead_id, trace_id, edge_type, claim_ref, brief_id, source_ref, payload_json, created_at
+                FROM evidence_graph_edges
+                WHERE lead_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (lead_id, limit),
+            ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "lead_id": row["lead_id"],
+                "trace_id": row["trace_id"],
+                "edge_type": row["edge_type"],
+                "claim_ref": row["claim_ref"],
+                "brief_id": row["brief_id"],
+                "source_ref": row["source_ref"],
+                "payload": json.loads(row["payload_json"]),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]

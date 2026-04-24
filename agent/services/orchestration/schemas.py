@@ -40,6 +40,8 @@ class LeadReplyRequest(BaseModel):
     message_id: str
     content: str
     subject: str | None = None
+    rfc_message_id: str | None = None
+    references_for_thread: str | None = None
     from_email: str | None = None
     from_number: str | None = None
     company_name: str | None = None
@@ -55,6 +57,20 @@ class LeadAdvanceRequest(BaseModel):
     from_state: str
     to_state: str
     reason: str
+    outreach_to_email: str | None = None
+
+
+class LeadCompactRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    lead_id: str
+    reason: str = "context_threshold_exceeded"
+
+
+class LeadRehydrateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    lead_id: str
 
 
 class LeadEscalationRequest(BaseModel):
@@ -65,3 +81,47 @@ class LeadEscalationRequest(BaseModel):
     reason_code: str
     summary: str
     evidence_refs: list[str] = Field(default_factory=list)
+
+
+class OutreachDraftRequest(BaseModel):
+    """specs/api_contracts/outreach_api.md — POST /outreach/draft."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    lead_id: str
+    brief_id: str | None = None
+    gap_brief_id: str | None = None
+    variant: str = "cold_email"
+    to_email: str | None = None
+    idempotency_key: str | None = None
+
+
+class OutreachReviewRequest(BaseModel):
+    """specs/api_contracts/outreach_api.md — POST /outreach/review."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    lead_id: str
+    draft_id: str
+
+
+class OutreachSendRequest(BaseModel):
+    """specs/api_contracts/outreach_api.md — POST /outreach/send."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    lead_id: str
+    draft_id: str
+    review_id: str
+    channel: str = "email"
+    to_email: str | None = None
+    idempotency_key: str | None = None
+
+
+class MemorySessionWriteRequest(BaseModel):
+    """specs/api_contracts/memory_api.md — POST /memory/session/write."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    lead_id: str
+    session_state: dict[str, Any] = Field(default_factory=dict)

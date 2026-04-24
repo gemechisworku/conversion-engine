@@ -324,10 +324,14 @@ python agent/scripts/run_e2e_lead.py `
   --send-email --to-email "you@example.com" `
   --prospect-email "you@example.com" `
   --reply-subject "Re: your note" `
-  --reply-content "Thanks — yes, Thursday 2pm works. What is the calendar link?"
+  --reply-content "Thanks — yes, Thursday 2pm works. What is the calendar link?" `
+  --reply-rfc-message-id "<prospect-inbound-id@client.example>" `
+  --references-for-thread "<optional-prior-ids>"
 ```
 
 **Live first-touch email after stages (Resend + policy):** **`--send-email --to-email`** (see above). Requires **`RESEND_*`**, **`OPENROUTER_API_KEY`** for LLM drafts, and live policy rules as for `python agent/scripts/live_smoke.py email`. After send, the script logs the outbound in **`message_log`** so **`handle_reply`** can load prior email context for the reply LLM. Optional **`TENACIOUS_SALES_DATA_PATH`** overrides the default **`./tenacious_sales_data`** root.
+
+**Email threading (RFC `In-Reply-To` / `References`):** Outbound sends accept optional **`in_reply_to`** and **`references`** on **`OutboundEmailRequest`**; Resend receives them as custom **`headers`** per [Reply to Receiving Emails](https://resend.com/docs/dashboard/receiving/reply-to-emails). The repo keeps an **`email_threads`** row per lead (see **`SQLiteStateRepository`**) with the latest inbound RFC **`Message-Id`** and a merged **`References`** chain. **`build_email_service()`** passes **`state_repo`** so **`email.received`** webhooks can update threads via **`X-Lead-Id`** (or **`metadata.lead_id`**) in the payload. **`handle_reply`** records **`LeadReplyRequest.rfc_message_id`** / **`references_for_thread`** into that table and attaches **`in_reply_to`** / **`references`** metadata on suggested outbound rows for the next Resend send. For strict client threading, pass **`--reply-rfc-message-id`** from the prospect message headers when running the E2E CLI.
 
 Notes:
 * live side-effect commands are blocked when `CHALLENGE_MODE=true` and `SINK_ROUTING_ENABLED=false`.

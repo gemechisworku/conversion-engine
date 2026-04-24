@@ -3,6 +3,7 @@
   "created_at": "2026-04-23T12:00:00Z",
   "data": {
     "id": "re_123",
+    "message_id": "<prospect-reply-abc@mail.example>",
     "from": "prospect@example.com",
     "to": [
       "outreach@tenacious.example"
@@ -10,6 +11,11 @@
     "subject": "Re: Intro",
     "text": "Can we discuss next week?",
     "html": "<p>Can we discuss next week?</p>",
-    "created_at": "2026-04-23T11:59:58Z"
+    "created_at": "2026-04-23T11:59:58Z",
+    "in_reply_to": "<outbound-ses-id@amazonses.com>",
+    "references": "<first@id.com> <outbound-ses-id@amazonses.com>",
+    "headers": {
+      "X-Lead-Id": "lead_fixture_1"
+    }
   }
 }

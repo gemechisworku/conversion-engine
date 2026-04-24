@@ -120,6 +120,8 @@ class Settings(BaseSettings):
     hubspot_mcp_required_tools_csv: str = Field(default="", alias="HUBSPOT_MCP_REQUIRED_TOOLS_CSV")
     hubspot_mcp_required_tool_count: int = Field(default=9, alias="HUBSPOT_MCP_REQUIRED_TOOL_COUNT")
 
+    default_outreach_to_email: str = Field(default="", alias="DEFAULT_OUTREACH_TO_EMAIL")
+
     langfuse_public_key: str = Field(default="", alias="LANGFUSE_PUBLIC_KEY")
     langfuse_secret_key: str = Field(default="", alias="LANGFUSE_SECRET_KEY")
     langfuse_host: str = Field(default="https://cloud.langfuse.com", alias="LANGFUSE_HOST")

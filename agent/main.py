@@ -28,13 +28,14 @@ from agent.services.sms.webhook import AfricasTalkingWebhookParser
 from agent.repositories.state_repo import SQLiteStateRepository
 
 
-def build_email_service() -> EmailService:
+def build_email_service(state_repo: SQLiteStateRepository | None = None) -> EmailService:
     settings = get_settings()
     policy_service = OutboundPolicyService(settings)
     client = ResendEmailClient(settings=settings, policy_service=policy_service)
     parser = ResendWebhookParser(settings)
     router = EmailEventRouter()
-    return EmailService(client=client, parser=parser, router=router)
+    repo = state_repo if state_repo is not None else build_state_repo()
+    return EmailService(client=client, parser=parser, router=router, state_repo=repo)
 
 
 def build_sms_service() -> SMSService:
@@ -86,6 +87,7 @@ def build_orchestration_runtime() -> OrchestrationRuntime:
         state_repo=state_repo,
         enrichment_services=enrichment_services,
         hubspot_service=build_hubspot_service(),
+        email_service=build_email_service(state_repo=state_repo),
     )
 
 

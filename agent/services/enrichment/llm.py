@@ -10,6 +10,10 @@ from pydantic import BaseModel, ValidationError
 
 from agent.config.settings import Settings
 from agent.services.observability.events import log_processing_step, log_trace_event
+from agent.services.observability.langfuse_llm import (
+    langfuse_openrouter_generation,
+    update_langfuse_generation_success,
+)
 
 
 class OpenRouterJSONClient:
@@ -94,18 +98,31 @@ class OpenRouterJSONClient:
             "response_format": {"type": "json_object"},
         }
         try:
-            response = await self._post(payload=payload)
-            response.raise_for_status()
-            raw = response.json()
-            self._log_token_usage(
-                usage=raw.get("usage") if isinstance(raw, dict) else None,
-                purpose=purpose,
+            with langfuse_openrouter_generation(
+                self._settings,
                 trace_id=trace_id,
                 lead_id=lead_id,
-            )
-            content = raw["choices"][0]["message"]["content"]
-            data = json.loads(content)
-            return response_model.model_validate(data)
+                purpose=purpose,
+                model=self._settings.openrouter_model,
+            ) as lf_obs:
+                response = await self._post(payload=payload)
+                response.raise_for_status()
+                raw = response.json()
+                self._log_token_usage(
+                    usage=raw.get("usage") if isinstance(raw, dict) else None,
+                    purpose=purpose,
+                    trace_id=trace_id,
+                    lead_id=lead_id,
+                )
+                content = raw["choices"][0]["message"]["content"]
+                data = json.loads(content)
+                validated = response_model.model_validate(data)
+                update_langfuse_generation_success(
+                    lf_obs,
+                    parsed_output=data,
+                    usage=raw.get("usage") if isinstance(raw, dict) else None,
+                )
+                return validated
         except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError, ValidationError):
             return None
 

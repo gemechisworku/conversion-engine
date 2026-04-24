@@ -66,6 +66,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Inbound email subject when --reply-channel is email.",
     )
     p.add_argument(
+        "--reply-rfc-message-id",
+        default="",
+        help="RFC Message-ID of the inbound mail (for In-Reply-To when using --reply-channel email).",
+    )
+    p.add_argument(
+        "--references-for-thread",
+        default="",
+        help="Optional References header fragment from the prospect client (space-separated Message-Ids).",
+    )
+    p.add_argument(
         "--reply-content",
         default="Yes, interested. Can we schedule a 15-minute call next week?",
         help="Inbound message body for handle_reply.",
@@ -111,6 +121,8 @@ async def _run(args: argparse.Namespace) -> int:
 
     lead_id = process.data["lead_id"]
     out["lead_id"] = lead_id
+    email_thread_id = repo.ensure_email_thread(lead_id=lead_id)
+    out["email_thread_id"] = email_thread_id
 
     advances: list[tuple[str, str]] = [
         ("brief_ready", "drafting"),
@@ -151,6 +163,9 @@ async def _run(args: argparse.Namespace) -> int:
             idempotency_key=f"{prefix}_first_email",
             briefs=briefs,
         )
+        req = req.model_copy(
+            update={"metadata": {**req.metadata, "email_thread_id": email_thread_id, "bench_verified": True}}
+        )
         send_result = await email_service.send_email(req)
         out["timings_ms"]["send_email"] = round((perf_counter() - t_send) * 1000, 2)
         out["steps"].append({"name": "send_email", "result": send_result.model_dump(mode="json")})
@@ -167,6 +182,8 @@ async def _run(args: argparse.Namespace) -> int:
                 "subject": req.subject,
                 "provider": "resend",
                 "idempotency_key": req.idempotency_key,
+                "email_thread_id": email_thread_id,
+                "resend_email_id": send_result.provider_message_id,
             },
         )
     else:
@@ -182,6 +199,12 @@ async def _run(args: argparse.Namespace) -> int:
                 message_id=f"e2e_reply_{prefix}",
                 content=args.reply_content,
                 subject=args.reply_subject if args.reply_channel.lower() == "email" else None,
+                rfc_message_id=args.reply_rfc_message_id.strip() or None
+                if args.reply_channel.lower() == "email"
+                else None,
+                references_for_thread=args.references_for_thread.strip() or None
+                if args.reply_channel.lower() == "email"
+                else None,
                 from_email=args.prospect_email or None,
                 from_number=args.from_number or None,
                 company_name=company_name,

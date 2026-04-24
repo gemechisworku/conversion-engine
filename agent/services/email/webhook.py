@@ -47,6 +47,7 @@ class ResendWebhookParser:
             provider_message_id, from_email, to_email, subject, text_body, html_body, received_at = (
                 self._extract_core_fields(payload)
             )
+            rfc_message_id, in_reply_to, references = self._extract_threading_fields(payload)
 
             if event_type == "reply":
                 if not from_email or not to_email or (not text_body and not html_body):
@@ -63,6 +64,9 @@ class ResendWebhookParser:
                 text_body=text_body,
                 html_body=html_body,
                 received_at=received_at,
+                rfc_message_id=rfc_message_id,
+                in_reply_to=in_reply_to,
+                references=references,
                 raw_payload_ref=raw_payload_ref,
                 raw_payload=payload,
             )
@@ -153,6 +157,27 @@ class ResendWebhookParser:
         )
         received_at = self._coerce_datetime(received_at_raw)
         return provider_message_id, from_email, to_email, subject, text_body, html_body, received_at
+
+    def _extract_threading_fields(self, payload: dict[str, Any]) -> tuple[str | None, str | None, str | None]:
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            data = payload
+        rfc_message_id = self._coerce_str(
+            data.get("message_id") or self._nested(data, "email", "message_id") or data.get("message-id")
+        )
+        in_reply_to = self._coerce_str(data.get("in_reply_to") or data.get("inReplyTo"))
+        references = self._coerce_str(data.get("references"))
+        headers = data.get("headers")
+        if isinstance(headers, dict):
+            for key, value in headers.items():
+                lk = str(key).lower()
+                if lk == "in-reply-to" and value and not in_reply_to:
+                    in_reply_to = self._coerce_str(value)
+                if lk == "references" and value and not references:
+                    references = self._coerce_str(value)
+                if lk == "message-id" and value and not rfc_message_id:
+                    rfc_message_id = self._coerce_str(value)
+        return rfc_message_id, in_reply_to, references
 
     def _payload_ref(self, payload: dict[str, Any]) -> str:
         canonical = json.dumps(payload, separators=(",", ":"), sort_keys=True)

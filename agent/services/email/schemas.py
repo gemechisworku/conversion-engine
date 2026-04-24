@@ -28,6 +28,8 @@ class OutboundEmailRequest(BaseModel):
     text_body: str | None = None
     html_body: str | None = None
     from_email: str | None = None
+    in_reply_to: str | None = None
+    references: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -53,6 +55,9 @@ class InboundEmailEvent(BaseModel):
     text_body: str | None = None
     html_body: str | None = None
     received_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    rfc_message_id: str | None = None
+    in_reply_to: str | None = None
+    references: str | None = None
     raw_payload_ref: str
     error: ErrorEnvelope | None = None
     raw_payload: dict[str, Any] = Field(default_factory=dict)

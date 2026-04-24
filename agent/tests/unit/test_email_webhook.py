@@ -40,6 +40,9 @@ def test_reply_webhook_is_normalized() -> None:
 
     assert event.event_type == "reply"
     assert event.provider_message_id == "re_123"
+    assert event.rfc_message_id == "<prospect-reply-abc@mail.example>"
+    assert event.in_reply_to == "<outbound-ses-id@amazonses.com>"
+    assert "first@id.com" in (event.references or "")
     assert event.from_email == "prospect@example.com"
     assert event.to_email == "outreach@tenacious.example"
     assert event.text_body == "Can we discuss next week?"

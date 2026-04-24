@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import httpx
 
@@ -125,6 +126,42 @@ def test_send_email_retries_transient_failure_then_succeeds() -> None:
     assert result.accepted is True
     assert result.provider_message_id == "re_msg_retry"
     assert state["calls"] == 2
+
+
+def test_send_email_includes_threading_headers_when_set() -> None:
+    captured: dict = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["json"] = json.loads((await request.aread()).decode())
+        return httpx.Response(202, json={"id": "re_thread"})
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = ResendEmailClient(
+        settings=_settings(),
+        policy_service=OutboundPolicyService(_settings()),
+        http_client=http_client,
+    )
+    req = OutboundEmailRequest(
+        lead_id="lead_123",
+        draft_id="draft_123",
+        review_id="review_123",
+        trace_id="trace_123",
+        idempotency_key="idem_thread",
+        to_email="prospect@example.com",
+        subject="Re: Intro",
+        text_body="Follow-up",
+        in_reply_to="<inbound-msg@example.com>",
+        references="<a@b> <inbound-msg@example.com>",
+        metadata={"email_thread_id": "emthr_test1", "tenacious_status": "approved", "bench_verified": True},
+    )
+    result = asyncio.run(client.send_email(req))
+    asyncio.run(http_client.aclose())
+
+    assert result.accepted is True
+    hdr = captured["json"]["headers"]
+    assert hdr["In-Reply-To"] == "<inbound-msg@example.com>"
+    assert "<a@b>" in hdr["References"]
+    assert hdr["X-Email-Thread-Id"] == "emthr_test1"
 
 
 def test_send_email_blocked_without_approved_review() -> None:
