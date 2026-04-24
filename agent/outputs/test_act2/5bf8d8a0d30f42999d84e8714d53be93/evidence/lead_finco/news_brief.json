@@ -1,0 +1,19 @@
+{
+  "brief_id": "news_5aeb3a9c51",
+  "lead_id": "lead_finco",
+  "company_id": "finco",
+  "generated_at": "2026-04-24T19:21:21.029001Z",
+  "found": false,
+  "source_type": "unknown",
+  "title": null,
+  "url": null,
+  "published_at": null,
+  "snippet": null,
+  "confidence": 0.15,
+  "source_refs": [],
+  "error": "search:no_hits; extract:low_signal:https://finco.example/news; extract:low_signal:https://finco.example/press; extract:low_signal:https://finco.example/blog",
+  "risk_notes": [
+    "Controlled web research did not yield ranked pages; verify before making strong claims.",
+    "No verifiable public pages could be synthesized for query: '(\"FinCo\" news OR press release OR \"finco\" news OR press release) (finco.example)'."
+  ]
+}

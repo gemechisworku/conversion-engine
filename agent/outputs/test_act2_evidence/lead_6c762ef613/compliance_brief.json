@@ -1,0 +1,16 @@
+{
+  "brief_id": "compliance_478f7e0d30",
+  "lead_id": "lead_6c762ef613",
+  "company_id": "comp_123",
+  "generated_at": "2026-04-24T19:22:37.551204Z",
+  "applicable": false,
+  "company_name": "Acme AI",
+  "lookback_days": 180,
+  "complaint_count": 0,
+  "top_issues": [],
+  "confidence": 0.8,
+  "source_refs": [],
+  "skipped_reason": "not_financial_services",
+  "error": null,
+  "risk_notes": []
+}

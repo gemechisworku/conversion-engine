@@ -1,0 +1,8 @@
+[{
+          "id": "funded_co",
+          "name": "Funded Co",
+          "website": "https://funded.example",
+          "industries": "[{\"id\":\"fintech\",\"value\":\"FinTech\"}]",
+          "funding_rounds_list": "[{\"investment_type\":\"Series A\",\"announced_on\":\"2026-03-01\",\"money_raised\":{\"value_usd\":5000000}}]",
+          "builtwith_tech": "[{\"name\":\"OpenAI\"}]"
+        }]

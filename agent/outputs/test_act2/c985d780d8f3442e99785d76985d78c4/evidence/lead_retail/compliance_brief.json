@@ -1,0 +1,16 @@
+{
+  "brief_id": "compliance_6b128fefa2",
+  "lead_id": "lead_retail",
+  "company_id": "retailco",
+  "generated_at": "2026-04-24T19:22:11.520873Z",
+  "applicable": false,
+  "company_name": "RetailCo",
+  "lookback_days": 180,
+  "complaint_count": 0,
+  "top_issues": [],
+  "confidence": 0.8,
+  "source_refs": [],
+  "skipped_reason": "not_financial_services",
+  "error": null,
+  "risk_notes": []
+}

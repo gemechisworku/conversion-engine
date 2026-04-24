@@ -125,6 +125,8 @@ class Settings(BaseSettings):
     http_timeout_seconds: float = Field(default=20.0, alias="HTTP_TIMEOUT_SECONDS")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
+    serpapi_api_key: str = Field(default="", alias="SERPAPI_API_KEY")
+
     def require(self, *field_names: str) -> None:
         """Raise a ValueError if required settings are not configured."""
         missing = [name for name in field_names if not getattr(self, name)]

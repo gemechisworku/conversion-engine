@@ -1,0 +1,19 @@
+{
+  "brief_id": "news_e94248ef0b",
+  "lead_id": "lead_retail",
+  "company_id": "retailco",
+  "generated_at": "2026-04-24T19:22:11.523754Z",
+  "found": false,
+  "source_type": "unknown",
+  "title": null,
+  "url": null,
+  "published_at": null,
+  "snippet": null,
+  "confidence": 0.15,
+  "source_refs": [],
+  "error": "search:no_hits; fetch:empty_or_blocked:https://retail.example/news; fetch:empty_or_blocked:https://retail.example/press; fetch:empty_or_blocked:https://retail.example/blog",
+  "risk_notes": [
+    "Controlled web research did not yield ranked pages; verify before making strong claims.",
+    "No verifiable public pages could be synthesized for query: '(\"RetailCo\" news OR press release OR \"retailco\" news OR press release OR \"retail\" news OR press release) (retail.example)'."
+  ]
+}

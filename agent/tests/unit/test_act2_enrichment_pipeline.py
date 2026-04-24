@@ -11,6 +11,7 @@ from agent.services.enrichment.act2_pipeline import ActIIEnrichmentPipeline
 from agent.services.enrichment.cfpb import CFPBComplaintAdapter
 from agent.services.enrichment.crunchbase import CrunchbaseAdapter
 from agent.services.enrichment.news_playwright import PublicNewsPlaywrightRetriever
+from agent.services.enrichment.schemas import Firmographics
 
 
 def _write_csv(path: Path) -> None:
@@ -42,7 +43,8 @@ def test_act2_pipeline_writes_three_required_briefs() -> None:
     _write_csv(csv_path)
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        if "consumerfinance.gov" in str(request.url):
+        url = str(request.url)
+        if "consumerfinance.gov" in url:
             return httpx.Response(
                 200,
                 json={
@@ -56,12 +58,17 @@ def test_act2_pipeline_writes_three_required_briefs() -> None:
                     }
                 },
             )
+        if "lite.duckduckgo.com" in url:
+            return httpx.Response(200, text="<html></html>", headers={"Content-Type": "text/html"})
+        if "wikipedia.org/w/api.php" in url:
+            return httpx.Response(200, json={"query": {"search": []}})
         return httpx.Response(
             200,
             text=(
                 "<html><head><title>FinCo announces platform update</title>"
                 '<meta name="description" content="FinCo shared a public product and compliance update.">'
-                "</head><body><time>2026-04-01</time></body></html>"
+                "</head><body><p>FinCo announced a public platform update for buyers in financial services.</p>"
+                "<time>2026-04-01</time></body></html>"
             ),
             headers={"Content-Type": "text/html"},
         )
@@ -139,3 +146,88 @@ def test_act2_pipeline_skips_cfpb_for_non_financial_company() -> None:
     assert context.enrichment_brief.matched is True
     assert context.compliance_brief.applicable is False
     assert context.compliance_brief.skipped_reason == "not_financial_services"
+
+
+def test_news_retriever_uses_search_feed_and_ignores_crunchbase() -> None:
+    settings = Settings()
+    seen_urls: list[str] = []
+
+    article = (
+        "<html><head><title>FinCo announces new lending platform</title>"
+        '<meta name="description" content="FinCo announced a public platform update.">'
+        "</head><body><p>FinCo announced a public platform update for lending.</p></body></html>"
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen_urls.append(str(request.url))
+        if "lite.duckduckgo.com" in str(request.url):
+            link = "https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample-news.test%2Ffinco-platform"
+            return httpx.Response(200, text=f'<html><a href="{link}">story</a></html>')
+        if "wikipedia.org/w/api.php" in str(request.url):
+            return httpx.Response(200, json={"query": {"search": []}})
+        if "example-news.test" in str(request.url):
+            return httpx.Response(200, text=article, headers={"Content-Type": "text/html"})
+        return httpx.Response(404)
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    retriever = PublicNewsPlaywrightRetriever(settings=settings, http_client=http_client)
+    brief = asyncio.run(
+        retriever.build_news_brief(
+            lead_id="lead_finco",
+            enrichment_brief=asyncio.run(
+                CrunchbaseAdapter(settings=settings).build_enrichment_brief(
+                    lead_id="lead_finco",
+                    company_name="FinCo",
+                )
+            ).model_copy(
+                update={
+                    "matched": True,
+                    "firmographics": Firmographics(
+                        company_name="FinCo",
+                        website="https://finco.example",
+                        crunchbase_url="https://www.crunchbase.com/organization/finco",
+                    ),
+                }
+            ),
+        )
+    )
+    asyncio.run(http_client.aclose())
+
+    assert brief.found is True
+    assert brief.url == "https://example-news.test/finco-platform"
+    assert not any("crunchbase.com" in url for url in seen_urls)
+    assert any("lite.duckduckgo.com" in url for url in seen_urls)
+
+
+def test_news_retriever_rejects_blocked_pages() -> None:
+    settings = Settings()
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text="<html><title>Attention Required! | Cloudflare</title><body>Sorry, you have been blocked</body></html>",
+            headers={"Content-Type": "text/html"},
+        )
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    retriever = PublicNewsPlaywrightRetriever(settings=settings, http_client=http_client)
+    enrichment = asyncio.run(
+        CrunchbaseAdapter(settings=settings).build_enrichment_brief(
+            lead_id="lead_finco",
+            company_name="FinCo",
+        )
+    ).model_copy(
+        update={
+            "matched": True,
+            "firmographics": Firmographics(
+                company_name="No Matching Company Name",
+                website="https://finco.example",
+            ),
+        }
+    )
+    brief = asyncio.run(retriever.build_news_brief(lead_id="lead_finco", enrichment_brief=enrichment))
+    asyncio.run(http_client.aclose())
+
+    assert brief.found is False
+    assert brief.error
+    assert "empty_or_blocked" in brief.error or "blocked" in brief.error.lower()

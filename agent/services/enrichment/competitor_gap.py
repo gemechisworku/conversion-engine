@@ -10,10 +10,11 @@ from uuid import uuid4
 
 import httpx
 
-from agent.services.enrichment.ai_maturity import score_ai_maturity
-from agent.services.enrichment.crunchbase import CrunchbaseAdapter
-from agent.services.enrichment.llm import OpenRouterJSONClient
 from agent.config.settings import Settings
+from agent.services.enrichment.web_research.runner import ControlledWebResearchRunner, build_research_runner
+from agent.services.enrichment.ai_maturity import score_ai_maturity
+from agent.services.enrichment.crunchbase import DEFAULT_CRUNCHBASE_DATASET_PATH, CrunchbaseAdapter
+from agent.services.enrichment.llm import OpenRouterJSONClient
 from agent.services.enrichment.schemas import (
     AIMaturityScore,
     CompetitorGapBrief,
@@ -36,10 +37,12 @@ class CompetitorGapAnalyst:
         settings: Settings,
         http_client: httpx.AsyncClient | None = None,
         llm: OpenRouterJSONClient | None = None,
+        web_research: ControlledWebResearchRunner | None = None,
     ) -> None:
         self._settings = settings
         self._http_client = http_client
         self._llm = llm
+        self._web_research = web_research or build_research_runner(settings=settings, http_client=http_client)
 
     async def build_brief(
         self,
@@ -53,7 +56,15 @@ class CompetitorGapAnalyst:
         industry = self._industry_from_artifact(artifact)
         peers = self._pick_peers(dataset=dataset, company_id=company_id, industry=industry)
         if len(peers) < 5:
-            peers = (peers + self._fallback_peers(dataset=dataset, company_id=company_id))[:10]
+            existing_ids = {self._row_id(row) for row in peers}
+            peers = [
+                *peers,
+                *[
+                    row
+                    for row in self._fallback_peers(dataset=dataset, company_id=company_id, artifact=artifact)
+                    if self._row_id(row) not in existing_ids
+                ],
+            ][:10]
 
         comparisons = [self._to_competitor_record(row=row) for row in peers[:10]]
         competitor_scores = [record.ai_maturity_score for record in comparisons] or [0]
@@ -83,18 +94,39 @@ class CompetitorGapAnalyst:
             confidence=confidence,
             risk_notes=risk_notes,
         )
+        controlled_web: dict[str, Any] | None = None
+        if self._llm is not None and self._llm.configured:
+            controlled_web = await self._controlled_web_context(artifact=artifact)
         llm_refined = await self._refine_with_llm(
             deterministic=deterministic,
             artifact=artifact,
             ai_maturity=ai_maturity,
+            peer_rows=peers[:10],
+            controlled_web_research=controlled_web,
         )
         return llm_refined or deterministic
+
+    async def _controlled_web_context(self, *, artifact: EnrichmentArtifact) -> dict[str, Any] | None:
+        crunchbase = artifact.signals.get("crunchbase")
+        summary = crunchbase.summary if crunchbase and isinstance(crunchbase.summary, dict) else {}
+        name = str(summary.get("company_name") or "").strip()
+        if not name:
+            return None
+        industry = self._industry_from_artifact(artifact)
+        query = f"{name} {industry} competitive landscape AI hiring public peer practices".strip()
+        research = await self._web_research.run(user_query=query, max_search_results=8, mode="competitor")
+        if not research.source_urls:
+            return None
+        return {"synthesis": research.synthesis, "source_urls": research.source_urls}
 
     async def _load_dataset(self) -> list[dict[str, Any]]:
         if self._settings.crunchbase_dataset_path:
             path = Path(self._settings.crunchbase_dataset_path)
             if path.exists():
                 return self._rows_from_file(path=path)
+        default_path = Path(DEFAULT_CRUNCHBASE_DATASET_PATH)
+        if default_path.exists():
+            return self._rows_from_file(path=default_path)
         if self._settings.crunchbase_dataset_url:
             return await self._rows_from_url(url=self._settings.crunchbase_dataset_url)
         return []
@@ -144,22 +176,29 @@ class CompetitorGapAnalyst:
     ) -> list[dict[str, Any]]:
         peers: list[dict[str, Any]] = []
         for row in dataset:
-            if str(row.get("company_id") or row.get("id") or "").strip() == company_id:
+            if self._row_id(row) == company_id:
                 continue
             row_industries = [item.lower() for item in CrunchbaseAdapter._industry_values(row)]
             row_industry = str(row.get("industry") or "").strip().lower()
-            if industry and industry not in row_industries and row_industry != industry:
+            if industry and not self._industry_matches(target=industry, row_industries=row_industries, row_industry=row_industry):
                 continue
             peers.append(row)
         return peers
 
-    def _fallback_peers(self, *, dataset: list[dict[str, Any]], company_id: str) -> list[dict[str, Any]]:
-        peers: list[dict[str, Any]] = []
+    def _fallback_peers(
+        self,
+        *,
+        dataset: list[dict[str, Any]],
+        company_id: str,
+        artifact: EnrichmentArtifact,
+    ) -> list[dict[str, Any]]:
+        target = self._prospect_peer_profile(artifact=artifact)
+        scored: list[tuple[float, dict[str, Any]]] = []
         for row in dataset:
-            if str(row.get("company_id") or row.get("id") or "").strip() == company_id:
+            if self._row_id(row) == company_id:
                 continue
-            peers.append(row)
-        return peers
+            scored.append((self._peer_score(row=row, target=target), row))
+        return [row for _, row in sorted(scored, key=lambda item: item[0], reverse=True)]
 
     def _to_competitor_record(self, *, row: dict[str, Any]) -> CompetitorRecord:
         row_company_id = str(row.get("company_id") or row.get("id") or row.get("uuid") or uuid4().hex[:8])
@@ -168,7 +207,7 @@ class CompetitorGapAnalyst:
         ai_score = maturity.score
         return CompetitorRecord(
             company_name=str(row.get("company_name") or row.get("name") or "Unknown Company"),
-            reason_included="same sector/stage public profile",
+            reason_included=self._reason_included(row=row),
             ai_maturity_score=ai_score,
             confidence=maturity.confidence,
         )
@@ -295,9 +334,22 @@ class CompetitorGapAnalyst:
         deterministic: CompetitorGapBrief,
         artifact: EnrichmentArtifact,
         ai_maturity: AIMaturityScore,
+        peer_rows: list[dict[str, Any]],
+        controlled_web_research: dict[str, Any] | None,
     ) -> CompetitorGapBrief | None:
         if self._llm is None or not self._llm.configured:
             return None
+        instructions = [
+            "Analyze only supplied peer_evidence_packet and prospect_evidence.",
+            "Extract 2-3 top-quartile public practices when evidence supports them.",
+            "If evidence is weak, keep confidence below 0.65 and add risk_notes.",
+            "Do not add competitors that are not in peer_evidence_packet.",
+        ]
+        if controlled_web_research:
+            instructions.append(
+                "When controlled_web_research is present, you may only add narrative context grounded in "
+                "that synthesis; cite its source URLs when you reference it. Do not treat it as new competitors."
+            )
         candidate = await self._llm.generate_model(
             system_prompt=(
                 "You are the Competitor Gap Analyst. Refine the deterministic competitor_gap_brief "
@@ -309,6 +361,9 @@ class CompetitorGapAnalyst:
                 "deterministic_candidate": deterministic.model_dump(mode="json"),
                 "prospect_evidence": artifact.model_dump(mode="json"),
                 "prospect_ai_maturity": ai_maturity.model_dump(mode="json"),
+                "peer_evidence_packet": self._peer_evidence_packet(peer_rows=peer_rows),
+                "controlled_web_research": controlled_web_research,
+                "instructions": instructions,
             },
             response_model=CompetitorGapBrief,
         )
@@ -330,3 +385,80 @@ class CompetitorGapAnalyst:
             return int(str(value).replace(",", "").strip())
         except ValueError:
             return 0
+
+    @staticmethod
+    def _row_id(row: dict[str, Any]) -> str:
+        return str(row.get("company_id") or row.get("id") or row.get("uuid") or "").strip()
+
+    @staticmethod
+    def _industry_matches(*, target: str, row_industries: list[str], row_industry: str) -> bool:
+        if target == row_industry or target in row_industries:
+            return True
+        related = {
+            "finance": {"financial services", "fintech", "banking", "lending", "insurance", "asset management"},
+            "financial services": {"finance", "fintech", "banking", "lending", "insurance", "asset management"},
+        }
+        return bool(related.get(target, set()).intersection({row_industry, *row_industries}))
+
+    @staticmethod
+    def _prospect_peer_profile(*, artifact: EnrichmentArtifact) -> dict[str, Any]:
+        crunchbase = artifact.signals.get("crunchbase")
+        summary = crunchbase.summary if crunchbase and isinstance(crunchbase.summary, dict) else {}
+        industries = [str(item).lower() for item in summary.get("industries", []) if item]
+        return {
+            "industry": str(summary.get("industry") or "").lower(),
+            "industries": industries,
+            "employee_count": str(summary.get("employee_count") or ""),
+            "region": str(summary.get("region") or ""),
+        }
+
+    def _peer_score(self, *, row: dict[str, Any], target: dict[str, Any]) -> float:
+        score = 0.0
+        row_industries = [item.lower() for item in CrunchbaseAdapter._industry_values(row)]
+        target_industries = set(target.get("industries") or [])
+        if target_industries.intersection(row_industries):
+            score += 3.0
+        if self._industry_matches(
+            target=str(target.get("industry") or ""),
+            row_industries=row_industries,
+            row_industry=str(row.get("industry") or "").lower(),
+        ):
+            score += 2.0
+        if str(row.get("num_employees") or "").strip() == str(target.get("employee_count") or "").strip():
+            score += 1.0
+        if str(row.get("region") or "").strip().lower() == str(target.get("region") or "").strip().lower():
+            score += 0.5
+        if CrunchbaseAdapter._tech_stack(row=row):
+            score += 0.3
+        return score
+
+    @staticmethod
+    def _reason_included(*, row: dict[str, Any]) -> str:
+        industries = CrunchbaseAdapter._industry_values(row)
+        band = str(row.get("num_employees") or "").strip()
+        pieces = []
+        if industries:
+            pieces.append(f"sector overlap: {', '.join(industries[:2])}")
+        if band:
+            pieces.append(f"size band: {band}")
+        return "; ".join(pieces) or "similar public company profile"
+
+    @staticmethod
+    def _peer_evidence_packet(*, peer_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        packet: list[dict[str, Any]] = []
+        for row in peer_rows[:10]:
+            packet.append(
+                {
+                    "company_id": CompetitorGapAnalyst._row_id(row),
+                    "company_name": row.get("company_name") or row.get("name"),
+                    "industries": CrunchbaseAdapter._industry_values(row),
+                    "employee_count": row.get("num_employees"),
+                    "region": row.get("region"),
+                    "funding_events_180d": CrunchbaseAdapter._funding_events(row=row, lookback_days=180),
+                    "tech_stack": CrunchbaseAdapter._tech_stack(row=row),
+                    "news": CrunchbaseAdapter._jsonish(row.get("news")),
+                    "leadership_hire": CrunchbaseAdapter._jsonish(row.get("leadership_hire")),
+                    "source_ref": row.get("url"),
+                }
+            )
+        return packet

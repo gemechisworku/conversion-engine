@@ -13,6 +13,7 @@ from agent.services.enrichment.ai_maturity import score_ai_maturity, score_ai_ma
 from agent.services.enrichment.competitor_gap import CompetitorGapAnalyst
 from agent.services.enrichment.icp_classifier import classify_icp
 from agent.services.enrichment.llm import OpenRouterJSONClient
+import agent.services.enrichment.competitor_gap as competitor_gap_module
 from agent.services.enrichment.schemas import EnrichmentArtifact, SignalSnapshot
 
 
@@ -159,3 +160,41 @@ def test_competitor_gap_brief_generation() -> None:
     assert 0 <= gap.sector_percentile <= 1
     assert gap.confidence > 0
     assert 5 <= len(gap.comparison_set) <= 10
+
+
+def test_competitor_gap_uses_default_crunchbase_dataset(monkeypatch) -> None:
+    peer_path = Path("outputs/test-fixtures/default_competitor_peers.json")
+    peer_path.parent.mkdir(parents=True, exist_ok=True)
+    peer_path.write_text(
+        json.dumps(
+            [
+                {"id": "comp_123", "name": "Acme AI", "industries": [{"value": "SaaS"}], "num_employees": "51-100"},
+                *[
+                    {
+                        "id": f"default_peer_{idx}",
+                        "name": f"Default Peer {idx}",
+                        "industries": [{"value": "SaaS"}],
+                        "num_employees": "51-100",
+                        "builtwith_tech": [{"name": "Databricks"}],
+                    }
+                    for idx in range(1, 6)
+                ],
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(competitor_gap_module, "DEFAULT_CRUNCHBASE_DATASET_PATH", str(peer_path))
+    artifact = _artifact()
+    score = score_ai_maturity(company_id="comp_123", artifact=artifact)
+    analyst = CompetitorGapAnalyst(settings=Settings(crunchbase_dataset_path=""))
+    gap = asyncio.run(
+        analyst.build_brief(
+            lead_id="lead_123",
+            company_id="comp_123",
+            artifact=artifact,
+            ai_maturity=score,
+        )
+    )
+
+    assert len(gap.comparison_set) >= 5
+    assert all(record.company_name.startswith("Default Peer") for record in gap.comparison_set)

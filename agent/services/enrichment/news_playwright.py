@@ -1,16 +1,24 @@
-"""Playwright-backed public news/filing retrieval."""
+"""Playwright-backed public news/filing retrieval via controlled LangGraph research."""
 
 from __future__ import annotations
 
 import re
-from typing import Any
 from urllib.parse import urljoin
 from uuid import uuid4
 
 import httpx
 
 from agent.config.settings import Settings
+from agent.services.enrichment.web_research.runner import ControlledWebResearchRunner, build_research_runner
 from agent.services.enrichment.schemas import EnrichmentBrief, NewsBrief, SourceRef
+from agent.services.enrichment.web_research.types import ControlledResearchResult
+
+
+def _failure_risk_notes(research: ControlledResearchResult) -> list[str]:
+    notes = ["Controlled web research did not yield ranked pages; verify before making strong claims."]
+    if research.synthesis:
+        notes.append(research.synthesis[:500])
+    return notes
 
 
 class PublicNewsPlaywrightRetriever:
@@ -18,62 +26,86 @@ class PublicNewsPlaywrightRetriever:
     # Workflow: reply_handling.md
     # Schema: evidence_record.md
     # API: research_api.md
-    def __init__(self, *, settings: Settings, http_client: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        http_client: httpx.AsyncClient | None = None,
+        web_research: ControlledWebResearchRunner | None = None,
+    ) -> None:
         self._settings = settings
         self._http_client = http_client
+        self._web_research = web_research or build_research_runner(settings=settings, http_client=http_client)
 
     async def build_news_brief(self, *, lead_id: str, enrichment_brief: EnrichmentBrief) -> NewsBrief:
-        urls = self._candidate_urls(enrichment_brief=enrichment_brief)
-        if not urls:
+        company_name = enrichment_brief.firmographics.company_name
+        if not company_name:
             return NewsBrief(
                 brief_id=f"news_{uuid4().hex[:10]}",
                 lead_id=lead_id,
                 company_id=enrichment_brief.company_id,
                 found=False,
                 confidence=0.0,
-                risk_notes=["No website or Crunchbase URL available for public news lookup."],
+                error="search_skipped:missing_company_name",
+                risk_notes=["No company name available for controlled web research."],
             )
 
-        errors: list[str] = []
-        for url in urls:
-            try:
-                html = await self._fetch_html(url=url)
-            except Exception as exc:  # Playwright browser installs are environment-dependent.
-                errors.append(f"{url}: {exc}")
-                continue
-            if not html:
-                continue
-            title = self._title(html=html)
-            snippet = self._snippet(html=html)
-            if title or snippet:
-                return NewsBrief(
-                    brief_id=f"news_{uuid4().hex[:10]}",
-                    lead_id=lead_id,
-                    company_id=enrichment_brief.company_id,
-                    found=True,
-                    source_type=self._source_type(url=url),
-                    title=title or "Recent public mention",
-                    url=url,
-                    published_at=self._published_at(html=html),
-                    snippet=snippet,
-                    confidence=0.72,
-                    source_refs=[SourceRef(source_name="public_news_playwright", source_url=url)],
-                )
+        domain = enrichment_brief.firmographics.domain
+        aliases = self._company_aliases(company_name=company_name, domain=domain)
+        base_terms = [company_name, *aliases[:2]]
+        query = " OR ".join(f'"{term}" news OR press release' for term in base_terms[:3])
+        if domain:
+            query = f"({query}) ({domain})"
 
+        seed_urls = self._candidate_urls(enrichment_brief=enrichment_brief)
+        research = await self._web_research.run(
+            user_query=query,
+            max_search_results=8,
+            mode="news",
+            seed_urls=seed_urls[:4],
+        )
+
+        source_refs = [
+            SourceRef(source_name="controlled_web_research", source_url=url) for url in research.source_urls[:10]
+        ]
+        if not research.ranked_pages:
+            return NewsBrief(
+                brief_id=f"news_{uuid4().hex[:10]}",
+                lead_id=lead_id,
+                company_id=enrichment_brief.company_id,
+                found=False,
+                confidence=0.15,
+                source_refs=source_refs,
+                error="; ".join((research.errors or [])[:4]) or "research:no_ranked_pages",
+                risk_notes=_failure_risk_notes(research),
+            )
+
+        top = research.ranked_pages[0]
+        confidence = min(0.88, 0.58 + 0.06 * min(len(research.ranked_pages), 5))
         return NewsBrief(
             brief_id=f"news_{uuid4().hex[:10]}",
             lead_id=lead_id,
             company_id=enrichment_brief.company_id,
-            found=False,
-            confidence=0.2,
-            error="; ".join(errors[:3]) or None,
-            source_refs=[SourceRef(source_name="public_news_playwright", source_url=url) for url in urls[:3]],
-            risk_notes=["No retrievable public filing or news mention found."],
+            found=True,
+            source_type=self._source_type(url=top.url),
+            title=top.title or "Recent public mention",
+            url=top.url,
+            published_at=None,
+            snippet=top.summary[:400] if top.summary else None,
+            confidence=confidence,
+            source_refs=source_refs or [SourceRef(source_name="controlled_web_research", source_url=top.url)],
+            risk_notes=[
+                "News brief synthesized only from fetched pages in the research graph; citations are required for outreach claims.",
+                (
+                    f"Synthesis excerpt: {research.synthesis[:420]}…"
+                    if len(research.synthesis) > 420
+                    else f"Synthesis: {research.synthesis}"
+                ),
+            ],
         )
 
     def _candidate_urls(self, *, enrichment_brief: EnrichmentBrief) -> list[str]:
         website = enrichment_brief.firmographics.website
-        crunchbase_url = enrichment_brief.firmographics.crunchbase_url
         urls: list[str] = []
         if website:
             base = website if "://" in website else f"https://{website}"
@@ -85,51 +117,7 @@ class PublicNewsPlaywrightRetriever:
                     urljoin(base.rstrip("/") + "/", "investors"),
                 ]
             )
-        if crunchbase_url:
-            urls.append(crunchbase_url)
         return list(dict.fromkeys(urls))
-
-    async def _fetch_html(self, *, url: str) -> str | None:
-        if self._http_client is not None:
-            response = await self._http_client.get(url, timeout=self._settings.http_timeout_seconds)
-            return response.text if response.is_success else None
-        try:
-            from playwright.async_api import async_playwright
-        except ImportError as exc:  # pragma: no cover - dependency is declared in requirements.
-            raise RuntimeError("Playwright is not installed.") from exc
-        async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True)
-            try:
-                page = await browser.new_page()
-                await page.goto(url, wait_until="domcontentloaded", timeout=int(self._settings.http_timeout_seconds * 1000))
-                return await page.content()
-            finally:
-                await browser.close()
-
-    @staticmethod
-    def _title(*, html: str) -> str | None:
-        match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
-        if match:
-            return PublicNewsPlaywrightRetriever._clean(match.group(1))[:160]
-        heading = re.search(r"<h1[^>]*>(.*?)</h1>", html, flags=re.IGNORECASE | re.DOTALL)
-        return PublicNewsPlaywrightRetriever._clean(heading.group(1))[:160] if heading else None
-
-    @staticmethod
-    def _snippet(*, html: str) -> str | None:
-        meta = re.search(
-            r'<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']',
-            html,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        if meta:
-            return PublicNewsPlaywrightRetriever._clean(meta.group(1))[:300]
-        text = PublicNewsPlaywrightRetriever._clean(re.sub(r"<[^>]+>", " ", html))
-        return text[:300] if text else None
-
-    @staticmethod
-    def _published_at(*, html: str) -> str | None:
-        match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", html)
-        return match.group(1) if match else None
 
     @staticmethod
     def _source_type(*, url: str) -> str:
@@ -145,3 +133,23 @@ class PublicNewsPlaywrightRetriever:
     @staticmethod
     def _clean(value: str) -> str:
         return re.sub(r"\s+", " ", value).strip()
+
+    @staticmethod
+    def _company_aliases(*, company_name: str, domain: str | None) -> list[str]:
+        blocked = {"inc", "inc.", "llc", "ltd", "corp", "corp.", "corporation", "company", "co", "capital"}
+        parts = [token for token in re.split(r"[^a-z0-9]+", company_name.lower()) if token and token not in blocked]
+        aliases: list[str] = []
+        if len(parts) >= 2:
+            aliases.append(" ".join(parts[:2]))
+            aliases.append(" ".join(parts[:3]))
+        if parts:
+            aliases.append(parts[0])
+        if domain:
+            root = domain.lower().split(".")[0].replace("-", " ").strip()
+            if root:
+                aliases.append(root)
+        deduped: list[str] = []
+        for value in aliases:
+            if value and value not in deduped:
+                deduped.append(value)
+        return deduped

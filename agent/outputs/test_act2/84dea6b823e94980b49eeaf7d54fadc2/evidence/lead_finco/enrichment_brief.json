@@ -1,0 +1,35 @@
+{
+  "brief_id": "enrich_lead_finco",
+  "lead_id": "lead_finco",
+  "company_id": "finco",
+  "generated_at": "2026-04-24T19:22:02.551999Z",
+  "matched": true,
+  "match_type": "email_domain",
+  "matched_identifier": "finco.example",
+  "match_confidence": 0.86,
+  "firmographics": {
+    "company_name": "FinCo",
+    "domain": "finco.example",
+    "website": "https://finco.example",
+    "industry": "Financial Services",
+    "industries": [
+      "Financial Services"
+    ],
+    "location": "New York",
+    "region": "NA",
+    "employee_count": "51-100",
+    "founded_date": null,
+    "funding_rounds": null,
+    "funding_total": null,
+    "operating_status": null,
+    "crunchbase_url": "https://www.crunchbase.com/organization/finco"
+  },
+  "source_refs": [
+    {
+      "source_name": "crunchbase_odm_local",
+      "source_url": "https://www.crunchbase.com/organization/finco",
+      "fetched_at": "2026-04-24T19:22:02.551987Z"
+    }
+  ],
+  "risk_notes": []
+}
