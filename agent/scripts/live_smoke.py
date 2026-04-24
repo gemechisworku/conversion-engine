@@ -15,6 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from agent.config.logging import configure_logging
 from agent.config.settings import get_settings
 from agent.main import build_calcom_service, build_email_service, build_hubspot_service, build_sms_service
 from agent.services.calendar.calcom_client import book_and_sync_crm
@@ -297,6 +298,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    configure_logging()
     parser = _build_parser()
     args = parser.parse_args()
 

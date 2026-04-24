@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -18,6 +19,7 @@ from agent.services.enrichment.web_research.providers import (
     build_default_search_stack,
     default_http_headers,
 )
+from agent.services.observability.events import log_processing_step
 from agent.services.enrichment.web_research.types import (
     ControlledResearchResult,
     ExtractedPage,
@@ -107,8 +109,29 @@ class ControlledWebResearchRunner:
             "errors": [],
             "seed_urls": list(seed_urls or []),
         }
+        log_processing_step(
+            component="graphs.web_research",
+            step="pipeline.start",
+            message="Running web research LangGraph (search → fetch → rank → answer)",
+            mode=mode,
+            max_results=max_results,
+            timeout_seconds=timeout,
+            seed_url_count=len(initial.get("seed_urls") or []),
+            query_preview=user_query[:120],
+        )
         final: ResearchGraphState = await self._graph.ainvoke(initial)
         ranked = [RankedPage.model_validate(row) for row in final.get("ranked_pages") or []]
+        err_list = list(final.get("errors") or [])
+        log_processing_step(
+            component="graphs.web_research",
+            step="pipeline.done",
+            message="Web research graph finished",
+            mode=mode,
+            ranked_pages=len(ranked),
+            source_urls=len(final.get("source_urls") or []),
+            error_events=len(err_list),
+            level=logging.WARNING if not ranked and err_list else logging.INFO,
+        )
         return ControlledResearchResult(
             synthesis=final.get("synthesis") or "",
             source_urls=list(final.get("source_urls") or []),
@@ -156,6 +179,13 @@ def _compile_graph(deps: ResearchDeps):
             seen.add(key)
             seed_hits.append(h)
         merged = seed_hits[:max_results]
+        log_processing_step(
+            component="graphs.web_research",
+            step="search",
+            message="Search + seed URLs merged",
+            hit_count=len(merged),
+            query_preview=(query[:100] + "…") if len(query) > 100 else query,
+        )
         return {"search_hits": [h.model_dump(mode="json") for h in merged], "errors": [*errs, *err_out]}
 
     async def fetch_extract_node(state: ResearchGraphState) -> dict[str, Any]:
@@ -216,6 +246,14 @@ def _compile_graph(deps: ResearchDeps):
             )
         if not any(not row.get("fetch_error") for row in extracted):
             err_out.append("fetch:no_usable_pages")
+        usable = sum(1 for row in extracted if not row.get("fetch_error"))
+        log_processing_step(
+            component="graphs.web_research",
+            step="fetch_extract",
+            message="Fetched and extracted candidate pages",
+            urls_attempted=len(raw_hits),
+            pages_usable=usable,
+        )
         return {"extracted_pages": extracted, "errors": err_out}
 
     async def summarize_rank_node(state: ResearchGraphState) -> dict[str, Any]:
@@ -242,6 +280,12 @@ def _compile_graph(deps: ResearchDeps):
         ranked = _dedupe_ranked(ranked)[:10]
         if not ranked:
             err_out.append("rank:no_pages")
+        log_processing_step(
+            component="graphs.web_research",
+            step="summarize_rank",
+            message="Ranked pages for answer node",
+            ranked_count=len(ranked),
+        )
         return {"ranked_pages": [r.model_dump(mode="json") for r in ranked], "errors": err_out}
 
     async def answer_node(state: ResearchGraphState) -> dict[str, Any]:
@@ -249,6 +293,13 @@ def _compile_graph(deps: ResearchDeps):
         ranked = [RankedPage.model_validate(row) for row in state.get("ranked_pages") or []]
         err_out: list[str] = []
         if not ranked:
+            log_processing_step(
+                component="graphs.web_research",
+                step="answer",
+                message="No ranked pages; emitting empty synthesis",
+                query_preview=(query[:80] + "…") if len(query) > 80 else query,
+                level=logging.WARNING,
+            )
             return {
                 "synthesis": f"No verifiable public pages could be synthesized for query: {query!r}.",
                 "source_urls": [],
@@ -265,6 +316,13 @@ def _compile_graph(deps: ResearchDeps):
             lines.append("")
             urls.append(page.url)
         synthesis = "\n".join(lines).strip()
+        log_processing_step(
+            component="graphs.web_research",
+            step="answer",
+            message="Built grounded synthesis with citations",
+            citation_count=len(urls),
+            synthesis_chars=len(synthesis),
+        )
         return {"synthesis": synthesis, "source_urls": urls, "errors": err_out}
 
     graph.add_node("search", search_node)

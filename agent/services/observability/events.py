@@ -8,6 +8,28 @@ from typing import Any
 LOGGER = logging.getLogger("agent.observability")
 
 
+def log_processing_step(
+    *,
+    component: str,
+    step: str,
+    message: str,
+    level: int = logging.INFO,
+    **fields: Any,
+) -> None:
+    """Human-visible pipeline progress (stdout when logging is configured)."""
+    log = logging.getLogger(f"agent.{component}")
+    parts = [f"[{step}]", message]
+    for key in sorted(fields):
+        value = fields[key]
+        if value is None or value == "":
+            continue
+        text = repr(value) if not isinstance(value, str) else value
+        if len(text) > 200:
+            text = text[:197] + "..."
+        parts.append(f"{key}={text}")
+    log.log(level, " ".join(parts))
+
+
 def log_trace_event(
     *,
     event_type: str,

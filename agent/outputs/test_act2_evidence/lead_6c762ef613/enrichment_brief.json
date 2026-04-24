@@ -2,7 +2,7 @@
   "brief_id": "enrich_lead_6c762ef613",
   "lead_id": "lead_6c762ef613",
   "company_id": "comp_123",
-  "generated_at": "2026-04-24T19:22:37.551167Z",
+  "generated_at": "2026-04-24T19:54:14.200403Z",
   "matched": true,
   "match_type": "domain",
   "matched_identifier": "acme.ai",
@@ -28,7 +28,7 @@
     {
       "source_name": "crunchbase_odm_local",
       "source_url": "D:\\FDE-Training\\week-10\\conversion-engine\\agent\\tests\\fixtures\\enrichment\\crunchbase_sample.json",
-      "fetched_at": "2026-04-24T19:22:37.551158Z"
+      "fetched_at": "2026-04-24T19:54:14.200393Z"
     }
   ],
   "risk_notes": []

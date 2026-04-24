@@ -1,0 +1,2 @@
+id,name,website,contact_email,contact_phone,industries,num_employees,region,address,url
+finco,FinCo,https://finco.example,buyer@finco.example,+15551234567,"[{""id"":""fintech"",""value"":""Financial Services""}]",51-100,NA,New York,https://www.crunchbase.com/organization/finco

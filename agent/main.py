@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from agent.config.logging import configure_logging
 from agent.config.settings import get_settings
 from agent.services.calendar.calcom_client import CalComService
 from agent.services.crm.hubspot_mcp import HubSpotMCPService
@@ -57,6 +58,7 @@ def build_state_repo() -> SQLiteStateRepository:
 
 
 def build_orchestration_runtime() -> OrchestrationRuntime:
+    configure_logging()
     settings = get_settings()
     state_repo = build_state_repo()
     crunchbase, jobs, layoffs, leadership, merger, competitor_gap, llm = build_enrichment_services()

@@ -145,7 +145,7 @@ def test_crunchbase_collect_includes_recent_funding_events() -> None:
 
 
 def test_jobs_module_has_no_interactive_auth_flow() -> None:
-    file_path = Path("agent/services/enrichment/jobs_playwright.py")
+    file_path = Path(__file__).resolve().parents[2] / "services" / "enrichment" / "jobs_playwright.py"
     content = file_path.read_text(encoding="utf-8").lower()
     blocked_patterns = ["page.fill(", "input[type=password]", "solve_", "anti-bot", "stealth"]
     for pattern in blocked_patterns:

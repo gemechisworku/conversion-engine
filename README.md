@@ -266,6 +266,38 @@ From repo root, with `.env` configured and dependencies installed:
 .\scripts\smoke-act2-live.ps1 -ProspectEmail "prospect@example.com" -SmsTo "+251900000000" -SmsInteractions 1
 ```
 
+### Run orchestrator (lead intake CLI)
+
+Runs **`OrchestrationRuntime.process_lead`**: session bootstrap, **lead intake LangGraph** (`enrich` then `crm_sync`), then persistence. Prints the **`ResponseEnvelope`** as JSON. Exit code **0** when `status` is `accepted`, **1** otherwise.
+
+Requires `.env` at the repo root (or env vars), same enrichment paths as smoke (`CRUNCHBASE_DATASET_PATH`, etc.). HubSpot MCP calls run when tokens are configured; otherwise readiness or CRM steps may fail—see printed JSON `error`.
+
+**PowerShell** (from repo root):
+
+```powershell
+Set-Location "d:\FDE-Training\week-10\conversion-engine"
+$env:LOG_LEVEL = "INFO"
+python agent/scripts/run_orchestrator.py `
+  --company-id "your-company-slug" `
+  --company-name "Your Company Name" `
+  --company-domain "yourdomain.com"
+```
+
+**Bash** (from repo root):
+
+```bash
+cd /path/to/conversion-engine
+export LOG_LEVEL=INFO
+python agent/scripts/run_orchestrator.py \
+  --company-id "your-company-slug" \
+  --company-name "Your Company Name" \
+  --company-domain "yourdomain.com"
+```
+
+Optional: **`--idempotency-key`** for repeatable HubSpot writes. If **`--company-name`** is omitted, it defaults to **`--company-id`**.
+
+**Expected result:** stderr shows `agent.orchestration` / `agent.graphs.lead_intake` log lines when `LOG_LEVEL=INFO`; stdout ends with JSON including `"status": "accepted"`, `"data": { "lead_id": "...", "state": "brief_ready" }`, and `"trace_id": "..."`.
+
 Notes:
 * live side-effect commands are blocked when `CHALLENGE_MODE=true` and `SINK_ROUTING_ENABLED=false`.
 * use `-Cold` on SMS script and `-Unconfirmed` on booking script to validate policy-block behavior.

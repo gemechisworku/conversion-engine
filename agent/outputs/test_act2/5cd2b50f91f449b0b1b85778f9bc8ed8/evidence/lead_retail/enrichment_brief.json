@@ -1,0 +1,35 @@
+{
+  "brief_id": "enrich_lead_retail",
+  "lead_id": "lead_retail",
+  "company_id": "retailco",
+  "generated_at": "2026-04-24T19:47:01.084038Z",
+  "matched": true,
+  "match_type": "email_domain",
+  "matched_identifier": "retail.example",
+  "match_confidence": 0.86,
+  "firmographics": {
+    "company_name": "RetailCo",
+    "domain": "retail.example",
+    "website": "https://retail.example",
+    "industry": "Retail",
+    "industries": [
+      "Retail"
+    ],
+    "location": null,
+    "region": null,
+    "employee_count": null,
+    "founded_date": null,
+    "funding_rounds": null,
+    "funding_total": null,
+    "operating_status": null,
+    "crunchbase_url": null
+  },
+  "source_refs": [
+    {
+      "source_name": "crunchbase_odm_local",
+      "source_url": "outputs\\test_act2\\5cd2b50f91f449b0b1b85778f9bc8ed8\\crunchbase.csv",
+      "fetched_at": "2026-04-24T19:47:01.084026Z"
+    }
+  ],
+  "risk_notes": []
+}

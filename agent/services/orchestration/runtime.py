@@ -3,19 +3,20 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
 from agent.config.settings import Settings
-from agent.graphs.lead_graph import run_lead_intake
+from agent.graphs.lead_intake_langgraph import LeadIntakeGraphDeps, compile_lead_intake_graph
 from agent.graphs.state import LeadGraphState
 from agent.graphs.transitions import InvalidStateTransitionError, validate_lead_transition
 from agent.repositories.state_repo import SQLiteStateRepository
 from agent.services.common.schemas import ErrorEnvelope
-from agent.services.crm.hubspot_mcp import HubSpotMCPService, map_enrichment_to_crm_payload
-from agent.services.crm.schemas import CRMLeadPayload
-from agent.services.observability.events import log_trace_event
+from agent.services.crm.hubspot_mcp import HubSpotMCPService
+from agent.services.enrichment.schemas import EnrichmentArtifact
+from agent.services.observability.events import log_processing_step, log_trace_event
 from agent.services.orchestration.schemas import (
     LeadAdvanceRequest,
     LeadEscalationRequest,
@@ -23,7 +24,6 @@ from agent.services.orchestration.schemas import (
     LeadReplyRequest,
     ResponseEnvelope,
 )
-
 
 class OrchestrationRuntime:
     # Implements: FR-9, FR-11, FR-12, FR-14, FR-15
@@ -42,6 +42,13 @@ class OrchestrationRuntime:
         self._state_repo = state_repo
         self._enrichment_services = enrichment_services
         self._hubspot = hubspot_service
+        self._lead_intake_graph = compile_lead_intake_graph(
+            LeadIntakeGraphDeps(
+                hubspot=self._hubspot,
+                enrichment_services=self._enrichment_services,
+                state_repo=self._state_repo,
+            )
+        )
 
     async def process_lead(self, request: LeadProcessRequest) -> ResponseEnvelope:
         request_id = f"req_{uuid4().hex[:10]}"
@@ -49,6 +56,17 @@ class OrchestrationRuntime:
         lead_id = self._lead_id_for_company(company_id=request.company_id)
         company_name = str(request.metadata.get("company_name") or request.company_id)
         company_domain = str(request.metadata.get("company_domain") or "")
+        log_processing_step(
+            component="orchestration",
+            step="process_lead.start",
+            message="Processing new lead",
+            lead_id=lead_id,
+            trace_id=trace_id,
+            company_id=request.company_id,
+            company_name=company_name,
+            company_domain=company_domain,
+            idempotency_key=request.idempotency_key,
+        )
         try:
             self._state_repo.upsert_session_state(
                 lead_id=lead_id,
@@ -74,11 +92,47 @@ class OrchestrationRuntime:
                 },
             )
             state = LeadGraphState(lead_id=lead_id, company_id=request.company_id, current_stage="enriching")
-            enriched_state, artifact = await run_lead_intake(
-                state=state,
-                company_name=company_name,
-                company_domain=company_domain,
-                services={**self._enrichment_services, "state_repo": self._state_repo},
+            log_processing_step(
+                component="orchestration",
+                step="process_lead.graph",
+                message="Invoking lead intake LangGraph (enrich → crm_sync)",
+                lead_id=lead_id,
+                trace_id=trace_id,
+                hubspot_configured=self._hubspot is not None,
+            )
+            if self._hubspot is not None:
+                readiness = await self._hubspot.verify_tool_readiness()
+                if not readiness.get("ready", False):
+                    return self._failure(
+                        request_id=request_id,
+                        trace_id=trace_id,
+                        code="CONFIG_ERROR",
+                        message=f"HubSpot MCP readiness failed: {readiness}",
+                        retryable=False,
+                    )
+            graph_out = await self._lead_intake_graph.ainvoke(
+                {
+                    "lead_id": lead_id,
+                    "company_id": request.company_id,
+                    "company_name": company_name,
+                    "company_domain": company_domain,
+                    "trace_id": trace_id,
+                    "idempotency_key": request.idempotency_key,
+                    "lead_state": state.model_dump(mode="json"),
+                    "errors": [],
+                }
+            )
+            enriched_state = LeadGraphState.model_validate(graph_out["enriched_state"])
+            artifact = EnrichmentArtifact.model_validate(graph_out["artifact"])
+            log_processing_step(
+                component="orchestration",
+                step="process_lead.graph_done",
+                message="Lead intake graph completed; persisting session and conversation state",
+                lead_id=lead_id,
+                trace_id=trace_id,
+                crm_synced=graph_out.get("crm_synced"),
+                brief_refs_count=len(enriched_state.brief_refs),
+                artifact_company_id=artifact.company_id,
             )
             self._state_repo.upsert_session_state(
                 lead_id=lead_id,
@@ -106,48 +160,6 @@ class OrchestrationRuntime:
                 },
             )
 
-            if self._hubspot is not None:
-                readiness = await self._hubspot.verify_tool_readiness()
-                if not readiness.get("ready", False):
-                    return self._failure(
-                        request_id=request_id,
-                        trace_id=trace_id,
-                        code="CONFIG_ERROR",
-                        message=f"HubSpot MCP readiness failed: {readiness}",
-                        retryable=False,
-                    )
-                await self._hubspot.upsert_contact(
-                    contact=CRMLeadPayload(
-                        lead_id=lead_id,
-                        company_id=request.company_id,
-                        company_name=company_name,
-                        company_domain=company_domain or None,
-                    ),
-                    trace_id=trace_id,
-                    idempotency_key=request.idempotency_key,
-                )
-                await self._hubspot.append_enrichment(
-                    lead_id=lead_id,
-                    enrichment=map_enrichment_to_crm_payload(
-                        lead_id=lead_id,
-                        enrichment_artifact=artifact.model_dump(mode="json"),
-                    ),
-                    trace_id=trace_id,
-                    idempotency_key=f"{request.idempotency_key}:enrichment",
-                )
-                await self._hubspot.set_stage(
-                    lead_id=lead_id,
-                    stage="brief_ready",
-                    trace_id=trace_id,
-                    idempotency_key=f"{request.idempotency_key}:stage",
-                )
-                await self._hubspot.attach_brief_refs(
-                    lead_id=lead_id,
-                    brief_refs=enriched_state.brief_refs,
-                    trace_id=trace_id,
-                    idempotency_key=f"{request.idempotency_key}:brief_refs",
-                )
-
             log_trace_event(
                 event_type="lead_processed",
                 trace_id=trace_id,
@@ -162,6 +174,15 @@ class OrchestrationRuntime:
                 data={"lead_id": lead_id, "state": "brief_ready"},
             )
         except InvalidStateTransitionError as exc:
+            log_processing_step(
+                component="orchestration",
+                step="process_lead.error",
+                message="Invalid state transition during process_lead",
+                lead_id=lead_id,
+                trace_id=trace_id,
+                error=str(exc),
+                level=logging.WARNING,
+            )
             return self._failure(
                 request_id=request_id,
                 trace_id=trace_id,
@@ -170,6 +191,15 @@ class OrchestrationRuntime:
                 retryable=False,
             )
         except Exception as exc:  # pragma: no cover - orchestration guard
+            log_processing_step(
+                component="orchestration",
+                step="process_lead.error",
+                message="Unhandled exception during process_lead",
+                lead_id=lead_id,
+                trace_id=trace_id,
+                error=str(exc),
+                level=logging.ERROR,
+            )
             return self._failure(
                 request_id=request_id,
                 trace_id=trace_id,
@@ -181,6 +211,16 @@ class OrchestrationRuntime:
     async def handle_reply(self, request: LeadReplyRequest) -> ResponseEnvelope:
         request_id = f"req_{uuid4().hex[:10]}"
         trace_id = f"trace_reply_{uuid4().hex[:12]}"
+        log_processing_step(
+            component="orchestration",
+            step="handle_reply.start",
+            message="Inbound reply received",
+            lead_id=request.lead_id,
+            trace_id=trace_id,
+            channel=request.channel,
+            message_id=request.message_id,
+            idempotency_key=request.idempotency_key,
+        )
         session = self._state_repo.get_session_state(lead_id=request.lead_id)
         if session is None:
             return self._failure(
@@ -204,9 +244,27 @@ class OrchestrationRuntime:
                 lead_id=request.lead_id,
                 request=request,
             )
+            log_processing_step(
+                component="orchestration",
+                step="handle_reply.act2",
+                message="Act II pre-reply enrichment finished" if act2_context else "Act II pipeline skipped or disabled",
+                lead_id=request.lead_id,
+                trace_id=trace_id,
+                act2_ran=act2_context is not None,
+            )
             intent = self._classify_intent(request.content)
             next_action = self._next_action(intent=intent)
             next_state = "scheduling" if next_action == "schedule" else "qualifying"
+            log_processing_step(
+                component="orchestration",
+                step="handle_reply.route",
+                message="Classified inbound intent and next action",
+                lead_id=request.lead_id,
+                trace_id=trace_id,
+                intent=intent,
+                next_action=next_action,
+                next_state=next_state,
+            )
             validate_lead_transition(from_state="reply_received", to_state=next_state)
 
             self._state_repo.upsert_session_state(
@@ -289,6 +347,14 @@ class OrchestrationRuntime:
                     trace_id=trace_id,
                     idempotency_key=f"{request.idempotency_key}:stage",
                 )
+            log_processing_step(
+                component="orchestration",
+                step="handle_reply.done",
+                message="Reply handling persisted session and optional HubSpot events",
+                lead_id=request.lead_id,
+                trace_id=trace_id,
+                next_action=next_action,
+            )
             return ResponseEnvelope(
                 request_id=request_id,
                 trace_id=trace_id,
@@ -296,6 +362,15 @@ class OrchestrationRuntime:
                 data={"lead_id": request.lead_id, "state": "reply_received", "next_action": next_action},
             )
         except InvalidStateTransitionError as exc:
+            log_processing_step(
+                component="orchestration",
+                step="handle_reply.error",
+                message="Invalid transition during handle_reply",
+                lead_id=request.lead_id,
+                trace_id=trace_id,
+                error=str(exc),
+                level=logging.WARNING,
+            )
             return self._failure(
                 request_id=request_id,
                 trace_id=trace_id,
@@ -340,6 +415,17 @@ class OrchestrationRuntime:
     async def advance_state(self, request: LeadAdvanceRequest) -> ResponseEnvelope:
         request_id = f"req_{uuid4().hex[:10]}"
         trace_id = f"trace_advance_{uuid4().hex[:12]}"
+        log_processing_step(
+            component="orchestration",
+            step="advance_state.start",
+            message="Advancing lead session stage",
+            lead_id=request.lead_id,
+            trace_id=trace_id,
+            from_state=request.from_state,
+            to_state=request.to_state,
+            reason=request.reason,
+            idempotency_key=request.idempotency_key,
+        )
         session = self._state_repo.get_session_state(lead_id=request.lead_id)
         if session is None:
             return self._failure(
@@ -369,6 +455,14 @@ class OrchestrationRuntime:
                     trace_id=trace_id,
                     idempotency_key=request.idempotency_key,
                 )
+            log_processing_step(
+                component="orchestration",
+                step="advance_state.done",
+                message="Lead stage advanced",
+                lead_id=request.lead_id,
+                trace_id=trace_id,
+                current_state=request.to_state,
+            )
             return ResponseEnvelope(
                 request_id=request_id,
                 trace_id=trace_id,
@@ -376,6 +470,15 @@ class OrchestrationRuntime:
                 data={"lead_id": request.lead_id, "current_state": request.to_state},
             )
         except InvalidStateTransitionError as exc:
+            log_processing_step(
+                component="orchestration",
+                step="advance_state.error",
+                message="advance_state rejected",
+                lead_id=request.lead_id,
+                trace_id=trace_id,
+                error=str(exc),
+                level=logging.WARNING,
+            )
             return self._failure(
                 request_id=request_id,
                 trace_id=trace_id,
@@ -418,6 +521,14 @@ class OrchestrationRuntime:
     async def escalate(self, request: LeadEscalationRequest) -> ResponseEnvelope:
         request_id = f"req_{uuid4().hex[:10]}"
         trace_id = f"trace_escalate_{uuid4().hex[:12]}"
+        log_processing_step(
+            component="orchestration",
+            step="escalate",
+            message="Escalating lead to human handoff",
+            lead_id=request.lead_id,
+            trace_id=trace_id,
+            reason_code=request.reason_code,
+        )
         session = self._state_repo.get_session_state(lead_id=request.lead_id)
         if session is None:
             return self._failure(
@@ -504,6 +615,16 @@ class OrchestrationRuntime:
         message: str,
         retryable: bool,
     ) -> ResponseEnvelope:
+        log_processing_step(
+            component="orchestration",
+            step="response.failure",
+            message="Returning failure response envelope",
+            trace_id=trace_id,
+            error_code=code,
+            error_message=message,
+            retryable=retryable,
+            level=logging.WARNING,
+        )
         return ResponseEnvelope(
             request_id=request_id,
             trace_id=trace_id,
