@@ -15,6 +15,7 @@
 * For Act II inbound identity matching, should local Crunchbase ODM matching prefer exact contact email/phone over email-domain matching when both exist?
 * For Act II CFPB lookup, should company aliases/legal names be expanded beyond exact local Crunchbase company name?
 * For Act II news lookup, which public source should be canonical when the company has no filings page or press/news page?
+* `specs/api_contracts/scheduling_api.md` is empty: what are the canonical orchestration routes/payloads for operator-driven scheduling prepare/book actions, including idempotency and response envelope fields?
 
 ## 3. Evaluation
 

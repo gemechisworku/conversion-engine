@@ -23,10 +23,14 @@ from agent.services.orchestration.runtime import OrchestrationRuntime
 from agent.services.orchestration.schemas import (
     LeadAdvanceRequest,
     LeadProcessRequest,
+    LeadScheduleBookRequest,
+    LeadSchedulePrepareRequest,
     LeadRespondRequest,
     LeadReplyRequest,
     OutreachSendRequest,
 )
+from agent.services.calendar.schemas import BookingResult
+from agent.services.crm.schemas import CRMWriteResult
 from agent.services.email.schemas import InboundEmailEvent
 from agent.services.outreach.outreach_payload import wrap_v2
 
@@ -46,7 +50,7 @@ def _settings() -> Settings:
     )
 
 
-def _runtime(*, email_service=None) -> OrchestrationRuntime:
+def _runtime(*, email_service=None, hubspot_service=None, calcom_service=None) -> OrchestrationRuntime:
     settings = _settings()
     repo = SQLiteStateRepository(db_path=settings.state_db_path)
     async def handler(_: httpx.Request) -> httpx.Response:
@@ -76,7 +80,8 @@ def _runtime(*, email_service=None) -> OrchestrationRuntime:
         settings=settings,
         state_repo=repo,
         enrichment_services=services,
-        hubspot_service=None,
+        hubspot_service=hubspot_service,
+        calcom_service=calcom_service,
         email_service=email_service,
     )
 
@@ -145,6 +150,58 @@ def test_reply_updates_next_action() -> None:
     assert reply.status == "accepted"
     assert reply.data["next_action"] == "schedule"
     assert runtime._state_repo.get_act2_briefs(lead_id=lead_id) is not None
+
+
+def test_schedule_reply_does_not_store_suggested_outbound_reply() -> None:
+    runtime = _runtime()
+    processed = asyncio.run(
+        runtime.process_lead(
+            LeadProcessRequest(
+                idempotency_key="idem_2b",
+                company_id="comp_235",
+                metadata={"company_name": "Acme AI", "company_domain": "acme.ai"},
+            )
+        )
+    )
+    lead_id = processed.data["lead_id"]
+    transitions = [
+        ("brief_ready", "drafting"),
+        ("drafting", "in_review"),
+        ("in_review", "queued_to_send"),
+        ("queued_to_send", "awaiting_reply"),
+    ]
+    for idx, (from_state, to_state) in enumerate(transitions, start=1):
+        advance = asyncio.run(
+            runtime.advance_state(
+                LeadAdvanceRequest(
+                    idempotency_key=f"idem_reply_no_suggest_adv_{idx}",
+                    lead_id=lead_id,
+                    from_state=from_state,
+                    to_state=to_state,
+                    reason="test setup",
+                )
+            )
+        )
+        assert advance.status == "success"
+    reply = asyncio.run(
+        runtime.handle_reply(
+            LeadReplyRequest(
+                idempotency_key="idem_reply_no_suggest_1",
+                lead_id=lead_id,
+                channel="email",
+                message_id="msg_sched_1",
+                content="Tuesday 4 PM EAT works for me.",
+                from_email="buyer@acme.ai",
+            )
+        )
+    )
+    assert reply.status == "accepted"
+    assert reply.data["next_action"] == "schedule"
+    messages = runtime._state_repo.list_messages(lead_id=lead_id, limit=20)
+    assert not any(
+        str((row.get("metadata") or {}).get("kind") or "") == "suggested_reply_email"
+        for row in messages
+    )
 
 
 def test_invalid_advance_transition_rejected() -> None:
@@ -673,3 +730,159 @@ def test_respond_to_lead_sends_outbound_reply_and_waits_for_followup() -> None:
     assert conversation["last_outbound_message_id"] == "reply_msg_123"
     messages = runtime._state_repo.list_messages(lead_id=lead_id, limit=10)
     assert any(m["message_id"] == "reply_msg_123" and m["direction"] == "outbound" for m in messages)
+
+
+def test_prepare_scheduling_extracts_meeting_time_from_history() -> None:
+    runtime = _runtime()
+    lead_id = "lead_schedule_prepare_1"
+    runtime._state_repo.upsert_session_state(
+        lead_id=lead_id,
+        payload={
+            "current_stage": "scheduling",
+            "next_best_action": "schedule",
+            "current_objective": "reply_handling",
+            "brief_refs": [],
+            "kb_refs": [],
+            "pending_actions": [{"action_type": "delegate_scheduler", "status": "pending"}],
+            "policy_flags": [],
+            "handoff_required": False,
+        },
+    )
+    runtime._state_repo.upsert_conversation_state(
+        lead_id=lead_id,
+        payload={
+            "current_stage": "inbound_received",
+            "current_channel": "email",
+            "last_inbound_message_id": "msg_sched_in_1",
+            "last_customer_intent": "schedule",
+            "last_customer_sentiment": "neutral",
+            "qualification_status": "likely_qualified",
+            "pending_actions": [{"action_type": "delegate_scheduler", "status": "pending"}],
+            "policy_flags": [],
+            "scheduling_context": {"booking_status": "none", "timezone": None, "slots_proposed": []},
+        },
+    )
+    runtime._state_repo.append_message(
+        lead_id=lead_id,
+        channel="email",
+        message_id="msg_sched_in_1",
+        direction="inbound",
+        content="Tuesday at 4 PM EAT works for me.",
+        metadata={"from_email": "prospect@example.com"},
+    )
+    runtime._state_repo.upsert_inbound_email(
+        resend_email_id="recv_sched_prepare_1",
+        lead_id=lead_id,
+        from_email="prospect@example.com",
+        to_email=f"{lead_id}@chuairkoon.resend.app",
+        subject="Re: Intro",
+        text_body="Tuesday at 4 PM EAT works for me.",
+        html_body=None,
+        headers={},
+        in_reply_to="<outbound@example.com>",
+        references="<outbound@example.com>",
+        received_at=datetime.now(UTC),
+    )
+    env = asyncio.run(runtime.prepare_scheduling(LeadSchedulePrepareRequest(lead_id=lead_id)))
+    assert env.status == "success"
+    assert "4 PM EAT" in str(env.data.get("meeting_time_text") or "")
+
+
+def test_book_scheduling_books_with_cal_and_syncs_hubspot() -> None:
+    class _CalServiceStub:
+        async def book_discovery_call(self, request):
+            return BookingResult(
+                booking_id="booking_123",
+                lead_id=request.lead_id,
+                slot_id=request.slot_id,
+                status="confirmed",
+                timezone=request.timezone,
+                calendar_ref="https://cal.com/bookings/booking_123",
+                starts_at=request.starts_at,
+                ends_at=request.ends_at,
+                confirmed_by_prospect=True,
+                raw_response={"id": "booking_123"},
+            )
+
+    class _HubSpotStub:
+        def __init__(self) -> None:
+            self.stage_updates: list[str] = []
+            self.bookings: list[str] = []
+
+        async def record_booking(self, *, lead_id, booking, trace_id, idempotency_key):
+            del trace_id, idempotency_key
+            self.bookings.append(lead_id)
+            return CRMWriteResult(status="event_recorded", lead_id=lead_id, event_id=booking.booking_id)
+
+        async def set_stage(self, *, lead_id, stage, trace_id, idempotency_key, company_name=None, company_domain=None):
+            del trace_id, idempotency_key, company_name, company_domain
+            self.stage_updates.append(f"{lead_id}:{stage}")
+            return CRMWriteResult(status="event_recorded", lead_id=lead_id)
+
+    hubspot = _HubSpotStub()
+    runtime = _runtime(calcom_service=_CalServiceStub(), hubspot_service=hubspot)
+    lead_id = "lead_schedule_book_1"
+    runtime._state_repo.upsert_session_state(
+        lead_id=lead_id,
+        payload={
+            "current_stage": "scheduling",
+            "next_best_action": "schedule",
+            "current_objective": "reply_handling",
+            "brief_refs": [],
+            "kb_refs": [],
+            "pending_actions": [{"action_type": "delegate_scheduler", "status": "pending"}],
+            "policy_flags": [],
+            "handoff_required": False,
+        },
+    )
+    runtime._state_repo.upsert_conversation_state(
+        lead_id=lead_id,
+        payload={
+            "current_stage": "inbound_received",
+            "current_channel": "email",
+            "last_inbound_message_id": "msg_sched_in_2",
+            "last_customer_intent": "schedule",
+            "last_customer_sentiment": "neutral",
+            "qualification_status": "likely_qualified",
+            "pending_actions": [{"action_type": "delegate_scheduler", "status": "pending"}],
+            "policy_flags": [],
+            "scheduling_context": {
+                "booking_status": "none",
+                "timezone": "Africa/Addis_Ababa",
+                "requested_time_text": "Tuesday at 4 PM EAT works for me.",
+                "slots_proposed": [{"source": "thread_extraction", "text": "Tuesday at 4 PM EAT works for me."}],
+            },
+        },
+    )
+    runtime._state_repo.upsert_inbound_email(
+        resend_email_id="recv_sched_book_1",
+        lead_id=lead_id,
+        from_email="prospect@example.com",
+        to_email=f"{lead_id}@chuairkoon.resend.app",
+        subject="Re: Intro",
+        text_body="Tuesday at 4 PM EAT works for me.",
+        html_body=None,
+        headers={},
+        in_reply_to="<outbound@example.com>",
+        references="<outbound@example.com>",
+        received_at=datetime.now(UTC),
+    )
+    env = asyncio.run(
+        runtime.book_scheduling(
+            LeadScheduleBookRequest(
+                idempotency_key="idem_schedule_book_1",
+                lead_id=lead_id,
+                confirmed_by_prospect=True,
+            )
+        )
+    )
+    assert env.status == "success"
+    assert env.data["state"] == "booked"
+    session = runtime._state_repo.get_session_state(lead_id=lead_id)
+    assert session is not None
+    assert session["current_stage"] == "booked"
+    conversation = runtime._state_repo.get_conversation_state(lead_id=lead_id)
+    assert conversation is not None
+    assert str(conversation["scheduling_context"].get("booking_status")) == "confirmed"
+    assert any(item.endswith(":booked") for item in hubspot.stage_updates)
+    assert lead_id in hubspot.bookings

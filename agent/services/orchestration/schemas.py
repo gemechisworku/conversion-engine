@@ -60,6 +60,23 @@ class LeadRespondRequest(BaseModel):
     to_email: str | None = None
 
 
+class LeadSchedulePrepareRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    lead_id: str
+
+
+class LeadScheduleBookRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    idempotency_key: str
+    lead_id: str
+    confirmed_by_prospect: bool = True
+    duration_minutes: int = Field(default=15, ge=15, le=120)
+    starts_at_iso: str | None = None
+    timezone: str | None = None
+
+
 class LeadAdvanceRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

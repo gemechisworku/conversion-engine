@@ -16,6 +16,8 @@ from agent.services.orchestration.schemas import (
     LeadCompactRequest,
     LeadEscalationRequest,
     LeadProcessRequest,
+    LeadScheduleBookRequest,
+    LeadSchedulePrepareRequest,
     LeadRespondRequest,
     LeadRehydrateRequest,
     LeadReplyRequest,
@@ -70,6 +72,16 @@ def create_orchestration_app() -> FastAPI:
     @app.post("/lead/respond", tags=["leads"])
     async def post_lead_respond(req: LeadRespondRequest, request: Request) -> JSONResponse:
         env = await request.app.state.runtime.respond_to_lead(req)
+        return JSONResponse(env.model_dump(mode="json"))
+
+    @app.post("/lead/schedule/prepare", tags=["leads"])
+    async def post_lead_schedule_prepare(req: LeadSchedulePrepareRequest, request: Request) -> JSONResponse:
+        env = await request.app.state.runtime.prepare_scheduling(req)
+        return JSONResponse(env.model_dump(mode="json"))
+
+    @app.post("/lead/schedule/book", tags=["leads"])
+    async def post_lead_schedule_book(req: LeadScheduleBookRequest, request: Request) -> JSONResponse:
+        env = await request.app.state.runtime.book_scheduling(req)
         return JSONResponse(env.model_dump(mode="json"))
 
     @app.post(settings.webhook_route_resend, tags=["leads"])

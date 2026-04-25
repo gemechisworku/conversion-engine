@@ -5,7 +5,40 @@ from __future__ import annotations
 
 def classify_intent_from_text(content: str) -> str:
     lowered = content.lower()
-    if any(token in lowered for token in ("book", "schedule", "calendar", "time")):
+    schedule_tokens = (
+        "book",
+        "schedule",
+        "calendar",
+        "time",
+        "zoom",
+        "meet ",
+        "meeting",
+        "call next",
+        "availability",
+        "tomorrow",
+        "today",
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+        " pm",
+        " am",
+        "p.m",
+        "a.m",
+        "o'clock",
+        "oclock",
+        " eat",
+        " est",
+        " pst",
+        " cst",
+        " mst",
+        " gmt",
+        " utc",
+    )
+    if any(token in lowered for token in schedule_tokens):
         return "schedule"
     if any(token in lowered for token in ("not interested", "stop", "no thanks", "unsubscribe")):
         return "decline"

@@ -5,9 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from datetime import UTC, datetime
+import re
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
+
+from dateutil import parser as date_parser
+from dateutil import tz as date_tz
 
 from agent.config.settings import Settings
 from agent.graphs.lead_intake_langgraph import LeadIntakeGraphDeps, compile_lead_intake_graph
@@ -15,9 +19,15 @@ from agent.graphs.reply_langgraph import ReplyRouteGraphDeps, compile_reply_rout
 from agent.graphs.state import LeadGraphState
 from agent.graphs.transitions import InvalidStateTransitionError, validate_lead_transition
 from agent.repositories.state_repo import SQLiteStateRepository
+from agent.services.calendar.calcom_client import CalComService, book_and_sync_crm
+from agent.services.calendar.schemas import BookingRequest
 from agent.services.common.schemas import ErrorEnvelope
+from agent.services.crm.schemas import CRMWriteResult
 from agent.services.crm.hubspot_mcp import HubSpotMCPService
-from agent.services.conversation.email_llm import InboundEmailInterpretLLM
+from agent.services.conversation.email_llm import (
+    InboundEmailInterpretLLM,
+    interpret_inbound_email_and_draft_reply,
+)
 from agent.services.email.client import EmailService
 from agent.services.email.reply_address import build_lead_reply_address, extract_lead_id_from_reply_address
 from agent.services.email.rfc_ids import merge_references_header, normalize_message_id
@@ -30,6 +40,8 @@ from agent.services.orchestration.schemas import (
     LeadCompactRequest,
     LeadEscalationRequest,
     LeadProcessRequest,
+    LeadScheduleBookRequest,
+    LeadSchedulePrepareRequest,
     LeadRehydrateRequest,
     LeadRespondRequest,
     LeadReplyRequest,
@@ -58,12 +70,14 @@ class OrchestrationRuntime:
         state_repo: SQLiteStateRepository,
         enrichment_services: dict[str, Any],
         hubspot_service: HubSpotMCPService | None = None,
+        calcom_service: CalComService | None = None,
         email_service: EmailService | None = None,
     ) -> None:
         self._settings = settings
         self._state_repo = state_repo
         self._enrichment_services = enrichment_services
         self._hubspot = hubspot_service
+        self._calcom = calcom_service
         self._email_service = email_service
         self._policy = OutboundPolicyService(settings)
         self._lead_intake_graph = compile_lead_intake_graph(
@@ -336,6 +350,7 @@ class OrchestrationRuntime:
             briefs_all = self._state_repo.get_briefs(lead_id=request.lead_id) or {}
             hiring = briefs_all.get("hiring_signal_brief")
             hiring_dict = hiring if isinstance(hiring, dict) else {}
+            transcript_for_route = self._conversation_transcript_for_reply_routing(lead_id=request.lead_id)
             with langfuse_workflow_span(
                 self._settings,
                 trace_id=trace_id,
@@ -352,6 +367,7 @@ class OrchestrationRuntime:
                         "company_name": request.company_name or "",
                         "hiring_signal_brief": hiring_dict,
                         "recent_outbound_snippet": self._recent_outbound_email_snippet(lead_id=request.lead_id),
+                        "conversation_transcript": transcript_for_route or None,
                     }
                 )
             intent = str(route_out.get("intent") or "unclear")
@@ -364,15 +380,20 @@ class OrchestrationRuntime:
                     email_interp = InboundEmailInterpretLLM.model_validate(raw_interp)
                 except Exception:
                     email_interp = None
+            meeting_time_hint = self._meeting_time_from_reply_context(
+                email_interp=email_interp,
+                inbound_content=request.content,
+                transcript=transcript_for_route,
+            )
             if request.channel.lower() == "email":
                 suggested_subject: str | None = None
                 suggested_body: str | None = None
                 suggested_confidence: float | None = None
-                if email_interp is not None:
+                if email_interp is not None and next_action != "schedule":
                     suggested_subject = email_interp.suggested_reply_subject
                     suggested_body = email_interp.suggested_reply_body
                     suggested_confidence = email_interp.confidence
-                else:
+                elif next_action != "schedule":
                     suggested_subject, suggested_body = self._fallback_suggested_reply_for_action(
                         lead_id=request.lead_id,
                         next_action=next_action,
@@ -420,6 +441,37 @@ class OrchestrationRuntime:
             )
             validate_lead_transition(from_state="reply_received", to_state=next_state)
 
+            prev_conv = self._state_repo.get_conversation_state(lead_id=request.lead_id) or {}
+            prev_raw = prev_conv.get("scheduling_context")
+            prev_sched: dict[str, Any] = (
+                prev_raw
+                if isinstance(prev_raw, dict)
+                else {"booking_status": "none", "timezone": None, "slots_proposed": []}
+            )
+            slot_text: str | None = meeting_time_hint
+            if slot_text:
+                slots_out: list[Any] = [
+                    {
+                        "source": (
+                            "llm_thread_extraction"
+                            if email_interp is not None and bool(email_interp.meeting_time_from_thread)
+                            else "heuristic_thread_extraction"
+                        ),
+                        "text": slot_text,
+                        "inbound_message_id": request.message_id,
+                    }
+                ]
+            else:
+                prev_slots = prev_sched.get("slots_proposed")
+                slots_out = list(prev_slots) if isinstance(prev_slots, list) else []
+            scheduling_ctx = dict(prev_sched)
+            scheduling_ctx.setdefault("booking_status", "none")
+            scheduling_ctx["slots_proposed"] = slots_out
+            if slot_text:
+                scheduling_ctx["last_extracted_inbound_message_id"] = request.message_id
+                scheduling_ctx["requested_time_text"] = slot_text
+            scheduling_ctx.setdefault("requested_time_text", None)
+
             self._state_repo.upsert_session_state(
                 lead_id=request.lead_id,
                 payload={
@@ -460,7 +512,7 @@ class OrchestrationRuntime:
                     "pending_actions": route_out.get("branch_pending")
                     or [{"action_type": next_action, "status": "pending"}],
                     "policy_flags": [],
-                    "scheduling_context": {"booking_status": "none", "timezone": None, "slots_proposed": []},
+                    "scheduling_context": scheduling_ctx,
                 },
             )
             self._state_repo.update_pipeline_run_stage(
@@ -525,7 +577,7 @@ class OrchestrationRuntime:
                 "next_action": next_action,
                 "inbound_intent": intent,
             }
-            if email_interp is not None:
+            if email_interp is not None and next_action != "schedule":
                 reply_data["suggested_reply_subject"] = email_interp.suggested_reply_subject
                 reply_data["suggested_reply_body"] = email_interp.suggested_reply_body
                 reply_data["llm_reply_confidence"] = email_interp.confidence
@@ -577,7 +629,7 @@ class OrchestrationRuntime:
         body_map: dict[str, str] = {
             "schedule": (
                 f"Thanks for the reply.\n\nHappy to share more about how we work with teams like {company_name}. "
-                "Would Tuesday or Wednesday work for a 15-minute call? If yes, share your timezone and a preferred window."
+                "I can align on your preferred window and send a calendar confirmation."
             ),
             "qualify": (
                 "Thanks for the thoughtful question.\n\nIn short, we provide dedicated data/ML engineering capacity "
@@ -610,6 +662,254 @@ class OrchestrationRuntime:
         )
         _ = inbound_content
         return subject, body_map.get(next_action, default_body)
+
+    @staticmethod
+    def _meeting_text_from_scheduling_context(scheduling_context: dict[str, Any]) -> str | None:
+        requested = scheduling_context.get("requested_time_text")
+        if isinstance(requested, str) and requested.strip():
+            return requested.strip()
+        slots = scheduling_context.get("slots_proposed")
+        if isinstance(slots, list):
+            for slot in slots:
+                if not isinstance(slot, dict):
+                    continue
+                text = slot.get("text")
+                if isinstance(text, str) and text.strip():
+                    return text.strip()
+        return None
+
+    def _meeting_time_from_reply_context(
+        self,
+        *,
+        email_interp: InboundEmailInterpretLLM | None,
+        inbound_content: str,
+        transcript: str,
+    ) -> str | None:
+        inbound_hint = self._extract_schedule_phrase_from_text(inbound_content)
+        if inbound_hint:
+            return inbound_hint
+        inbound_transcript = self._inbound_only_transcript(transcript)
+        transcript_hint = self._extract_schedule_phrase_from_text(inbound_transcript)
+        if transcript_hint:
+            return transcript_hint
+        if email_interp is not None and email_interp.meeting_time_from_thread:
+            text = email_interp.meeting_time_from_thread.strip()
+            if text and not self._looks_like_outbound_question(text):
+                return text
+        return None
+
+    @staticmethod
+    def _extract_schedule_phrase_from_text(text: str) -> str | None:
+        if not text:
+            return None
+        lines = [segment.strip() for segment in re.split(r"[\r\n]+", text) if segment.strip()]
+        schedule_keywords = (
+            "monday",
+            "tuesday",
+            "wednesday",
+            "thursday",
+            "friday",
+            "saturday",
+            "sunday",
+            "today",
+            "tomorrow",
+            "next ",
+            " am",
+            " pm",
+            "a.m",
+            "p.m",
+            "timezone",
+            "utc",
+            "gmt",
+            "eat",
+            "est",
+            "pst",
+            "cst",
+            "mst",
+            "cet",
+        )
+        preference_keywords = ("works", "available", "free", "can do", "would work", "prefer")
+        candidates: list[str] = []
+        for line in lines:
+            lowered = line.lower()
+            if any(token in lowered for token in schedule_keywords):
+                candidates.append(line)
+        if not candidates:
+            return None
+        for line in candidates:
+            lowered = line.lower()
+            if any(token in lowered for token in preference_keywords):
+                return line[:500]
+        return candidates[0][:500]
+
+    async def _extract_meeting_time_with_optional_llm(
+        self,
+        *,
+        lead_id: str,
+        trace_id: str,
+        inbound_subject: str,
+        inbound_body: str,
+        transcript: str,
+    ) -> str | None:
+        inbound_hint = self._extract_schedule_phrase_from_text(inbound_body)
+        if inbound_hint:
+            return inbound_hint
+        inbound_transcript = self._inbound_only_transcript(transcript)
+        transcript_hint = self._extract_schedule_phrase_from_text(inbound_transcript)
+        if transcript_hint:
+            return transcript_hint
+        llm = self._enrichment_services.get("llm")
+        if llm is not None and getattr(llm, "configured", False):
+            briefs_all = self._state_repo.get_briefs(lead_id=lead_id) or {}
+            hiring = briefs_all.get("hiring_signal_brief")
+            hiring_dict = hiring if isinstance(hiring, dict) else {}
+            email_interp = await interpret_inbound_email_and_draft_reply(
+                settings=self._settings,
+                llm=llm,
+                company_name=self._company_display_name(lead_id, fallback=lead_id),
+                inbound_subject=inbound_subject or "(no subject)",
+                inbound_body=inbound_body or "(no body)",
+                recent_outbound_context=self._recent_outbound_email_snippet(lead_id=lead_id),
+                conversation_transcript=transcript,
+                hiring_signal_brief=hiring_dict,
+                trace_id=trace_id,
+                lead_id=lead_id,
+            )
+            if email_interp is not None and email_interp.meeting_time_from_thread:
+                value = email_interp.meeting_time_from_thread.strip()
+                if value and not self._looks_like_outbound_question(value):
+                    return value
+        return None
+
+    @staticmethod
+    def _inbound_only_transcript(transcript: str) -> str:
+        if not transcript:
+            return ""
+        pattern = re.compile(
+            r"\[[^\]]+\]\s+inbound\s+\w+:\n(.*?)(?=\n\n---\n\n\[[^\]]+\]\s+\w+\s+\w+:\n|\Z)",
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        chunks = [match.group(1).strip() for match in pattern.finditer(transcript) if match.group(1).strip()]
+        return "\n\n".join(chunks)
+
+    @staticmethod
+    def _looks_like_outbound_question(text: str) -> bool:
+        lowered = text.lower()
+        if "?" not in lowered:
+            return False
+        question_markers = (
+            "would ",
+            "could ",
+            "can you ",
+            "if yes",
+            "share your timezone",
+            "open to",
+        )
+        return any(marker in lowered for marker in question_markers)
+
+    @staticmethod
+    def _resolve_tz_name_from_text(text: str | None) -> str | None:
+        if not text:
+            return None
+        lowered = text.lower()
+        tz_map = {
+            "eat": "Africa/Addis_Ababa",
+            "eat)": "Africa/Addis_Ababa",
+            "eest": "Europe/Helsinki",
+            "cet": "Europe/Berlin",
+            "cest": "Europe/Berlin",
+            "est": "America/New_York",
+            "edt": "America/New_York",
+            "cst": "America/Chicago",
+            "cdt": "America/Chicago",
+            "mst": "America/Denver",
+            "mdt": "America/Denver",
+            "pst": "America/Los_Angeles",
+            "pdt": "America/Los_Angeles",
+            "gmt": "Etc/GMT",
+            "utc": "UTC",
+        }
+        for token, tz_name in tz_map.items():
+            if f" {token}" in lowered or lowered.startswith(token):
+                return tz_name
+        return None
+
+    def _resolve_meeting_start_from_text(
+        self,
+        *,
+        meeting_text: str,
+        timezone_hint: str | None,
+    ) -> tuple[datetime | None, str | None]:
+        if not meeting_text.strip():
+            return None, timezone_hint
+        tz_name = timezone_hint or self._resolve_tz_name_from_text(meeting_text)
+        tzinfo = date_tz.gettz(tz_name) if tz_name else None
+        now = datetime.now(tz=tzinfo or UTC)
+        default_dt = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        try:
+            parsed = date_parser.parse(
+                meeting_text,
+                fuzzy=True,
+                default=default_dt,
+                tzinfos={
+                    "EAT": date_tz.gettz("Africa/Addis_Ababa"),
+                    "UTC": date_tz.gettz("UTC"),
+                    "GMT": date_tz.gettz("Etc/GMT"),
+                    "EST": date_tz.gettz("America/New_York"),
+                    "EDT": date_tz.gettz("America/New_York"),
+                    "CST": date_tz.gettz("America/Chicago"),
+                    "PST": date_tz.gettz("America/Los_Angeles"),
+                },
+            )
+        except (ValueError, OverflowError):
+            return None, tz_name
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=tzinfo or UTC)
+        if parsed < now - timedelta(minutes=5):
+            parsed = parsed + timedelta(days=7)
+        return parsed, (tz_name or (parsed.tzname() if parsed.tzinfo is not None else None))
+
+    def _resolve_scheduling_portal_url(
+        self,
+        *,
+        lead_id: str,
+        meeting_text: str | None,
+        starts_at: datetime | None,
+        prospect_email: str | None,
+    ) -> str | None:
+        from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
+        base = self._settings.calcom_booking_portal_url.strip()
+        if not base:
+            username = self._settings.calcom_username.strip()
+            slug = self._settings.calcom_event_type_slug.strip()
+            if username and slug:
+                base = f"https://cal.com/{username}/{slug}"
+            elif username:
+                base = f"https://cal.com/{username}"
+            else:
+                base = "https://cal.com"
+        parsed = urlparse(base)
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        if prospect_email:
+            query.setdefault("email", prospect_email)
+        if starts_at is not None:
+            query.setdefault("date", starts_at.date().isoformat())
+        if meeting_text:
+            query.setdefault("notes", meeting_text[:180])
+        query.setdefault("utm_source", "tenacious_ops")
+        query.setdefault("lead_id", lead_id)
+        return urlunparse(parsed._replace(query=urlencode(query)))
+
+    @staticmethod
+    def _prospect_name_from_latest_inbound(inbound_payload: dict[str, Any]) -> str | None:
+        from_email = str(inbound_payload.get("from_email") or "").strip()
+        if not from_email or "@" not in from_email:
+            return None
+        local = from_email.split("@", 1)[0].replace(".", " ").replace("_", " ").strip()
+        if not local:
+            return None
+        return " ".join(part.capitalize() for part in local.split() if part)
 
     async def respond_to_lead(self, request: LeadRespondRequest) -> ResponseEnvelope:
         request_id = f"req_{uuid4().hex[:10]}"
@@ -781,6 +1081,336 @@ class OrchestrationRuntime:
                 "state": next_stage,
                 "next_action": "wait_for_reply" if next_stage == "awaiting_reply" else session.get("next_best_action"),
             },
+        )
+        self._state_repo.put_idempotency_response(
+            idempotency_key=request.idempotency_key,
+            response=env.model_dump(mode="json"),
+        )
+        return env
+
+    # SPEC-GAP: specs/api_contracts/scheduling_api.md is empty in this repo.
+    # Minimal safe contract added for operator-driven scheduling prepare/book actions.
+    async def prepare_scheduling(self, request: LeadSchedulePrepareRequest) -> ResponseEnvelope:
+        request_id = f"req_{uuid4().hex[:10]}"
+        trace_id = f"trace_schedule_prepare_{uuid4().hex[:12]}"
+        log_processing_step(
+            component="orchestration",
+            step="prepare_scheduling.start",
+            message="Preparing scheduling context from conversation history",
+            lead_id=request.lead_id,
+            trace_id=trace_id,
+        )
+        session = self._state_repo.get_session_state(lead_id=request.lead_id)
+        if session is None:
+            return self._failure(
+                request_id=request_id,
+                trace_id=trace_id,
+                code="INVALID_INPUT",
+                message=f"Unknown lead_id '{request.lead_id}'.",
+                retryable=False,
+            )
+        conversation = self._state_repo.get_conversation_state(lead_id=request.lead_id) or {}
+        scheduling_ctx = conversation.get("scheduling_context")
+        scheduling_ctx_dict = scheduling_ctx if isinstance(scheduling_ctx, dict) else {"booking_status": "none"}
+        transcript = self._conversation_transcript_for_reply_routing(lead_id=request.lead_id)
+        latest_inbound = self._state_repo.get_latest_inbound_email_for_lead(lead_id=request.lead_id) or {}
+        inbound_subject = str(latest_inbound.get("subject") or "").strip()
+        inbound_body = (
+            str(latest_inbound.get("text_body") or "").strip()
+            or str(latest_inbound.get("html_body") or "").strip()
+        )
+        meeting_text = self._meeting_text_from_scheduling_context(scheduling_ctx_dict)
+        meeting_source = "conversation_state" if meeting_text else "none"
+        if meeting_text and self._looks_like_outbound_question(meeting_text):
+            meeting_text = None
+            meeting_source = "none"
+        if not meeting_text:
+            meeting_text = await self._extract_meeting_time_with_optional_llm(
+                lead_id=request.lead_id,
+                trace_id=trace_id,
+                inbound_subject=inbound_subject,
+                inbound_body=inbound_body,
+                transcript=transcript,
+            )
+            meeting_source = "llm_or_heuristic" if meeting_text else "none"
+
+        inferred_starts_at: datetime | None = None
+        inferred_timezone: str | None = None
+        if meeting_text:
+            inferred_starts_at, inferred_timezone = self._resolve_meeting_start_from_text(
+                meeting_text=meeting_text,
+                timezone_hint=str(scheduling_ctx_dict.get("timezone") or "").strip() or None,
+            )
+            next_ctx = dict(scheduling_ctx_dict)
+            next_ctx.setdefault("booking_status", "none")
+            next_ctx["requested_time_text"] = meeting_text
+            if inferred_timezone and not next_ctx.get("timezone"):
+                next_ctx["timezone"] = inferred_timezone
+            slots = next_ctx.get("slots_proposed")
+            slots_list: list[Any] = list(slots) if isinstance(slots, list) else []
+            if not slots_list:
+                slot_payload: dict[str, Any] = {"source": meeting_source, "text": meeting_text}
+                if inferred_starts_at is not None:
+                    slot_payload["start_at"] = inferred_starts_at.isoformat()
+                    slot_payload["end_at"] = (inferred_starts_at + timedelta(minutes=15)).isoformat()
+                slots_list = [slot_payload]
+            next_ctx["slots_proposed"] = slots_list
+            self._state_repo.upsert_conversation_state(
+                lead_id=request.lead_id,
+                payload={
+                    **conversation,
+                    "scheduling_context": next_ctx,
+                },
+            )
+            scheduling_ctx_dict = next_ctx
+
+        portal_url = self._resolve_scheduling_portal_url(
+            lead_id=request.lead_id,
+            meeting_text=meeting_text,
+            starts_at=inferred_starts_at,
+            prospect_email=str(latest_inbound.get("from_email") or "").strip() or None,
+        )
+        log_processing_step(
+            component="orchestration",
+            step="prepare_scheduling.done",
+            message="Scheduling context prepared",
+            lead_id=request.lead_id,
+            trace_id=trace_id,
+            meeting_time_text=meeting_text,
+            meeting_time_source=meeting_source,
+            booking_status=scheduling_ctx_dict.get("booking_status", "none"),
+        )
+        return ResponseEnvelope(
+            request_id=request_id,
+            trace_id=trace_id,
+            status="success",
+            data={
+                "lead_id": request.lead_id,
+                "next_action": session.get("next_best_action"),
+                "meeting_time_text": meeting_text,
+                "meeting_time_source": meeting_source,
+                "meeting_time_start_at": inferred_starts_at.isoformat() if inferred_starts_at is not None else None,
+                "meeting_timezone": inferred_timezone or scheduling_ctx_dict.get("timezone"),
+                "booking_status": scheduling_ctx_dict.get("booking_status", "none"),
+                "scheduling_portal_url": portal_url,
+            },
+        )
+
+    async def book_scheduling(self, request: LeadScheduleBookRequest) -> ResponseEnvelope:
+        request_id = f"req_{uuid4().hex[:10]}"
+        trace_id = f"trace_schedule_book_{uuid4().hex[:12]}"
+        log_processing_step(
+            component="orchestration",
+            step="book_scheduling.start",
+            message="Attempting Cal.com booking from scheduling context",
+            lead_id=request.lead_id,
+            trace_id=trace_id,
+            idempotency_key=request.idempotency_key,
+        )
+        session = self._state_repo.get_session_state(lead_id=request.lead_id)
+        if session is None:
+            return self._failure(
+                request_id=request_id,
+                trace_id=trace_id,
+                code="INVALID_INPUT",
+                message=f"Unknown lead_id '{request.lead_id}'.",
+                retryable=False,
+            )
+        cached = self._state_repo.get_idempotency_response(idempotency_key=request.idempotency_key)
+        if cached is not None:
+            return ResponseEnvelope.model_validate(cached)
+        if self._calcom is None:
+            return self._failure(
+                request_id=request_id,
+                trace_id=trace_id,
+                code="CONFIG_ERROR",
+                message="Cal.com service is not configured.",
+                retryable=False,
+            )
+        if not request.confirmed_by_prospect:
+            return self._failure(
+                request_id=request_id,
+                trace_id=trace_id,
+                code="POLICY_BLOCKED",
+                message="Booking requires explicit prospect confirmation.",
+                retryable=False,
+            )
+
+        try:
+            validate_lead_transition(from_state=session["current_stage"], to_state="booked")
+        except InvalidStateTransitionError as exc:
+            return self._failure(
+                request_id=request_id,
+                trace_id=trace_id,
+                code="INVALID_STATE_TRANSITION",
+                message=str(exc),
+                retryable=False,
+            )
+
+        conversation = self._state_repo.get_conversation_state(lead_id=request.lead_id) or {}
+        scheduling_ctx = conversation.get("scheduling_context")
+        scheduling_ctx_dict = scheduling_ctx if isinstance(scheduling_ctx, dict) else {"booking_status": "none"}
+        meeting_text = self._meeting_text_from_scheduling_context(scheduling_ctx_dict)
+
+        explicit_start = self._coerce_datetime(request.starts_at_iso)
+        inferred_start, inferred_timezone = (
+            self._resolve_meeting_start_from_text(
+                meeting_text=meeting_text or "",
+                timezone_hint=request.timezone or str(scheduling_ctx_dict.get("timezone") or "").strip() or None,
+            )
+            if explicit_start is None and meeting_text
+            else (None, None)
+        )
+        starts_at = explicit_start or inferred_start
+        timezone_text = (
+            (request.timezone or "").strip()
+            or inferred_timezone
+            or str(scheduling_ctx_dict.get("timezone") or "").strip()
+            or "UTC"
+        )
+        if starts_at is None:
+            return self._failure(
+                request_id=request_id,
+                trace_id=trace_id,
+                code="INVALID_INPUT",
+                message="Could not resolve a concrete booking time from conversation history. Provide starts_at_iso.",
+                retryable=False,
+            )
+
+        latest_inbound = self._state_repo.get_latest_inbound_email_for_lead(lead_id=request.lead_id) or {}
+        prospect_email = str(latest_inbound.get("from_email") or "").strip()
+        if not prospect_email:
+            return self._failure(
+                request_id=request_id,
+                trace_id=trace_id,
+                code="INVALID_INPUT",
+                message="Prospect email is missing; cannot book Cal event.",
+                retryable=False,
+            )
+
+        prospect_name = self._prospect_name_from_latest_inbound(latest_inbound)
+        ends_at = starts_at + timedelta(minutes=request.duration_minutes)
+        booking_request = BookingRequest(
+            lead_id=request.lead_id,
+            trace_id=trace_id,
+            slot_id=f"inferred_{starts_at.isoformat()}",
+            starts_at=starts_at,
+            ends_at=ends_at,
+            timezone=timezone_text,
+            prospect_email=prospect_email,
+            prospect_name=prospect_name,
+            confirmed_by_prospect=True,
+            idempotency_key=request.idempotency_key,
+        )
+
+        crm_write: CRMWriteResult | None = None
+        if self._hubspot is not None:
+            pipeline = self._state_repo.get_pipeline_run(lead_id=request.lead_id) or {}
+            linked = await book_and_sync_crm(
+                lead_id=request.lead_id,
+                booking_request=booking_request,
+                calcom_service=self._calcom,
+                hubspot_service=self._hubspot,
+                company_name=str(pipeline.get("company_name") or "").strip() or None,
+                company_domain=str(pipeline.get("company_domain") or "").strip() or None,
+            )
+            booking = linked.booking
+            crm_write = linked.crm_write
+        else:
+            booking = await self._calcom.book_discovery_call(booking_request)
+
+        if not booking.succeeded:
+            failed_ctx = dict(scheduling_ctx_dict)
+            failed_ctx["booking_status"] = "failed"
+            failed_ctx["requested_time_text"] = meeting_text
+            self._state_repo.upsert_conversation_state(
+                lead_id=request.lead_id,
+                payload={
+                    **conversation,
+                    "current_stage": "scheduling_dialogue",
+                    "scheduling_context": failed_ctx,
+                },
+            )
+            return self._failure(
+                request_id=request_id,
+                trace_id=trace_id,
+                code="BOOKING_FAILED",
+                message=(
+                    booking.error.error_message
+                    if booking.error is not None
+                    else "Booking failed before confirmation."
+                ),
+                retryable=bool(booking.error.retryable) if booking.error is not None else False,
+            )
+
+        next_session = {
+            **session,
+            "current_stage": "booked",
+            "next_best_action": "none",
+            "current_objective": "booking_confirmed",
+            "pending_actions": [],
+            "handoff_required": False,
+        }
+        self._state_repo.upsert_session_state(lead_id=request.lead_id, payload=next_session)
+        booked_ctx = dict(scheduling_ctx_dict)
+        booked_ctx["booking_status"] = "confirmed"
+        booked_ctx["timezone"] = timezone_text
+        booked_ctx["requested_time_text"] = meeting_text
+        booked_ctx["slots_proposed"] = [
+            {
+                "source": "calcom_booking",
+                "slot_id": booking.slot_id,
+                "start_at": booking.starts_at.isoformat() if booking.starts_at is not None else starts_at.isoformat(),
+                "end_at": booking.ends_at.isoformat() if booking.ends_at is not None else ends_at.isoformat(),
+                "calendar_ref": booking.calendar_ref,
+            }
+        ]
+        self._state_repo.upsert_conversation_state(
+            lead_id=request.lead_id,
+            payload={
+                **conversation,
+                "current_stage": "completed",
+                "current_channel": "email",
+                "pending_actions": [],
+                "scheduling_context": booked_ctx,
+            },
+        )
+        self._state_repo.update_pipeline_run_stage(
+            lead_id=request.lead_id,
+            stage="booked",
+            trace_id=trace_id,
+        )
+        if self._hubspot is not None:
+            await self._hubspot.set_stage(
+                lead_id=request.lead_id,
+                stage="booked",
+                trace_id=trace_id,
+                idempotency_key=f"{request.idempotency_key}:stage",
+            )
+        env = ResponseEnvelope(
+            request_id=request_id,
+            trace_id=trace_id,
+            status="success",
+            data={
+                "lead_id": request.lead_id,
+                "state": "booked",
+                "booking_id": booking.booking_id,
+                "slot_id": booking.slot_id,
+                "calendar_ref": booking.calendar_ref,
+                "starts_at": booking.starts_at.isoformat() if booking.starts_at is not None else starts_at.isoformat(),
+                "ends_at": booking.ends_at.isoformat() if booking.ends_at is not None else ends_at.isoformat(),
+                "timezone": timezone_text,
+                "crm_sync_status": crm_write.status if crm_write is not None else "not_configured",
+            },
+        )
+        log_processing_step(
+            component="orchestration",
+            step="book_scheduling.done",
+            message="Booking confirmed and lead marked booked",
+            lead_id=request.lead_id,
+            trace_id=trace_id,
+            booking_id=booking.booking_id,
+            crm_status=crm_write.status if crm_write is not None else "not_configured",
         )
         self._state_repo.put_idempotency_response(
             idempotency_key=request.idempotency_key,
@@ -1294,6 +1924,33 @@ class OrchestrationRuntime:
                 message=str(exc),
                 retryable=False,
             )
+
+    def _conversation_transcript_for_reply_routing(
+        self,
+        *,
+        lead_id: str,
+        message_limit: int = 80,
+        max_chars: int = 24_000,
+        max_message_body_chars: int = 4000,
+    ) -> str:
+        """Chronological message_log excerpt for reply routing / scheduling context (newest batch, capped)."""
+        rows = self._state_repo.list_messages(lead_id=lead_id, limit=message_limit)
+        if not rows:
+            return ""
+        chronological = list(reversed(rows))
+        chunks: list[str] = []
+        for row in chronological:
+            direction = str(row.get("direction") or "?")
+            channel = str(row.get("channel") or "?")
+            when = str(row.get("recorded_at") or "")
+            body = str(row.get("content") or "").strip()
+            if len(body) > max_message_body_chars:
+                body = body[:max_message_body_chars] + "\n…(truncated)"
+            chunks.append(f"[{when}] {direction} {channel}:\n{body}")
+        full = "\n\n---\n\n".join(chunks)
+        if len(full) > max_chars:
+            full = "…(earlier messages omitted)\n\n" + full[-max_chars:]
+        return full
 
     def _recent_outbound_email_snippet(self, *, lead_id: str) -> str | None:
         rows = self._state_repo.list_messages(lead_id=lead_id, limit=16)

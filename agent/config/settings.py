@@ -96,6 +96,7 @@ class Settings(BaseSettings):
     calcom_event_type_id: str = Field(default="", alias="CALCOM_EVENT_TYPE_ID")
     calcom_event_type_slug: str = Field(default="", alias="CALCOM_EVENT_TYPE_SLUG")
     calcom_username: str = Field(default="", alias="CALCOM_USERNAME")
+    calcom_booking_portal_url: str = Field(default="", alias="CALCOM_BOOKING_PORTAL_URL")
     calcom_webhook_secret: str = Field(default="", alias="CALCOM_WEBHOOK_SECRET")
 
     tenacious_sales_data_path: str = Field(default="", alias="TENACIOUS_SALES_DATA_PATH")

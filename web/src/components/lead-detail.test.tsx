@@ -50,7 +50,12 @@ function env(status: string, data: Record<string, unknown>, traceId = "trace_tes
   };
 }
 
-function wireDefaultApiMocks(leadId: string) {
+function wireDefaultApiMocks(
+  leadId: string,
+  options: { nextAction?: string; scheduleText?: string } = {},
+) {
+  const nextAction = options.nextAction || "clarify";
+  const scheduleText = options.scheduleText || "Tuesday at 4 PM EAT works for me.";
   orchestrationFetchMock.mockImplementation(async (path: string) => {
     if (path.includes(`/lead/${leadId}/state`)) {
       return env("success", {
@@ -77,7 +82,7 @@ function wireDefaultApiMocks(leadId: string) {
     if (path.includes(`/lead/${leadId}/conversation`)) {
       return env("success", {
         lead_id: leadId,
-        session_state: { next_best_action: "clarify" },
+        session_state: { next_best_action: nextAction },
         conversation_state: {
           lead_id: leadId,
           conversation_state_id: "conv_1",
@@ -89,7 +94,15 @@ function wireDefaultApiMocks(leadId: string) {
           open_questions: [],
           pending_actions: [],
           objections: [],
-          scheduling_context: { booking_status: "none", timezone: null, slots_proposed: [] },
+          scheduling_context: {
+            booking_status: "none",
+            timezone: "Africa/Addis_Ababa",
+            requested_time_text: nextAction === "schedule" ? scheduleText : null,
+            slots_proposed:
+              nextAction === "schedule"
+                ? [{ source: "thread_extraction", text: scheduleText }]
+                : [],
+          },
           policy_flags: [],
           updated_at: new Date().toISOString(),
         },
@@ -118,6 +131,35 @@ function wireDefaultApiMocks(leadId: string) {
     }
     if (path.includes(`/memory/session/${leadId}`)) {
       return env("success", { lead_id: leadId, session_state: { current_stage: "awaiting_reply" } });
+    }
+    if (path === "/lead/schedule/prepare") {
+      return env(
+        "success",
+        {
+          lead_id: leadId,
+          next_action: "schedule",
+          meeting_time_text: scheduleText,
+          meeting_time_source: "llm_or_heuristic",
+          meeting_time_start_at: "2026-04-28T13:00:00+00:00",
+          meeting_timezone: "Africa/Addis_Ababa",
+          booking_status: "none",
+          scheduling_portal_url: "https://cal.com/demo/demo?lead_id=test",
+        },
+        "trace_schedule_prepare_1",
+      );
+    }
+    if (path === "/lead/schedule/book") {
+      return env(
+        "success",
+        {
+          lead_id: leadId,
+          state: "booked",
+          booking_id: "booking_1",
+          slot_id: "slot_1",
+          calendar_ref: "https://cal.com/bookings/booking_1",
+        },
+        "trace_schedule_book_1",
+      );
     }
     if (path === "/outreach/draft") return env("success", { draft_id: "draft_new_1" }, "trace_draft_1");
     if (path === "/lead/respond")
@@ -168,5 +210,18 @@ describe("LeadDetail", () => {
       "/lead/respond",
       expect.objectContaining({ method: "POST" }),
     );
+  });
+
+  it("shows scheduling actions and hides outbound reply composer when next action is schedule", async () => {
+    const leadId = "lead_test_3";
+    wireDefaultApiMocks(leadId, { nextAction: "schedule" });
+    render(<LeadDetail leadId={leadId} />);
+
+    await screen.findByText("Acme Test");
+    await userEvent.click(screen.getByRole("tab", { name: "Conversation" }));
+    await screen.findByText(/Extracted meeting preference/i);
+    expect(screen.getByText(/Tuesday at 4 PM EAT works for me/i)).toBeInTheDocument();
+    expect(screen.queryByLabelText(/Outbound reply content/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Book extracted time/i })).toBeInTheDocument();
   });
 });

@@ -118,3 +118,33 @@ def test_post_lead_respond_unknown_returns_failure() -> None:
     body = res.json()
     assert body["status"] == "failure"
     assert body["error"]["error_code"] == "INVALID_INPUT"
+
+
+def test_post_lead_schedule_prepare_unknown_returns_failure() -> None:
+    app = create_orchestration_app()
+    with TestClient(app) as client:
+        res = client.post(
+            "/lead/schedule/prepare",
+            json={"lead_id": "lead_does_not_exist_zzzz"},
+        )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "failure"
+    assert body["error"]["error_code"] == "INVALID_INPUT"
+
+
+def test_post_lead_schedule_book_unknown_returns_failure() -> None:
+    app = create_orchestration_app()
+    with TestClient(app) as client:
+        res = client.post(
+            "/lead/schedule/book",
+            json={
+                "idempotency_key": "idem_test_schedule_book_unknown",
+                "lead_id": "lead_does_not_exist_zzzz",
+                "confirmed_by_prospect": True,
+            },
+        )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "failure"
+    assert body["error"]["error_code"] == "INVALID_INPUT"

@@ -40,6 +40,14 @@ class InboundEmailInterpretLLM(BaseModel):
     suggested_reply_subject: str = Field(max_length=120)
     suggested_reply_body: str
     next_best_action: Literal["schedule", "qualify", "clarify", "handle_objection", "nurture", "escalate"]
+    meeting_time_from_thread: str | None = Field(
+        default=None,
+        max_length=500,
+        description=(
+            "If the prospect stated a concrete meeting time, day, window, or timezone anywhere in "
+            "CONVERSATION_THREAD or the latest inbound, copy it verbatim here; otherwise null."
+        ),
+    )
 
 
 async def draft_first_touch_email_with_llm(
@@ -113,6 +121,7 @@ async def interpret_inbound_email_and_draft_reply(
     inbound_subject: str,
     inbound_body: str,
     recent_outbound_context: str | None,
+    conversation_transcript: str | None,
     hiring_signal_brief: dict[str, Any] | None,
     trace_id: str | None,
     lead_id: str | None,
@@ -122,11 +131,16 @@ async def interpret_inbound_email_and_draft_reply(
     if not style.strip():
         return None
 
+    transcript = (conversation_transcript or "").strip()
+    if len(transcript) > 24_000:
+        transcript = "…(earlier thread omitted)\n\n" + transcript[-24_000:]
+
     user_payload = {
         "company_name": company_name,
         "inbound_email_subject": inbound_subject,
         "inbound_email_body": inbound_body,
         "recent_outbound_context": recent_outbound_context or "",
+        "CONVERSATION_THREAD": transcript,
         "hiring_signal_brief_excerpt": json.dumps(hiring_signal_brief or {}, default=str)[:8_000],
         "STYLE_GUIDE": style[:10_000],
         "INTENT_LABELS": [
@@ -149,7 +163,12 @@ async def interpret_inbound_email_and_draft_reply(
     return await llm.generate_model(
         system_prompt=(
             "You analyze a real inbound sales email reply and draft Tenacious's next email. "
-            "Classify intent conservatively. Map intent to next_best_action: "
+            "You may receive CONVERSATION_THREAD: chronological prior + current email thread (may be empty). "
+            "Use the entire thread for intent and scheduling: if the prospect stated a meeting day, time, window, "
+            "or timezone in an earlier message or the latest inbound, you MUST reflect it in meeting_time_from_thread "
+            "and in suggested_reply_body when next_best_action is schedule (confirm that exact preference; do not invent a different slot). "
+            "Classify intent conservatively from the latest inbound in light of the thread. "
+            "Map intent to next_best_action: "
             "schedule->schedule, interest->qualify, clarification->clarify, objection->handle_objection, "
             "decline->nurture, unclear->clarify. "
             "Follow STYLE_GUIDE; warm replies may mirror the prospect's tone slightly but stay professional. "

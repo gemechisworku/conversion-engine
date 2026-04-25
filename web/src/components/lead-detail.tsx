@@ -8,6 +8,8 @@ import type {
   EvidenceEdge,
   LeadBriefsPayload,
   LeadConversationPayload,
+  LeadScheduleBookPayload,
+  LeadSchedulePreparePayload,
   LeadRespondPayload,
   LeadStatePayload,
   MessageLogItem,
@@ -156,6 +158,7 @@ export function LeadDetail({ leadId }: { leadId: string }) {
   const [sendDialogOpen, setSendDialogOpen] = useState(false);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [schedulePrepare, setSchedulePrepare] = useState<LeadSchedulePreparePayload | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -192,6 +195,10 @@ export function LeadDetail({ leadId }: { leadId: string }) {
     void load();
   }, [load]);
 
+  useEffect(() => {
+    setSchedulePrepare(null);
+  }, [leadId]);
+
   const currentState = state?.status === "success" ? state.data.state : "";
   const allowedTransitions = useMemo(() => transitionAllowList[currentState] ?? [], [currentState]);
   const traceIds = inferTraceIds(leadId);
@@ -226,6 +233,29 @@ export function LeadDetail({ leadId }: { leadId: string }) {
       }
     }
   }, [conversation, replyBody, replySubject, replyToEmail]);
+
+  useEffect(() => {
+    const nextAction = String((conversation?.session_state as Record<string, unknown> | undefined)?.next_best_action || "");
+    if (nextAction !== "schedule") return;
+    if (schedulePrepare !== null) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const env = await orchestrationFetch<LeadSchedulePreparePayload>("/lead/schedule/prepare", {
+          method: "POST",
+          body: JSON.stringify({ lead_id: leadId }),
+        });
+        if (!cancelled && env.status === "success") {
+          setSchedulePrepare(env.data);
+        }
+      } catch {
+        // Keep UI usable even if schedule prepare prefetch fails.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [conversation, leadId, schedulePrepare]);
 
   async function withAction(key: string, fn: () => Promise<void>) {
     setBusyKey(key);
@@ -326,6 +356,43 @@ export function LeadDetail({ leadId }: { leadId: string }) {
       }
       setSuccess(`Outbound reply queued (${env.data.message_id}).`);
       setReplyBody("");
+      await load();
+    });
+  }
+
+  async function onPrepareScheduling() {
+    await withAction("prepare_schedule", async () => {
+      const env = await orchestrationFetch<LeadSchedulePreparePayload>("/lead/schedule/prepare", {
+        method: "POST",
+        body: JSON.stringify({
+          lead_id: leadId,
+        }),
+      });
+      if (env.status !== "success") {
+        throw new Error(env.error?.error_message || "Failed to prepare scheduling context.");
+      }
+      setSchedulePrepare(env.data);
+      setSuccess("Scheduling context prepared from conversation history.");
+      await load();
+    });
+  }
+
+  async function onBookScheduling() {
+    await withAction("book_schedule", async () => {
+      const env = await orchestrationFetch<LeadScheduleBookPayload>("/lead/schedule/book", {
+        method: "POST",
+        body: JSON.stringify({
+          idempotency_key: makeIdem("ui_schedule_book", leadId),
+          lead_id: leadId,
+          confirmed_by_prospect: true,
+          starts_at_iso: schedulePrepare?.meeting_time_start_at || undefined,
+          timezone: schedulePrepare?.meeting_timezone || undefined,
+        }),
+      });
+      if (env.status !== "success") {
+        throw new Error(env.error?.error_message || "Scheduling booking failed.");
+      }
+      setSuccess(`Booking confirmed (${env.data.booking_id || env.data.slot_id || "booked"}).`);
       await load();
     });
   }
@@ -462,8 +529,29 @@ export function LeadDetail({ leadId }: { leadId: string }) {
   const schedulingContext = (conversationState?.scheduling_context || {}) as Record<string, unknown>;
   const nextBestAction = String((conversation?.session_state?.next_best_action as string) || "—");
   const lastIntent = String(conversationState?.last_customer_intent || "unknown");
-  const outboundReplyActions = new Set(["clarify", "qualify", "handle_objection", "nurture", "schedule"]);
+  const outboundReplyActions = new Set(["clarify", "qualify", "handle_objection", "nurture"]);
   const replyActionNeeded = outboundReplyActions.has(nextBestAction);
+  const scheduleSlots = Array.isArray(schedulingContext.slots_proposed)
+    ? (schedulingContext.slots_proposed as Array<Record<string, unknown>>)
+    : [];
+  const scheduleTextFromContext =
+    typeof schedulingContext.requested_time_text === "string" ? schedulingContext.requested_time_text : "";
+  const scheduleTextFromSlots = scheduleSlots.find((slot) => typeof slot.text === "string")?.text as
+    | string
+    | undefined;
+  const scheduleMeetingText = schedulePrepare?.meeting_time_text || scheduleTextFromContext || scheduleTextFromSlots || "";
+  const scheduleMeetingStart =
+    schedulePrepare?.meeting_time_start_at ||
+    (scheduleSlots.find((slot) => typeof slot.start_at === "string")?.start_at as string | undefined) ||
+    "";
+  const scheduleTimezone = String(schedulePrepare?.meeting_timezone || schedulingContext.timezone || "unknown");
+  const schedulingPortalUrl = schedulePrepare?.scheduling_portal_url || "";
+  const visibleMessages = messages.filter((row) => {
+    const kind = typeof row.metadata?.kind === "string" ? row.metadata.kind : "";
+    const sourceNextAction =
+      typeof row.metadata?.source_next_action === "string" ? row.metadata.source_next_action : "";
+    return !(kind === "suggested_reply_email" && sourceNextAction === "schedule");
+  });
   const latestSuggestedReply = messages.find(
     (row) =>
       row.direction === "outbound" &&
@@ -711,11 +799,11 @@ export function LeadDetail({ leadId }: { leadId: string }) {
                 <CardTitle>Thread History</CardTitle>
               </CardHeader>
               <CardContent>
-                {messages.length === 0 ? (
+                {visibleMessages.length === 0 ? (
                   <p className="text-sm text-muted">No message history yet.</p>
                 ) : (
                   <ul className="max-h-[32rem] space-y-2 overflow-auto">
-                    {messages.map((row: MessageLogItem) => (
+                    {visibleMessages.map((row: MessageLogItem) => (
                       <li
                         key={`${row.message_id}_${row.recorded_at}`}
                         className="rounded-md border border-border bg-background p-3"
@@ -761,78 +849,127 @@ export function LeadDetail({ leadId }: { leadId: string }) {
                     Move lead to scheduling
                   </Button>
                 )}
-                <div className="pt-1">
-                  <p className="text-xs font-medium text-foreground">Outbound Reply Composer</p>
-                  <p className="text-xs text-muted">
-                    Outbound response should follow the latest intent and next-best-action selected by the orchestrator.
-                  </p>
-                </div>
-                <div className="grid gap-2 sm:grid-cols-2">
-                  <label className="text-xs text-muted">
-                    Channel
-                    <select
-                      value={replyChannel}
-                      onChange={(e) => setReplyChannel(e.target.value as "email" | "sms")}
-                      className="mt-1 w-full rounded-md border border-border bg-background px-2 py-2 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/30"
+                {nextBestAction === "schedule" ? (
+                  <>
+                    <div className="pt-1">
+                      <p className="text-xs font-medium text-foreground">Scheduling Action</p>
+                      <p className="text-xs text-muted">
+                        When the orchestrator detects scheduling intent, extract preferred time from thread and proceed to booking.
+                      </p>
+                    </div>
+                    <div className="rounded-md border border-border bg-background p-2 text-xs text-foreground">
+                      <p className="text-muted">Extracted meeting preference</p>
+                      <p className="mt-1 whitespace-pre-wrap font-medium">{scheduleMeetingText || "Not extracted yet."}</p>
+                      <p className="mt-1 text-muted">
+                        Suggested start: {scheduleMeetingStart ? formatDate(scheduleMeetingStart) : "unknown"}
+                      </p>
+                      <p className="text-muted">Timezone: {scheduleTimezone}</p>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        onClick={() => void onPrepareScheduling()}
+                        disabled={busyKey !== null}
+                      >
+                        {busyKey === "prepare_schedule" ? "Preparing..." : "Refresh extraction"}
+                      </Button>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        onClick={() => {
+                          if (schedulingPortalUrl) window.open(schedulingPortalUrl, "_blank", "noopener,noreferrer");
+                        }}
+                        disabled={busyKey !== null || !schedulingPortalUrl}
+                      >
+                        Open scheduling portal
+                      </Button>
+                      <Button
+                        variant="primary"
+                        size="sm"
+                        onClick={() => void onBookScheduling()}
+                        disabled={busyKey !== null || !scheduleMeetingText}
+                      >
+                        {busyKey === "book_schedule" ? "Booking..." : "Book extracted time (Cal + HubSpot)"}
+                      </Button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="pt-1">
+                      <p className="text-xs font-medium text-foreground">Outbound Reply Composer</p>
+                      <p className="text-xs text-muted">
+                        Outbound response should follow the latest intent and next-best-action selected by the orchestrator.
+                      </p>
+                    </div>
+                    <div className="grid gap-2 sm:grid-cols-2">
+                      <label className="text-xs text-muted">
+                        Channel
+                        <select
+                          value={replyChannel}
+                          onChange={(e) => setReplyChannel(e.target.value as "email" | "sms")}
+                          className="mt-1 w-full rounded-md border border-border bg-background px-2 py-2 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/30"
+                        >
+                          <option value="email">Email</option>
+                        </select>
+                      </label>
+                      <label className="text-xs text-muted">
+                        To email
+                        <input
+                          value={replyToEmail}
+                          onChange={(e) => setReplyToEmail(e.target.value)}
+                          placeholder="prospect@example.com"
+                          className="mt-1 w-full rounded-md border border-border bg-background px-2 py-2 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/30"
+                        />
+                      </label>
+                      <label className="text-xs text-muted">
+                        Subject (email optional)
+                        <input
+                          value={replySubject}
+                          onChange={(e) => setReplySubject(e.target.value)}
+                          className="mt-1 w-full rounded-md border border-border bg-background px-2 py-2 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/30"
+                        />
+                      </label>
+                    </div>
+                    <label className="block text-xs text-muted">
+                      Outbound reply content
+                      <textarea
+                        value={replyBody}
+                        onChange={(e) => setReplyBody(e.target.value)}
+                        rows={8}
+                        className="mt-1 w-full rounded-md border border-border bg-background px-2 py-2 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/30"
+                      />
+                    </label>
+                    {latestSuggestedReply && (
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        onClick={() => {
+                          setReplyBody(latestSuggestedReply.content || "");
+                          const subj =
+                            typeof latestSuggestedReply.metadata?.subject === "string"
+                              ? latestSuggestedReply.metadata.subject
+                              : "";
+                          if (subj) setReplySubject(subj);
+                        }}
+                        disabled={busyKey !== null}
+                      >
+                        Use suggested outbound draft
+                      </Button>
+                    )}
+                    <Button
+                      variant="primary"
+                      onClick={() => void onSendReply()}
+                      disabled={busyKey !== null || !replyActionNeeded}
                     >
-                      <option value="email">Email</option>
-                    </select>
-                  </label>
-                  <label className="text-xs text-muted">
-                    To email
-                    <input
-                      value={replyToEmail}
-                      onChange={(e) => setReplyToEmail(e.target.value)}
-                      placeholder="prospect@example.com"
-                      className="mt-1 w-full rounded-md border border-border bg-background px-2 py-2 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/30"
-                    />
-                  </label>
-                  <label className="text-xs text-muted">
-                    Subject (email optional)
-                    <input
-                      value={replySubject}
-                      onChange={(e) => setReplySubject(e.target.value)}
-                      className="mt-1 w-full rounded-md border border-border bg-background px-2 py-2 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/30"
-                    />
-                  </label>
-                </div>
-                <label className="block text-xs text-muted">
-                  Outbound reply content
-                  <textarea
-                    value={replyBody}
-                    onChange={(e) => setReplyBody(e.target.value)}
-                    rows={8}
-                    className="mt-1 w-full rounded-md border border-border bg-background px-2 py-2 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/30"
-                  />
-                </label>
-                {latestSuggestedReply && (
-                  <Button
-                    variant="secondary"
-                    size="sm"
-                    onClick={() => {
-                      setReplyBody(latestSuggestedReply.content || "");
-                      const subj =
-                        typeof latestSuggestedReply.metadata?.subject === "string"
-                          ? latestSuggestedReply.metadata.subject
-                          : "";
-                      if (subj) setReplySubject(subj);
-                    }}
-                    disabled={busyKey !== null}
-                  >
-                    Use suggested outbound draft
-                  </Button>
-                )}
-                <Button
-                  variant="primary"
-                  onClick={() => void onSendReply()}
-                  disabled={busyKey !== null || !replyActionNeeded}
-                >
-                  {busyKey === "respond" ? "Sending..." : "Send outbound reply"}
-                </Button>
-                {!replyActionNeeded && (
-                  <p className="text-xs text-muted">
-                    Current next-best-action does not require an outbound reply from this panel.
-                  </p>
+                      {busyKey === "respond" ? "Sending..." : "Send outbound reply"}
+                    </Button>
+                    {!replyActionNeeded && (
+                      <p className="text-xs text-muted">
+                        Current next-best-action does not require an outbound reply from this panel.
+                      </p>
+                    )}
+                  </>
                 )}
               </CardContent>
             </Card>

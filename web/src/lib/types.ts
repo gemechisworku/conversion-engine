@@ -153,3 +153,26 @@ export type LeadRespondPayload = {
   state?: string;
   next_action?: string;
 };
+
+export type LeadSchedulePreparePayload = {
+  lead_id: string;
+  next_action?: string;
+  meeting_time_text?: string | null;
+  meeting_time_source?: string | null;
+  meeting_time_start_at?: string | null;
+  meeting_timezone?: string | null;
+  booking_status?: string;
+  scheduling_portal_url?: string | null;
+};
+
+export type LeadScheduleBookPayload = {
+  lead_id: string;
+  state: string;
+  booking_id?: string | null;
+  slot_id?: string | null;
+  calendar_ref?: string | null;
+  starts_at?: string | null;
+  ends_at?: string | null;
+  timezone?: string | null;
+  crm_sync_status?: string;
+};

@@ -31,6 +31,7 @@ class ReplyRouteGraphState(TypedDict, total=False):
     company_name: str
     hiring_signal_brief: dict[str, Any]
     recent_outbound_snippet: str | None
+    conversation_transcript: str | None
     intent: str
     next_action: str
     next_state: str
@@ -50,7 +51,15 @@ def compile_reply_route_graph(deps: ReplyRouteGraphDeps):
     graph: StateGraph = StateGraph(ReplyRouteGraphState)
 
     async def classify_heuristic(state: ReplyRouteGraphState) -> dict[str, Any]:
-        intent = classify_intent_from_text(state.get("content") or "")
+        parts: list[str] = []
+        transcript = (state.get("conversation_transcript") or "").strip()
+        if transcript:
+            parts.append(transcript)
+        body = (state.get("content") or "").strip()
+        if body:
+            parts.append(body)
+        combined = "\n\n".join(parts) if parts else ""
+        intent = classify_intent_from_text(combined)
         next_action = next_action_for_intent(intent)
         log_processing_step(
             component="graphs.reply_route",
@@ -77,6 +86,7 @@ def compile_reply_route_graph(deps: ReplyRouteGraphDeps):
             inbound_subject=state.get("subject") or "(no subject)",
             inbound_body=state.get("content") or "",
             recent_outbound_context=state.get("recent_outbound_snippet"),
+            conversation_transcript=state.get("conversation_transcript"),
             hiring_signal_brief=hiring if isinstance(hiring, dict) else {},
             trace_id=state.get("trace_id"),
             lead_id=state.get("lead_id"),
