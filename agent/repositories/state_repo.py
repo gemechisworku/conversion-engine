@@ -682,6 +682,20 @@ class SQLiteStateRepository:
             ).fetchone()
         return str(row["lead_id"]) if row is not None else None
 
+    def get_bound_phone_for_lead(self, *, lead_id: str) -> str | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT phone_number
+                FROM phone_lead_map
+                WHERE lead_id = ?
+                ORDER BY datetime(updated_at) DESC
+                LIMIT 1
+                """,
+                (lead_id,),
+            ).fetchone()
+        return str(row["phone_number"]) if row is not None else None
+
     def upsert_briefs(
         self,
         *,

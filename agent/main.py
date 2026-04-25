@@ -38,18 +38,18 @@ def build_email_service(state_repo: SQLiteStateRepository | None = None) -> Emai
     return EmailService(client=client, parser=parser, router=router, state_repo=repo)
 
 
-def build_sms_service() -> SMSService:
+def build_sms_service(state_repo: SQLiteStateRepository | None = None) -> SMSService:
     settings = get_settings()
     policy_service = OutboundPolicyService(settings)
     parser = AfricasTalkingWebhookParser(settings)
     router = SMSRouter()
-    state_repo = SQLiteStateRepository(db_path=settings.state_db_path)
+    repo = state_repo if state_repo is not None else SQLiteStateRepository(db_path=settings.state_db_path)
     return SMSService(
         settings=settings,
         policy_service=policy_service,
         parser=parser,
         router=router,
-        state_repo=state_repo,
+        state_repo=repo,
     )
 
 
@@ -89,6 +89,7 @@ def build_orchestration_runtime() -> OrchestrationRuntime:
         hubspot_service=build_hubspot_service(),
         calcom_service=build_calcom_service(),
         email_service=build_email_service(state_repo=state_repo),
+        sms_service=build_sms_service(state_repo=state_repo),
     )
 
 

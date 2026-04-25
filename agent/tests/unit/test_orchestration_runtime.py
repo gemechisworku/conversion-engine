@@ -50,7 +50,7 @@ def _settings() -> Settings:
     )
 
 
-def _runtime(*, email_service=None, hubspot_service=None, calcom_service=None) -> OrchestrationRuntime:
+def _runtime(*, email_service=None, sms_service=None, hubspot_service=None, calcom_service=None) -> OrchestrationRuntime:
     settings = _settings()
     repo = SQLiteStateRepository(db_path=settings.state_db_path)
     async def handler(_: httpx.Request) -> httpx.Response:
@@ -83,6 +83,7 @@ def _runtime(*, email_service=None, hubspot_service=None, calcom_service=None) -
         hubspot_service=hubspot_service,
         calcom_service=calcom_service,
         email_service=email_service,
+        sms_service=sms_service,
     )
 
 
@@ -730,6 +731,147 @@ def test_respond_to_lead_sends_outbound_reply_and_waits_for_followup() -> None:
     assert conversation["last_outbound_message_id"] == "reply_msg_123"
     messages = runtime._state_repo.list_messages(lead_id=lead_id, limit=10)
     assert any(m["message_id"] == "reply_msg_123" and m["direction"] == "outbound" for m in messages)
+
+
+def test_respond_to_lead_supports_sms_with_warm_gate_and_scheduling_link() -> None:
+    class _SMSServiceStub:
+        async def send_warm_lead_sms(self, request):
+            assert request.to_number == "+254700000111"
+            assert "https://cal.com" in request.message
+            return ProviderSendResult(
+                provider="africastalking",
+                provider_message_id="sms_reply_123",
+                accepted=True,
+                raw_status="queued",
+                raw_response={"messageId": "sms_reply_123"},
+            )
+
+    runtime = _runtime(sms_service=_SMSServiceStub())
+    lead_id = "lead_reply_sms_1"
+    runtime._state_repo.upsert_session_state(
+        lead_id=lead_id,
+        payload={
+            "current_stage": "scheduling",
+            "next_best_action": "schedule",
+            "current_objective": "reply_handling",
+            "brief_refs": [],
+            "kb_refs": [],
+            "pending_actions": [{"action_type": "delegate_scheduler", "status": "pending"}],
+            "policy_flags": [],
+            "handoff_required": False,
+        },
+    )
+    runtime._state_repo.upsert_conversation_state(
+        lead_id=lead_id,
+        payload={
+            "current_stage": "inbound_received",
+            "current_channel": "email",
+            "last_inbound_message_id": "msg_in_sms_1",
+            "last_customer_intent": "schedule",
+            "last_customer_sentiment": "neutral",
+            "qualification_status": "likely_qualified",
+            "pending_actions": [{"action_type": "delegate_scheduler", "status": "pending"}],
+            "policy_flags": [],
+            "scheduling_context": {"booking_status": "none", "timezone": None, "slots_proposed": []},
+        },
+    )
+    runtime._state_repo.append_message(
+        lead_id=lead_id,
+        channel="email",
+        message_id="warm_email_1",
+        direction="inbound",
+        content="Yes, we can continue on SMS.",
+        metadata={"from_email": "prospect@example.com"},
+    )
+
+    env = asyncio.run(
+        runtime.respond_to_lead(
+            LeadRespondRequest(
+                idempotency_key="idem_respond_sms_1",
+                lead_id=lead_id,
+                channel="sms",
+                to_number="+254700000111",
+                content="Great, sharing options now.",
+            )
+        )
+    )
+    assert env.status == "success"
+    assert env.data["message_id"] == "sms_reply_123"
+    conversation = runtime._state_repo.get_conversation_state(lead_id=lead_id)
+    assert conversation is not None
+    assert conversation["current_channel"] == "sms"
+
+
+def test_outreach_send_supports_sms_path() -> None:
+    class _SMSServiceStub:
+        async def send_warm_lead_sms(self, request):
+            assert request.to_number == "+254700000222"
+            return ProviderSendResult(
+                provider="africastalking",
+                provider_message_id="sms_outreach_123",
+                accepted=True,
+                raw_status="queued",
+                raw_response={"messageId": "sms_outreach_123"},
+            )
+
+    runtime = _runtime(sms_service=_SMSServiceStub())
+    processed = asyncio.run(
+        runtime.process_lead(
+            LeadProcessRequest(
+                idempotency_key="idem_send_sms_1",
+                company_id="comp_send_sms_1",
+                metadata={"company_name": "Acme AI", "company_domain": "acme.ai"},
+            )
+        )
+    )
+    lead_id = processed.data["lead_id"]
+    runtime._state_repo.append_message(
+        lead_id=lead_id,
+        channel="email",
+        message_id="warm_email_2",
+        direction="inbound",
+        content="Open to continuing over SMS.",
+        metadata={"from_email": "prospect@example.com"},
+    )
+    runtime._state_repo.upsert_outreach_draft(
+        lead_id=lead_id,
+        draft=wrap_v2(
+            outbound={
+                "lead_id": lead_id,
+                "draft_id": "draft_send_sms_1",
+                "review_id": "review_send_sms_1",
+                "review_status": "approved",
+                "trace_id": "trace_send_sms_1",
+                "idempotency_key": "idem_send_sms_1",
+                "to_email": "prospect@example.com",
+                "subject": "Hello",
+                "text_body": "Hello from Tenacious",
+                "metadata": {},
+            },
+            review={
+                "review_id": "review_send_sms_1",
+                "status": "approved",
+                "final_send_ok": True,
+            },
+        ),
+    )
+    send_env = asyncio.run(
+        runtime.outreach_send(
+            OutreachSendRequest(
+                lead_id=lead_id,
+                draft_id="draft_send_sms_1",
+                review_id="review_send_sms_1",
+                channel="sms",
+                to_number="+254700000222",
+                idempotency_key="idem_send_sms_1",
+            )
+        )
+    )
+    assert send_env.status == "success"
+    assert send_env.data["delivery_status"] == "queued"
+    conversation = runtime._state_repo.get_conversation_state(lead_id=lead_id)
+    assert conversation is not None
+    assert conversation["current_channel"] == "sms"
 
 
 def test_prepare_scheduling_extracts_meeting_time_from_history() -> None:

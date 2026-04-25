@@ -100,6 +100,22 @@ def create_orchestration_app() -> FastAPI:
         )
         return JSONResponse(env.model_dump(mode="json"))
 
+    @app.post(settings.webhook_route_africastalking, tags=["leads"])
+    async def post_africastalking_webhook(request: Request) -> JSONResponse:
+        raw_body = await request.body()
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                payload = {"payload": payload}
+        except Exception:
+            payload = {}
+        env = await request.app.state.runtime.handle_sms_webhook(
+            payload=payload,
+            headers=dict(request.headers),
+            raw_body=raw_body,
+        )
+        return JSONResponse(env.model_dump(mode="json"))
+
     @app.post("/lead/advance", tags=["leads"])
     async def post_lead_advance(req: LeadAdvanceRequest, request: Request) -> JSONResponse:
         env = await request.app.state.runtime.advance_state(req)

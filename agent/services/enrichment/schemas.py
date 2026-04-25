@@ -47,8 +47,9 @@ class WeightedSignal(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     signal_type: str
-    weight: Literal["high", "medium"]
+    weight: Literal["high", "medium", "low"]
     summary: str
+    justification: str
     evidence_refs: list[str] = Field(default_factory=list)
 
 
@@ -64,6 +65,8 @@ class AIMaturityScore(BaseModel):
     score: int
     confidence: float
     signals: list[WeightedSignal] = Field(default_factory=list)
+    confidence_rationale: str | None = None
+    silent_company: bool = False
     risk_notes: list[str] = Field(default_factory=list)
     generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 

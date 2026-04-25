@@ -5,8 +5,17 @@ from __future__ import annotations
 from typing import Any
 from uuid import uuid4
 
+from agent.services.enrichment.ai_maturity_inputs import (
+    INPUT_AI_LEADERSHIP,
+    INPUT_AI_ROLES,
+    INPUT_EXEC_COMMENTARY,
+    INPUT_GITHUB,
+    INPUT_STACK,
+    INPUT_STRATEGIC_COMMS,
+    collect_ai_maturity_inputs,
+)
 from agent.services.enrichment.llm import OpenRouterJSONClient
-from agent.services.enrichment.schemas import AIMaturityScore, EnrichmentArtifact, WeightedSignal
+from agent.services.enrichment.schemas import AIMaturityScore, EnrichmentArtifact, SignalSnapshot, WeightedSignal
 
 
 def score_ai_maturity(*, company_id: str, artifact: EnrichmentArtifact) -> AIMaturityScore:
@@ -14,126 +23,82 @@ def score_ai_maturity(*, company_id: str, artifact: EnrichmentArtifact) -> AIMat
     # Workflow: lead_intake_and_enrichment.md
     # Schema: ai_maturity_score.md
     # API: scoring_api.md
-    signals: list[WeightedSignal] = []
-    numeric_score = 0.0
-    evidential_confidences: list[float] = []
-
-    jobs_summary = _summary_dict(artifact.signals.get("job_posts"))
-    ai_roles = _as_int(jobs_summary.get("ai_adjacent_role_count"))
-    eng_roles = _as_int(jobs_summary.get("engineering_role_count"))
-    if ai_roles >= 3:
-        numeric_score += 1.5
-        signals.append(
+    collected = collect_ai_maturity_inputs(artifact=artifact)
+    specs: list[tuple[str, str, float]] = [
+        (INPUT_AI_ROLES, "high", 1.0),
+        (INPUT_AI_LEADERSHIP, "high", 1.0),
+        (INPUT_GITHUB, "medium", 0.6),
+        (INPUT_EXEC_COMMENTARY, "medium", 0.6),
+        (INPUT_STACK, "low", 0.3),
+        (INPUT_STRATEGIC_COMMS, "low", 0.3),
+    ]
+    weighted_total = 0.0
+    present_count = 0
+    present_confidences: list[float] = []
+    scored_signals: list[WeightedSignal] = []
+    for signal_key, weight_label, weight_value in specs:
+        snapshot = collected.get(signal_key) or SignalSnapshot(summary={"present": False}, confidence=0.3, source_refs=[])
+        summary = _summary_dict(snapshot)
+        present = bool(summary.get("present"))
+        if present:
+            weighted_total += weight_value
+            present_count += 1
+            present_confidences.append(float(snapshot.confidence))
+        scored_signals.append(
             WeightedSignal(
-                signal_type="ai_adjacent_roles",
-                weight="high",
-                summary=f"{ai_roles} AI-adjacent roles publicly listed.",
-                evidence_refs=["jobs_signal"],
+                signal_type=signal_key,
+                weight=weight_label,  # type: ignore[arg-type]
+                summary=_signal_summary(signal_key=signal_key, snapshot=summary),
+                justification=_signal_justification(signal_key=signal_key, snapshot=summary, present=present),
+                evidence_refs=_evidence_refs(snapshot=snapshot, fallback=signal_key),
             )
         )
-        evidential_confidences.append(float(artifact.signals["job_posts"].confidence))
-    elif ai_roles > 0:
-        numeric_score += 0.75
-        signals.append(
-            WeightedSignal(
-                signal_type="ai_adjacent_roles",
-                weight="medium",
-                summary=f"{ai_roles} AI-adjacent role(s) observed.",
-                evidence_refs=["jobs_signal"],
-            )
-        )
-        evidential_confidences.append(float(artifact.signals["job_posts"].confidence))
 
-    crunchbase_summary = _summary_dict(artifact.signals.get("crunchbase"))
-    funding_round = _as_str(crunchbase_summary.get("funding_round"))
-    if funding_round:
-        if funding_round.lower().startswith("series"):
-            numeric_score += 0.75
+    silent_company = present_count == 0
+    if silent_company:
+        score = 0
+        confidence = 0.25
+        confidence_rationale = (
+            "No qualifying public AI-maturity evidence was found. "
+            "This is a low-confidence score and absence of evidence is not evidence of absence."
+        )
+    else:
+        if weighted_total < 1.0:
+            score = 1
+        elif weighted_total < 2.2:
+            score = 2
         else:
-            numeric_score += 0.5
-        signals.append(
-            WeightedSignal(
-                signal_type="funding_signal",
-                weight="medium",
-                summary=f"Funding event detected ({funding_round}).",
-                evidence_refs=["crunchbase_signal"],
-            )
-        )
-        evidential_confidences.append(float(artifact.signals["crunchbase"].confidence))
+            score = 3
+        avg_conf = sum(present_confidences) / max(1, len(present_confidences))
+        coverage = present_count / len(specs)
+        confidence = float(max(0.3, min(0.95, round(0.25 + (0.45 * avg_conf) + (0.30 * coverage), 2))))
+        if score == 2 and present_count <= 2:
+            confidence_rationale = "Mid score inferred from limited high-weight signals; confidence is constrained."
+        elif score == 2 and present_count >= 4:
+            confidence_rationale = "Mid score supported by multiple corroborating signals."
+        elif score >= 3:
+            confidence_rationale = "Score driven by multiple weighted signals with consistent public evidence."
+        else:
+            confidence_rationale = "Score is based on partial evidence and should be phrased as exploratory."
 
-    leadership_summary = _summary_dict(artifact.signals.get("leadership_changes"))
-    role_name = _as_str(leadership_summary.get("role_name"))
-    if role_name and any(token in role_name.lower() for token in ("cto", "vp", "engineering", "ai")):
-        numeric_score += 0.5
-        signals.append(
-            WeightedSignal(
-                signal_type="leadership_change",
-                weight="medium",
-                summary=f"Leadership transition detected ({role_name}).",
-                evidence_refs=["leadership_signal"],
-            )
-        )
-        evidential_confidences.append(float(artifact.signals["leadership_changes"].confidence))
-
-    layoffs_summary = _summary_dict(artifact.signals.get("layoffs"))
-    affected_percent = _as_float(layoffs_summary.get("affected_percent"))
-    if affected_percent >= 20:
-        numeric_score -= 0.5
-        signals.append(
-            WeightedSignal(
-                signal_type="layoff_pressure",
-                weight="medium",
-                summary=f"Layoff signal indicates pressure ({affected_percent:.1f}% affected).",
-                evidence_refs=["layoffs_signal"],
-            )
-        )
-        evidential_confidences.append(float(artifact.signals["layoffs"].confidence))
-
-    if eng_roles >= 8 and ai_roles >= 1:
-        numeric_score += 0.5
-        signals.append(
-            WeightedSignal(
-                signal_type="engineering_scale",
-                weight="high",
-                summary=f"Engineering hiring scale ({eng_roles} roles) with AI adjacency.",
-                evidence_refs=["jobs_signal"],
-            )
-        )
-
-    tech_stack = [str(item).lower() for item in _as_list(crunchbase_summary.get("tech_stack"))]
-    ai_tech = [item for item in tech_stack if any(token in item for token in ("openai", "machine learning", "ml", "ai", "tensorflow", "pytorch", "databricks"))]
-    if ai_tech:
-        numeric_score += 1.0
-        signals.append(
-            WeightedSignal(
-                signal_type="public_ai_or_data_stack",
-                weight="high",
-                summary=f"Public technology profile includes AI/data tooling: {', '.join(ai_tech[:3])}.",
-                evidence_refs=["crunchbase_signal"],
-            )
-        )
-        evidential_confidences.append(float(artifact.signals["crunchbase"].confidence))
-
-    score = int(round(max(0.0, min(3.0, numeric_score))))
-    confidence = _confidence(evidential_confidences=evidential_confidences, signal_count=len(signals))
     risk_notes: list[str] = []
-    if len(signals) < 2:
-        risk_notes.append("AI maturity score uses limited public evidence; soften claims.")
+    if silent_company:
+        risk_notes.append("No public AI-maturity signals found; absence is not proof of absence.")
     if confidence < 0.6:
         risk_notes.append("Low confidence: prefer exploratory phrasing over assertions.")
-    if confidence >= 0.75:
-        risk_notes.append("Phrasing may state observed public signals directly.")
-    elif confidence >= 0.55:
-        risk_notes.append("Phrasing should frame maturity as a likely pattern, not a fact.")
+    elif confidence < 0.75:
+        risk_notes.append("Moderate confidence: frame conclusions as likely patterns.")
     else:
-        risk_notes.append("Phrasing should explicitly say public evidence is limited.")
+        risk_notes.append("Higher confidence: observed public signals can be stated directly.")
 
     return AIMaturityScore(
         score_id=f"score_{uuid4().hex[:10]}",
         company_id=company_id,
         score=score,
         confidence=confidence,
-        signals=signals,
+        signals=scored_signals,
+        confidence_rationale=confidence_rationale,
+        silent_company=silent_company,
         risk_notes=risk_notes,
     )
 
@@ -150,9 +115,10 @@ async def score_ai_maturity_with_llm(
     candidate = await llm.generate_model(
         system_prompt=(
             "You are the AI Maturity Scorer. Apply the required 0-3 scoring rubric. "
-            "High-weight inputs: AI-adjacent roles, public AI/data stack, engineering scale with AI adjacency. "
-            "Medium-weight inputs: recent funding, recent CTO/VP Engineering hire, layoffs/cost pressure. "
-            "Use confidence-sensitive phrasing and never infer strong maturity from weak evidence."
+            "Use six weighted inputs only: high=(ai_adjacent_open_roles, named_ai_ml_leadership), "
+            "medium=(github_org_activity, executive_commentary), low=(modern_data_ml_stack, strategic_communications). "
+            "Return per-signal justifications, a separate confidence field, and explicit silent-company handling where score=0 "
+            "with the note that absence of evidence is not evidence of absence."
         ),
         user_payload={
             "required_schema": AIMaturityScore.model_json_schema(),
@@ -179,36 +145,69 @@ def _summary_dict(snapshot: Any) -> dict[str, Any]:
     return summary if isinstance(summary, dict) else {}
 
 
-def _as_int(value: Any) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 0
+def _signal_summary(*, signal_key: str, snapshot: dict[str, Any]) -> str:
+    present = bool(snapshot.get("present"))
+    if signal_key == INPUT_AI_ROLES:
+        count = int(snapshot.get("ai_adjacent_role_count") or 0)
+        return f"{count} AI-adjacent open role(s) detected." if present else "No AI-adjacent open roles detected."
+    if signal_key == INPUT_AI_LEADERSHIP:
+        role = str(snapshot.get("role_name") or "").strip()
+        return f"Named AI/ML leadership found ({role})." if present else "No named AI/ML leadership detected."
+    if signal_key == INPUT_GITHUB:
+        orgs = snapshot.get("orgs") if isinstance(snapshot.get("orgs"), list) else []
+        return f"Public GitHub org signal present ({', '.join(str(o) for o in orgs[:2])})." if present else "No public GitHub org activity signal detected."
+    if signal_key == INPUT_EXEC_COMMENTARY:
+        return "Executive commentary signal found in public material." if present else "No executive AI commentary signal found."
+    if signal_key == INPUT_STACK:
+        hits = snapshot.get("stack_hits") if isinstance(snapshot.get("stack_hits"), list) else []
+        return f"Modern data/ML stack signals detected ({', '.join(str(h) for h in hits[:3])})." if present else "No modern data/ML stack signal found."
+    if signal_key == INPUT_STRATEGIC_COMMS:
+        return "Strategic AI-related communications signal detected." if present else "No strategic AI communications signal found."
+    return "Signal processed."
 
 
-def _as_float(value: Any) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
+def _signal_justification(*, signal_key: str, snapshot: dict[str, Any], present: bool) -> str:
+    if signal_key == INPUT_AI_ROLES:
+        count = int(snapshot.get("ai_adjacent_role_count") or 0)
+        return (
+            f"Public job-post evidence includes {count} AI-adjacent role(s), which is a high-weight indicator."
+            if present
+            else "No AI-adjacent openings were observed in public postings; this high-weight indicator is absent."
+        )
+    if signal_key == INPUT_AI_LEADERSHIP:
+        role = str(snapshot.get("role_name") or "N/A").strip()
+        return (
+            f"A named AI/ML leadership role was observed ({role}), which is treated as a high-weight indicator."
+            if present
+            else "No named AI/ML leadership role was observed; this high-weight indicator is absent."
+        )
+    if signal_key == INPUT_GITHUB:
+        return (
+            "Public GitHub organization presence/activity signal was found and contributes medium weight."
+            if present
+            else "No clear public GitHub organization activity signal was found."
+        )
+    if signal_key == INPUT_EXEC_COMMENTARY:
+        return (
+            "Executive commentary mentioning AI/technology direction was found in public material."
+            if present
+            else "No verifiable executive commentary signal was found in public material."
+        )
+    if signal_key == INPUT_STACK:
+        return (
+            "Public stack evidence shows modern data/ML tooling, counted as a low-weight maturity indicator."
+            if present
+            else "No modern data/ML tooling signal was found in public stack evidence."
+        )
+    if signal_key == INPUT_STRATEGIC_COMMS:
+        return (
+            "Public strategic communications indicate AI-related initiative visibility (low weight)."
+            if present
+            else "No strategic AI communications signal was found in public sources."
+        )
+    return "Signal justification unavailable."
 
 
-def _as_str(value: Any) -> str:
-    if value is None:
-        return ""
-    return str(value).strip()
-
-
-def _as_list(value: Any) -> list[Any]:
-    return value if isinstance(value, list) else []
-
-
-def _confidence(*, evidential_confidences: list[float], signal_count: int) -> float:
-    if not evidential_confidences:
-        return 0.35
-    baseline = sum(evidential_confidences) / len(evidential_confidences)
-    if signal_count >= 4:
-        baseline += 0.1
-    elif signal_count == 1:
-        baseline -= 0.1
-    return float(max(0.3, min(0.95, round(baseline, 2))))
+def _evidence_refs(*, snapshot: SignalSnapshot, fallback: str) -> list[str]:
+    refs = [ref.source_name for ref in snapshot.source_refs if ref.source_name]
+    return refs or [fallback]
