@@ -340,6 +340,12 @@ Notes:
 
 ---
 
+## Frontend (Tenacious Ops)
+
+A **Next.js + Tailwind** operator UI lives in **`web/`** (light / dark / system themes, blue primary). By default it uses a **same-origin `/api/orchestration` proxy** to FastAPI so you avoid browser CORS during local dev. See **`docs/frontend_runbook.md`** for `uvicorn` + `npm run dev`, `ORCHESTRATION_UPSTREAM_URL`, and optional API key / direct-URL CORS notes.
+
+---
+
 ## Final Note
 
 This system is built as:

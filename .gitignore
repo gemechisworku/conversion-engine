@@ -9,3 +9,9 @@ pytest-cache-files-*
 .venv/
 /outputs/test_*
 /agent/outputs/test*
+
+# Next.js frontend
+web/node_modules/
+web/.next/
+web/out/
+web/.env.local

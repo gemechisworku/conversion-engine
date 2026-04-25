@@ -132,6 +132,8 @@ class Settings(BaseSettings):
     # Orchestration REST (`agent/api/orchestration_app.py`) — SPA / frontend
     orchestration_api_key: str = Field(default="", alias="ORCHESTRATION_API_KEY")
     orchestration_cors_origins: str = Field(default="", alias="ORCHESTRATION_CORS_ORIGINS")
+    # When True (default), allow common Next.js dev origins on the API (no manual CORS env for local UI).
+    orchestration_cors_allow_localhost_dev: bool = Field(default=True, alias="ORCHESTRATION_CORS_ALLOW_LOCALHOST_DEV")
 
     serpapi_api_key: str = Field(default="", alias="SERPAPI_API_KEY")
 

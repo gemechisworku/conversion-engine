@@ -93,6 +93,13 @@ class OrchestrationRuntime:
         if cached is not None:
             return ResponseEnvelope.model_validate(cached)
         try:
+            self._state_repo.upsert_pipeline_run_start(
+                lead_id=lead_id,
+                company_id=request.company_id,
+                company_name=company_name,
+                company_domain=company_domain,
+                trace_id=trace_id,
+            )
             self._state_repo.upsert_session_state(
                 lead_id=lead_id,
                 payload={
@@ -190,6 +197,11 @@ class OrchestrationRuntime:
                     "scheduling_context": {"booking_status": "none", "timezone": None, "slots_proposed": []},
                 },
             )
+            self._state_repo.update_pipeline_run_stage(
+                lead_id=lead_id,
+                stage=enriched_state.current_stage,
+                trace_id=trace_id,
+            )
 
             log_trace_event(
                 event_type="lead_processed",
@@ -210,6 +222,11 @@ class OrchestrationRuntime:
             )
             return env
         except InvalidStateTransitionError as exc:
+            self._state_repo.update_pipeline_run_stage(
+                lead_id=lead_id,
+                stage="failed_invalid_transition",
+                trace_id=trace_id,
+            )
             log_processing_step(
                 component="orchestration",
                 step="process_lead.error",
@@ -227,6 +244,11 @@ class OrchestrationRuntime:
                 retryable=False,
             )
         except Exception as exc:  # pragma: no cover - orchestration guard
+            self._state_repo.update_pipeline_run_stage(
+                lead_id=lead_id,
+                stage="failed",
+                trace_id=trace_id,
+            )
             log_processing_step(
                 component="orchestration",
                 step="process_lead.error",
@@ -841,6 +863,36 @@ class OrchestrationRuntime:
             data={"lead_id": lead_id, "edges": edges},
         )
 
+    def list_pipelines(self, *, limit: int = 200) -> ResponseEnvelope:
+        request_id = f"req_{uuid4().hex[:10]}"
+        trace_id = f"trace_pipelines_{uuid4().hex[:12]}"
+        rows = self._state_repo.list_pipeline_runs(limit=limit)
+        return ResponseEnvelope(
+            request_id=request_id,
+            trace_id=trace_id,
+            status="success",
+            data={"pipelines": rows},
+        )
+
+    def delete_pipeline(self, *, lead_id: str) -> ResponseEnvelope:
+        request_id = f"req_{uuid4().hex[:10]}"
+        trace_id = f"trace_pipeline_del_{uuid4().hex[:12]}"
+        deleted = self._state_repo.delete_pipeline_run(lead_id=lead_id)
+        if not deleted:
+            return self._failure(
+                request_id=request_id,
+                trace_id=trace_id,
+                code="INVALID_INPUT",
+                message=f"Unknown lead_id '{lead_id}'.",
+                retryable=False,
+            )
+        return ResponseEnvelope(
+            request_id=request_id,
+            trace_id=trace_id,
+            status="success",
+            data={"lead_id": lead_id, "deleted": True},
+        )
+
     def get_state(self, *, lead_id: str) -> ResponseEnvelope:
         request_id = f"req_{uuid4().hex[:10]}"
         trace_id = f"trace_state_{uuid4().hex[:12]}"
@@ -869,6 +921,7 @@ class OrchestrationRuntime:
                 "pending_actions": session.get("pending_actions", []),
                 "kb_refs": session.get("kb_refs", []),
                 "policy_flags": session.get("policy_flags", []),
+                "updated_at": session.get("updated_at"),
             },
         )
 

@@ -157,6 +157,20 @@ class SQLiteStateRepository:
                 );
                 CREATE INDEX IF NOT EXISTS idx_evidence_lead_id ON evidence_graph_edges(lead_id);
                 CREATE INDEX IF NOT EXISTS idx_evidence_trace_id ON evidence_graph_edges(trace_id);
+
+                CREATE TABLE IF NOT EXISTS pipeline_runs (
+                    lead_id TEXT PRIMARY KEY,
+                    company_id TEXT NOT NULL,
+                    company_name TEXT NOT NULL,
+                    company_domain TEXT,
+                    run_count INTEGER NOT NULL DEFAULT 0,
+                    last_stage TEXT NOT NULL,
+                    last_trace_id TEXT,
+                    started_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_pipeline_runs_updated_at ON pipeline_runs(updated_at);
+                CREATE INDEX IF NOT EXISTS idx_pipeline_runs_company_name ON pipeline_runs(company_name);
                 """
             )
 
@@ -554,6 +568,87 @@ class SQLiteStateRepository:
             "generated_at": row["generated_at"],
         }
 
+    def upsert_pipeline_run_start(
+        self,
+        *,
+        lead_id: str,
+        company_id: str,
+        company_name: str,
+        company_domain: str | None,
+        trace_id: str,
+    ) -> None:
+        now = _utc_now()
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO pipeline_runs (
+                    lead_id, company_id, company_name, company_domain, run_count, last_stage, last_trace_id, started_at, updated_at
+                ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)
+                ON CONFLICT(lead_id) DO UPDATE SET
+                    company_id=excluded.company_id,
+                    company_name=excluded.company_name,
+                    company_domain=excluded.company_domain,
+                    run_count=pipeline_runs.run_count + 1,
+                    last_stage=excluded.last_stage,
+                    last_trace_id=excluded.last_trace_id,
+                    started_at=excluded.started_at,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    lead_id,
+                    company_id,
+                    company_name.strip() or company_id,
+                    (company_domain or "").strip() or None,
+                    "enriching",
+                    trace_id,
+                    now,
+                    now,
+                ),
+            )
+
+    def update_pipeline_run_stage(
+        self,
+        *,
+        lead_id: str,
+        stage: str,
+        trace_id: str | None = None,
+    ) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """
+                UPDATE pipeline_runs
+                SET last_stage = ?, last_trace_id = COALESCE(?, last_trace_id), updated_at = ?
+                WHERE lead_id = ?
+                """,
+                (stage, trace_id, _utc_now(), lead_id),
+            )
+
+    def list_pipeline_runs(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT lead_id, company_id, company_name, company_domain, run_count, last_stage, last_trace_id, started_at, updated_at
+                FROM pipeline_runs
+                ORDER BY datetime(updated_at) DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            {
+                "lead_id": row["lead_id"],
+                "company_id": row["company_id"],
+                "company_name": row["company_name"],
+                "company_domain": row["company_domain"],
+                "run_count": int(row["run_count"]),
+                "last_stage": row["last_stage"],
+                "last_trace_id": row["last_trace_id"],
+                "started_at": row["started_at"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+
     def upsert_act2_briefs(
         self,
         *,
@@ -722,3 +817,26 @@ class SQLiteStateRepository:
             }
             for row in rows
         ]
+
+    def delete_pipeline_run(self, *, lead_id: str) -> bool:
+        """Delete a lead pipeline and related state rows for operator cleanup in UI."""
+        with self._conn() as conn:
+            exists = conn.execute("SELECT 1 FROM pipeline_runs WHERE lead_id = ? LIMIT 1", (lead_id,)).fetchone()
+            if exists is None:
+                return False
+            for table in (
+                "lead_session_state",
+                "conversation_state",
+                "message_log",
+                "sms_consent_state",
+                "phone_lead_map",
+                "lead_briefs",
+                "lead_enrichment_cache",
+                "act2_enrichment_briefs",
+                "email_threads",
+                "outreach_draft_state",
+                "evidence_graph_edges",
+                "pipeline_runs",
+            ):
+                conn.execute(f"DELETE FROM {table} WHERE lead_id = ?", (lead_id,))
+            return True

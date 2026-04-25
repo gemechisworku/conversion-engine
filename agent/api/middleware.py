@@ -56,12 +56,16 @@ class OrchestrationAPIKeyMiddleware(BaseHTTPMiddleware):
 
 
 def add_orchestration_cors(app, *, settings: Settings) -> None:
-    """Register Starlette CORSMiddleware when ORCHESTRATION_CORS_ORIGINS is non-empty."""
+    """Register Starlette CORSMiddleware for configured origins plus optional local Next.js dev URLs."""
     from starlette.middleware.cors import CORSMiddleware
 
     from agent.api.security import parse_cors_origins
 
-    origins = parse_cors_origins(settings.orchestration_cors_origins)
+    origins = list(parse_cors_origins(settings.orchestration_cors_origins))
+    if settings.orchestration_cors_allow_localhost_dev:
+        for u in ("http://localhost:3000", "http://127.0.0.1:3000"):
+            if u not in origins:
+                origins.append(u)
     if not origins:
         return
     app.add_middleware(

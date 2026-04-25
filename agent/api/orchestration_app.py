@@ -45,6 +45,7 @@ def create_orchestration_app() -> FastAPI:
         openapi_tags=[
             {"name": "meta", "description": "Health (no API key)."},
             {"name": "leads", "description": "Lead intake, state, replies, escalation, compaction."},
+            {"name": "pipelines", "description": "Frontend pipeline runs list and cleanup controls."},
             {"name": "outreach", "description": "Draft, review, send."},
             {"name": "memory", "description": "Session, evidence edges, memory compaction."},
         ],
@@ -72,6 +73,19 @@ def create_orchestration_app() -> FastAPI:
     @app.get("/lead/{lead_id}/state", tags=["leads"])
     async def get_lead_state(lead_id: str, request: Request) -> JSONResponse:
         env = request.app.state.runtime.get_state(lead_id=lead_id)
+        return JSONResponse(env.model_dump(mode="json"))
+
+    @app.get("/pipelines", tags=["pipelines"])
+    async def get_pipelines(
+        request: Request,
+        limit: Annotated[int, Query(ge=1, le=500, description="Max pipeline rows (newest first)")] = 200,
+    ) -> JSONResponse:
+        env = request.app.state.runtime.list_pipelines(limit=limit)
+        return JSONResponse(env.model_dump(mode="json"))
+
+    @app.delete("/pipelines/{lead_id}", tags=["pipelines"])
+    async def delete_pipeline(lead_id: str, request: Request) -> JSONResponse:
+        env = request.app.state.runtime.delete_pipeline(lead_id=lead_id)
         return JSONResponse(env.model_dump(mode="json"))
 
     @app.post("/lead/escalate", tags=["leads"])
