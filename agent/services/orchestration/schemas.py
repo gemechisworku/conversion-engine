@@ -49,6 +49,17 @@ class LeadReplyRequest(BaseModel):
     received_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
+class LeadRespondRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    idempotency_key: str
+    lead_id: str
+    channel: str = "email"
+    content: str
+    subject: str | None = None
+    to_email: str | None = None
+
+
 class LeadAdvanceRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

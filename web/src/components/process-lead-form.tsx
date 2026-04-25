@@ -4,6 +4,8 @@ import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 import { orchestrationFetch, OrchestrationApiError } from "@/lib/api";
 import type { MemorySessionPayload } from "@/lib/types";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 
 function randomId(prefix: string) {
   return `${prefix}_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
@@ -176,67 +178,69 @@ export function ProcessLeadForm({ onPipelineChanged }: { onPipelineChanged?: () 
   }
 
   return (
-    <form onSubmit={(e) => void onSubmit(e)} className="max-w-xl space-y-4 rounded-lg border border-border bg-surface p-4 shadow-sm">
-      <h2 className="text-base font-semibold text-foreground">Process new lead</h2>
-      <p className="text-sm text-muted">
-        Select a company from the bundled Crunchbase dataset, then run intake (<code className="rounded bg-background px-1">POST /lead/process</code>).
-      </p>
-      {loadError && <p className="text-sm text-amber-700 dark:text-amber-400">{loadError}</p>}
-      <label className="block text-sm">
-        <span className="font-medium text-foreground">Search companies</span>
-        <input
-          type="search"
-          className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-foreground outline-none ring-primary focus:ring-2"
-          value={filter}
-          onChange={(e) => setFilter(e.target.value)}
-          placeholder="Filter by name, id, or domain..."
-          disabled={companies.length === 0}
-        />
-      </label>
-      <label className="block text-sm">
-        <span className="font-medium text-foreground">Company</span>
-        <select
-          required
-          className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-foreground outline-none ring-primary focus:ring-2"
-          value={selectedId}
-          onChange={(e) => setSelectedId(e.target.value)}
-          disabled={companies.length === 0}
-        >
-          <option value="">— Select —</option>
-          {filtered.slice(0, 500).map((c) => (
-            <option key={c.id} value={c.id}>
-              {c.name} ({c.id}){c.domain ? ` · ${c.domain}` : ""}
-            </option>
-          ))}
-        </select>
-        {filtered.length > 500 && <p className="mt-1 text-xs text-muted">Showing first 500 matches — narrow your search.</p>}
-      </label>
-      {selected && (
-        <p className="rounded-md bg-background px-3 py-2 text-xs text-muted">
-          <span className="font-medium text-foreground">id</span> {selected.id} · <span className="font-medium text-foreground">domain</span>{" "}
-          {selected.domain || "—"}
-        </p>
-      )}
-      {progress && (
-        <div className="rounded-md border border-border bg-background p-3">
-          <div className="mb-1 flex items-center justify-between gap-3 text-xs">
-            <span className="font-medium text-foreground">{progress.label}</span>
-            <span className="text-muted">{progress.pct}%</span>
-          </div>
-          <div className="h-2 w-full overflow-hidden rounded-full bg-slate-700/30">
-            <div className="h-full rounded-full bg-primary transition-all" style={{ width: `${progress.pct}%` }} />
-          </div>
-          <p className="mt-1 text-xs text-muted">lead {progress.leadId} · state {progress.state}</p>
-        </div>
-      )}
-      {message && <p className="text-sm text-red-600 dark:text-red-400">{message}</p>}
-      <button
-        type="submit"
-        disabled={busy || companies.length === 0}
-        className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50"
-      >
-        {busy ? "Processing..." : "Run intake"}
-      </button>
-    </form>
+    <Card className="max-w-xl">
+      <CardHeader>
+        <CardTitle>Process New Lead</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <form onSubmit={(e) => void onSubmit(e)} className="space-y-4">
+          <p className="text-sm text-muted">
+            Select a company from the bundled Crunchbase dataset, then run intake (<code className="rounded bg-background px-1">POST /lead/process</code>).
+          </p>
+          {loadError && <p className="text-sm text-amber-700 dark:text-amber-400">{loadError}</p>}
+          <label className="block text-sm">
+            <span className="font-medium text-foreground">Search companies</span>
+            <input
+              type="search"
+              className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-foreground outline-none ring-primary focus:ring-2"
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              placeholder="Filter by name, id, or domain..."
+              disabled={companies.length === 0}
+            />
+          </label>
+          <label className="block text-sm">
+            <span className="font-medium text-foreground">Company</span>
+            <select
+              required
+              className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-foreground outline-none ring-primary focus:ring-2"
+              value={selectedId}
+              onChange={(e) => setSelectedId(e.target.value)}
+              disabled={companies.length === 0}
+            >
+              <option value="">— Select —</option>
+              {filtered.slice(0, 500).map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name} ({c.id}){c.domain ? ` · ${c.domain}` : ""}
+                </option>
+              ))}
+            </select>
+            {filtered.length > 500 && <p className="mt-1 text-xs text-muted">Showing first 500 matches — narrow your search.</p>}
+          </label>
+          {selected && (
+            <p className="rounded-md bg-background px-3 py-2 text-xs text-muted">
+              <span className="font-medium text-foreground">id</span> {selected.id} · <span className="font-medium text-foreground">domain</span>{" "}
+              {selected.domain || "—"}
+            </p>
+          )}
+          {progress && (
+            <div className="rounded-md border border-border bg-background p-3">
+              <div className="mb-1 flex items-center justify-between gap-3 text-xs">
+                <span className="font-medium text-foreground">{progress.label}</span>
+                <span className="text-muted">{progress.pct}%</span>
+              </div>
+              <div className="h-2 w-full overflow-hidden rounded-full bg-slate-700/30">
+                <div className="h-full rounded-full bg-primary transition-all" style={{ width: `${progress.pct}%` }} />
+              </div>
+              <p className="mt-1 text-xs text-muted">lead {progress.leadId} · state {progress.state}</p>
+            </div>
+          )}
+          {message && <p className="text-sm text-red-600 dark:text-red-400">{message}</p>}
+          <Button type="submit" variant="primary" disabled={busy || companies.length === 0}>
+            {busy ? "Processing..." : "Run intake"}
+          </Button>
+        </form>
+      </CardContent>
+    </Card>
   );
 }

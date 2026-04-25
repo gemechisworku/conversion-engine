@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -17,9 +18,17 @@ from agent.services.enrichment.layoffs import LayoffsAdapter
 from agent.services.enrichment.leadership import LeadershipChangeDetector
 from agent.services.enrichment.merger import EnrichmentPipeline
 from agent.services.enrichment.news_playwright import PublicNewsPlaywrightRetriever
+from agent.services.common.schemas import ProviderSendResult
 from agent.services.orchestration.runtime import OrchestrationRuntime
-from agent.services.orchestration.schemas import LeadAdvanceRequest, LeadProcessRequest, LeadReplyRequest
+from agent.services.orchestration.schemas import (
+    LeadAdvanceRequest,
+    LeadProcessRequest,
+    LeadRespondRequest,
+    LeadReplyRequest,
+    OutreachSendRequest,
+)
 from agent.services.email.schemas import InboundEmailEvent
+from agent.services.outreach.outreach_payload import wrap_v2
 
 
 FIXTURE_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "enrichment"
@@ -509,3 +518,158 @@ def test_handle_email_webhook_falls_back_to_thread_headers_when_to_unmatched() -
     env = asyncio.run(runtime.handle_email_webhook(payload=payload, headers={}))
     assert env.status == "accepted"
     assert env.data["lead_id"] == lead_id
+
+
+def test_outreach_send_moves_session_to_awaiting_reply() -> None:
+    class _EmailServiceStub:
+        async def send_email(self, request):
+            del request
+            return ProviderSendResult(
+                provider="resend",
+                provider_message_id="resend_msg_123",
+                accepted=True,
+                raw_status="queued",
+                raw_response={"id": "resend_msg_123"},
+            )
+
+    runtime = _runtime(email_service=_EmailServiceStub())
+    processed = asyncio.run(
+        runtime.process_lead(
+            LeadProcessRequest(
+                idempotency_key="idem_send_stage_1",
+                company_id="comp_send_stage_1",
+                metadata={"company_name": "Acme AI", "company_domain": "acme.ai"},
+            )
+        )
+    )
+    lead_id = processed.data["lead_id"]
+    runtime._state_repo.upsert_outreach_draft(
+        lead_id=lead_id,
+        draft=wrap_v2(
+            outbound={
+                "lead_id": lead_id,
+                "draft_id": "draft_send_stage_1",
+                "review_id": "review_send_stage_1",
+                "review_status": "approved",
+                "trace_id": "trace_send_stage_1",
+                "idempotency_key": "idem_send_stage_1",
+                "to_email": "prospect@example.com",
+                "subject": "Hello",
+                "text_body": "Hello from Tenacious",
+                "metadata": {},
+            },
+            review={
+                "review_id": "review_send_stage_1",
+                "status": "approved",
+                "final_send_ok": True,
+            },
+        ),
+    )
+    send_env = asyncio.run(
+        runtime.outreach_send(
+            OutreachSendRequest(
+                lead_id=lead_id,
+                draft_id="draft_send_stage_1",
+                review_id="review_send_stage_1",
+                channel="email",
+                to_email="prospect@example.com",
+                idempotency_key="idem_send_stage_1",
+            )
+        )
+    )
+    assert send_env.status == "success"
+    assert send_env.data["delivery_status"] == "queued"
+    session = runtime._state_repo.get_session_state(lead_id=lead_id)
+    assert session is not None
+    assert session["current_stage"] == "awaiting_reply"
+    assert session["next_best_action"] == "wait_for_reply"
+    conversation = runtime._state_repo.get_conversation_state(lead_id=lead_id)
+    assert conversation is not None
+    assert conversation["current_stage"] == "waiting"
+    assert conversation["current_channel"] == "email"
+    assert conversation["last_outbound_message_id"] == "resend_msg_123"
+
+
+def test_respond_to_lead_sends_outbound_reply_and_waits_for_followup() -> None:
+    class _EmailServiceStub:
+        async def send_email(self, request):
+            del request
+            return ProviderSendResult(
+                provider="resend",
+                provider_message_id="reply_msg_123",
+                accepted=True,
+                raw_status="queued",
+                raw_response={"id": "reply_msg_123"},
+            )
+
+    runtime = _runtime(email_service=_EmailServiceStub())
+    lead_id = "lead_reply_send_1"
+    runtime._state_repo.upsert_session_state(
+        lead_id=lead_id,
+        payload={
+            "current_stage": "scheduling",
+            "next_best_action": "schedule",
+            "current_objective": "reply_handling",
+            "brief_refs": [],
+            "kb_refs": [],
+            "pending_actions": [{"action_type": "delegate_scheduler", "status": "pending"}],
+            "policy_flags": [],
+            "handoff_required": False,
+        },
+    )
+    runtime._state_repo.upsert_conversation_state(
+        lead_id=lead_id,
+        payload={
+            "current_stage": "inbound_received",
+            "current_channel": "email",
+            "last_inbound_message_id": "msg_in_1",
+            "last_customer_intent": "schedule",
+            "last_customer_sentiment": "neutral",
+            "qualification_status": "likely_qualified",
+            "pending_actions": [{"action_type": "delegate_scheduler", "status": "pending"}],
+            "policy_flags": [],
+            "scheduling_context": {"booking_status": "none", "timezone": None, "slots_proposed": []},
+        },
+    )
+    runtime._state_repo.upsert_inbound_email(
+        resend_email_id="recv_reply_send_1",
+        lead_id=lead_id,
+        from_email="prospect@example.com",
+        to_email=f"{lead_id}@chuairkoon.resend.app",
+        subject="Re: Intro",
+        text_body="Can you share more details?",
+        html_body=None,
+        headers={},
+        in_reply_to="<outbound@example.com>",
+        references="<outbound@example.com>",
+        received_at=datetime.now(UTC),
+    )
+    runtime._state_repo.ensure_email_thread(lead_id=lead_id)
+    runtime._state_repo.email_thread_record_inbound(
+        lead_id=lead_id,
+        inbound_rfc_message_id="<inbound-thread-anchor@example.com>",
+        prior_references_fragment="<outbound@example.com>",
+    )
+
+    env = asyncio.run(
+        runtime.respond_to_lead(
+            LeadRespondRequest(
+                idempotency_key="idem_respond_1",
+                lead_id=lead_id,
+                channel="email",
+                content="Thanks for the question. We can walk through this in 15 minutes.",
+            )
+        )
+    )
+    assert env.status == "success"
+    assert env.data["message_id"] == "reply_msg_123"
+    session = runtime._state_repo.get_session_state(lead_id=lead_id)
+    assert session is not None
+    assert session["current_stage"] == "awaiting_reply"
+    assert session["next_best_action"] == "wait_for_reply"
+    conversation = runtime._state_repo.get_conversation_state(lead_id=lead_id)
+    assert conversation is not None
+    assert conversation["current_stage"] == "waiting"
+    assert conversation["last_outbound_message_id"] == "reply_msg_123"
+    messages = runtime._state_repo.list_messages(lead_id=lead_id, limit=10)
+    assert any(m["message_id"] == "reply_msg_123" and m["direction"] == "outbound" for m in messages)

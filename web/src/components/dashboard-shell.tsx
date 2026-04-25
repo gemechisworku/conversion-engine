@@ -9,6 +9,8 @@ const nav = [
   { href: "/pipeline", label: "Pipeline" },
   { href: "/runs", label: "Pipeline Runs" },
   { href: "/outreachs", label: "Outreachs" },
+  { href: "/handoffs", label: "Handoffs" },
+  { href: "/control", label: "Control Tower" },
 ];
 
 export function DashboardShell({ children }: { children: React.ReactNode }) {

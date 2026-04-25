@@ -10,6 +10,15 @@
   --border: #cbd5e1;
   --primary: #2563eb;
   --primary-foreground: #ffffff;
+  --danger: #dc2626;
+  --danger-foreground: #ffffff;
+
+  --color-bg: var(--background);
+  --color-surface: var(--surface);
+  --color-text: var(--foreground);
+  --color-primary: var(--primary);
+  --color-border: var(--border);
+  --color-danger: var(--danger);
 }
 
 .dark {
@@ -20,6 +29,8 @@
   --border: #334155;
   --primary: #3b82f6;
   --primary-foreground: #ffffff;
+  --danger: #f87171;
+  --danger-foreground: #0f172a;
 }
 
 @theme inline {
@@ -30,6 +41,8 @@
   --color-border: var(--border);
   --color-primary: var(--primary);
   --color-primary-foreground: var(--primary-foreground);
+  --color-danger: var(--danger);
+  --color-danger-foreground: var(--danger-foreground);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }
@@ -38,4 +51,8 @@ body {
   background: var(--background);
   color: var(--foreground);
   font-family: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+}
+
+* {
+  scrollbar-color: color-mix(in oklab, var(--border), transparent 25%) transparent;
 }

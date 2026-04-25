@@ -29,6 +29,42 @@ export type LeadStatePayload = {
   updated_at?: string;
 };
 
+export type MessageLogItem = {
+  lead_id: string;
+  channel: string;
+  message_id: string;
+  direction: string;
+  content: string;
+  recorded_at: string;
+  metadata: Record<string, unknown>;
+};
+
+export type ConversationStatePayload = {
+  lead_id: string;
+  conversation_state_id: string;
+  current_stage: string;
+  current_channel: string;
+  last_inbound_message_id?: string | null;
+  last_outbound_message_id?: string | null;
+  last_customer_intent: string;
+  last_customer_sentiment: string;
+  qualification_status: string;
+  open_questions: Array<Record<string, unknown>>;
+  pending_actions: Array<Record<string, unknown>>;
+  objections: Array<Record<string, unknown>>;
+  scheduling_context: Record<string, unknown>;
+  policy_flags: string[];
+  updated_at: string;
+};
+
+export type LeadConversationPayload = {
+  lead_id: string;
+  session_state: Record<string, unknown>;
+  conversation_state: ConversationStatePayload | null;
+  messages: MessageLogItem[];
+  pipeline?: PipelineRun | null;
+};
+
 export type EvidenceEdge = {
   id: number;
   lead_id: string;
@@ -95,4 +131,25 @@ export type OutreachDetailPayload = {
   last_send_idempotency?: string | null;
   outbound?: Record<string, unknown>;
   review?: Record<string, unknown> | null;
+};
+
+export type HandoffQueueItem = {
+  lead_id: string;
+  current_stage: string;
+  handoff_required: boolean;
+  pending_actions: Array<Record<string, unknown>>;
+  policy_flags: string[];
+  updated_at: string;
+  company_id?: string | null;
+  company_name?: string | null;
+  company_domain?: string | null;
+  last_trace_id?: string | null;
+};
+
+export type LeadRespondPayload = {
+  lead_id: string;
+  message_id: string;
+  delivery_status: string;
+  state?: string;
+  next_action?: string;
 };

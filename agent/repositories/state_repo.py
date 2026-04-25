@@ -455,6 +455,36 @@ class SQLiteStateRepository:
             "created_at": row["created_at"],
         }
 
+    def get_latest_inbound_email_for_lead(self, *, lead_id: str) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT resend_email_id, lead_id, from_email, to_email, subject, text_body, html_body,
+                       headers_json, in_reply_to, references_header, received_at, created_at
+                FROM inbound_email_log
+                WHERE lead_id = ?
+                ORDER BY datetime(received_at) DESC, id DESC
+                LIMIT 1
+                """,
+                ((lead_id or "").strip(),),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "resend_email_id": row["resend_email_id"],
+            "lead_id": row["lead_id"],
+            "from_email": row["from_email"],
+            "to_email": row["to_email"],
+            "subject": row["subject"],
+            "text_body": row["text_body"],
+            "html_body": row["html_body"],
+            "headers": json.loads(row["headers_json"] or "{}"),
+            "in_reply_to": row["in_reply_to"],
+            "references": row["references_header"],
+            "received_at": row["received_at"],
+            "created_at": row["created_at"],
+        }
+
     def count_inbound_emails(self, *, resend_email_id: str | None = None, lead_id: str | None = None) -> int:
         clauses: list[str] = []
         params: list[Any] = []
@@ -803,6 +833,47 @@ class SQLiteStateRepository:
             }
             for row in rows
         ]
+
+    def list_handoff_queue(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    s.lead_id,
+                    s.current_stage,
+                    s.handoff_required,
+                    s.pending_actions,
+                    s.policy_flags,
+                    s.updated_at,
+                    p.company_id,
+                    p.company_name,
+                    p.company_domain,
+                    p.last_trace_id
+                FROM lead_session_state s
+                LEFT JOIN pipeline_runs p ON p.lead_id = s.lead_id
+                WHERE s.handoff_required = 1 OR s.current_stage = 'handoff_required'
+                ORDER BY datetime(s.updated_at) DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        queue: list[dict[str, Any]] = []
+        for row in rows:
+            queue.append(
+                {
+                    "lead_id": row["lead_id"],
+                    "current_stage": row["current_stage"],
+                    "handoff_required": bool(row["handoff_required"]),
+                    "pending_actions": json.loads(row["pending_actions"] or "[]"),
+                    "policy_flags": json.loads(row["policy_flags"] or "[]"),
+                    "updated_at": row["updated_at"],
+                    "company_id": row["company_id"],
+                    "company_name": row["company_name"],
+                    "company_domain": row["company_domain"],
+                    "last_trace_id": row["last_trace_id"],
+                }
+            )
+        return queue
 
     def get_pipeline_run(self, *, lead_id: str) -> dict[str, Any] | None:
         with self._conn() as conn:

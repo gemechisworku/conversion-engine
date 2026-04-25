@@ -16,6 +16,7 @@ from agent.services.orchestration.schemas import (
     LeadCompactRequest,
     LeadEscalationRequest,
     LeadProcessRequest,
+    LeadRespondRequest,
     LeadRehydrateRequest,
     LeadReplyRequest,
     MemorySessionWriteRequest,
@@ -66,6 +67,11 @@ def create_orchestration_app() -> FastAPI:
         env = await request.app.state.runtime.handle_reply(req)
         return JSONResponse(env.model_dump(mode="json"))
 
+    @app.post("/lead/respond", tags=["leads"])
+    async def post_lead_respond(req: LeadRespondRequest, request: Request) -> JSONResponse:
+        env = await request.app.state.runtime.respond_to_lead(req)
+        return JSONResponse(env.model_dump(mode="json"))
+
     @app.post(settings.webhook_route_resend, tags=["leads"])
     async def post_resend_webhook(request: Request) -> JSONResponse:
         raw_body = await request.body()
@@ -97,6 +103,24 @@ def create_orchestration_app() -> FastAPI:
         env = request.app.state.runtime.get_lead_briefs(lead_id=lead_id)
         return JSONResponse(env.model_dump(mode="json"))
 
+    @app.get("/lead/{lead_id}/messages", tags=["leads"])
+    async def get_lead_messages(
+        lead_id: str,
+        request: Request,
+        limit: Annotated[int, Query(ge=1, le=500, description="Max message rows (newest first)")] = 200,
+    ) -> JSONResponse:
+        env = request.app.state.runtime.get_lead_messages(lead_id=lead_id, limit=limit)
+        return JSONResponse(env.model_dump(mode="json"))
+
+    @app.get("/lead/{lead_id}/conversation", tags=["leads"])
+    async def get_lead_conversation(
+        lead_id: str,
+        request: Request,
+        limit: Annotated[int, Query(ge=1, le=500, description="Max message rows (newest first)")] = 200,
+    ) -> JSONResponse:
+        env = request.app.state.runtime.get_lead_conversation(lead_id=lead_id, limit=limit)
+        return JSONResponse(env.model_dump(mode="json"))
+
     @app.get("/pipelines", tags=["pipelines"])
     async def get_pipelines(
         request: Request,
@@ -113,6 +137,14 @@ def create_orchestration_app() -> FastAPI:
     @app.delete("/pipelines/{lead_id}", tags=["pipelines"])
     async def delete_pipeline(lead_id: str, request: Request) -> JSONResponse:
         env = request.app.state.runtime.delete_pipeline(lead_id=lead_id)
+        return JSONResponse(env.model_dump(mode="json"))
+
+    @app.get("/handoffs", tags=["pipelines"])
+    async def get_handoffs(
+        request: Request,
+        limit: Annotated[int, Query(ge=1, le=500, description="Max handoff rows (newest first)")] = 200,
+    ) -> JSONResponse:
+        env = request.app.state.runtime.list_handoffs(limit=limit)
         return JSONResponse(env.model_dump(mode="json"))
 
     @app.post("/lead/escalate", tags=["leads"])
