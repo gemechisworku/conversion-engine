@@ -46,6 +46,7 @@ def test_send_email_success_returns_normalized_result() -> None:
         payload = await request.aread()
         assert b"Quick intro" in payload
         assert b"X-Tenacious-Status" in payload
+        assert b"lead_123@chuairkoon.resend.app" in payload
         return httpx.Response(202, json={"id": "re_msg_123"})
 
     http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -158,6 +159,7 @@ def test_send_email_includes_threading_headers_when_set() -> None:
     asyncio.run(http_client.aclose())
 
     assert result.accepted is True
+    assert captured["json"]["reply_to"] == "lead_123@chuairkoon.resend.app"
     hdr = captured["json"]["headers"]
     assert hdr["In-Reply-To"] == "<inbound-msg@example.com>"
     assert "<a@b>" in hdr["References"]

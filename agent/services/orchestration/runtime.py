@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from datetime import UTC, datetime
 from typing import Any
@@ -18,6 +19,7 @@ from agent.services.common.schemas import ErrorEnvelope
 from agent.services.crm.hubspot_mcp import HubSpotMCPService
 from agent.services.conversation.email_llm import InboundEmailInterpretLLM
 from agent.services.email.client import EmailService
+from agent.services.email.reply_address import build_lead_reply_address, extract_lead_id_from_reply_address
 from agent.services.email.rfc_ids import merge_references_header, normalize_message_id
 from agent.services.email.schemas import OutboundEmailRequest
 from agent.services.enrichment.schemas import EnrichmentArtifact
@@ -39,6 +41,9 @@ from agent.services.orchestration.schemas import (
 from agent.services.outreach.outreach_flow import OutreachFlowDeps, run_outreach_draft_only, run_outreach_review_for_lead, run_outreach_send_for_lead
 from agent.services.outreach.outreach_payload import parse_outreach_stored
 from agent.services.policy.outbound_policy import OutboundPolicyService
+
+WEBHOOK_LOGGER = logging.getLogger("agent.webhooks.resend")
+
 
 class OrchestrationRuntime:
     # Implements: FR-9, FR-11, FR-12, FR-14, FR-15
@@ -530,6 +535,379 @@ class OrchestrationRuntime:
                 retryable=False,
             )
 
+    async def handle_email_webhook(
+        self,
+        *,
+        payload: dict[str, Any],
+        headers: dict[str, str] | None,
+        raw_body: bytes | str | None = None,
+    ) -> ResponseEnvelope:
+        request_id = f"req_{uuid4().hex[:10]}"
+        trace_id = f"trace_webhook_{uuid4().hex[:12]}"
+        if self._email_service is None:
+            return self._failure(
+                request_id=request_id,
+                trace_id=trace_id,
+                code="CONFIG_ERROR",
+                message="EmailService not configured.",
+                retryable=False,
+            )
+
+        raw_type = str(payload.get("type") or payload.get("event") or payload.get("event_type") or "").strip().lower()
+        if raw_type != "email.received":
+            return ResponseEnvelope(
+                request_id=request_id,
+                trace_id=trace_id,
+                status="accepted",
+                data={"event_type": raw_type or "unknown", "processed": False, "ignored": True},
+            )
+
+        WEBHOOK_LOGGER.info(
+            "resend_email_received_webhook trace_id=%s raw_payload=%s",
+            trace_id,
+            self._serialize_for_log(payload),
+        )
+
+        event = await self._email_service.handle_webhook(payload=payload, headers=headers, raw_body=raw_body)
+        WEBHOOK_LOGGER.info(
+            "resend_email_received_normalized_event trace_id=%s event=%s",
+            trace_id,
+            self._serialize_for_log(event.model_dump(mode="json")),
+        )
+        if event.error is not None:
+            log_processing_step(
+                component="orchestration",
+                step="handle_email_webhook.rejected",
+                message="Inbound email.received webhook failed validation",
+                trace_id=trace_id,
+                payload_ref=event.raw_payload_ref,
+                error_code=event.error.error_code,
+                error_message=event.error.error_message,
+                level=logging.WARNING,
+            )
+            return ResponseEnvelope(
+                request_id=request_id,
+                trace_id=trace_id,
+                status="accepted",
+                data={
+                    "event_type": raw_type,
+                    "processed": False,
+                    "reason": event.error.error_code,
+                    "raw_payload_ref": event.raw_payload_ref,
+                },
+            )
+
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        email_id = str(data.get("email_id") or event.provider_message_id or "").strip()
+        if not email_id:
+            log_processing_step(
+                component="orchestration",
+                step="handle_email_webhook.missing_email_id",
+                message="Inbound email.received payload missing data.email_id",
+                trace_id=trace_id,
+                payload_ref=event.raw_payload_ref,
+                level=logging.WARNING,
+            )
+            return ResponseEnvelope(
+                request_id=request_id,
+                trace_id=trace_id,
+                status="accepted",
+                data={"event_type": raw_type, "processed": False, "reason": "missing_email_id"},
+            )
+
+        hydrated_raw = await self._hydrate_received_email(email_id=email_id)
+        hydrated = self._extract_received_email_data(hydrated_raw) if isinstance(hydrated_raw, dict) else None
+        if hydrated is None:
+            log_processing_step(
+                component="orchestration",
+                step="handle_email_webhook.fetch_failed",
+                message="Failed to fetch received email from Resend",
+                trace_id=trace_id,
+                resend_email_id=email_id,
+                level=logging.WARNING,
+            )
+            return ResponseEnvelope(
+                request_id=request_id,
+                trace_id=trace_id,
+                status="accepted",
+                data={
+                    "event_type": raw_type,
+                    "processed": False,
+                    "reason": "received_email_fetch_failed",
+                    "resend_email_id": email_id,
+                },
+            )
+        WEBHOOK_LOGGER.info(
+            "resend_received_email_payload trace_id=%s resend_email_id=%s payload=%s",
+            trace_id,
+            email_id,
+            self._serialize_for_log(hydrated_raw),
+        )
+
+        to_address = self._first_email_address(hydrated.get("to"))
+        if not to_address or "@" not in to_address:
+            log_processing_step(
+                component="orchestration",
+                step="handle_email_webhook.invalid_to",
+                message="Fetched received email has malformed or missing recipient",
+                trace_id=trace_id,
+                resend_email_id=email_id,
+                level=logging.WARNING,
+            )
+            return ResponseEnvelope(
+                request_id=request_id,
+                trace_id=trace_id,
+                status="accepted",
+                data={
+                    "event_type": raw_type,
+                    "processed": False,
+                    "reason": "invalid_to_address",
+                    "resend_email_id": email_id,
+                },
+            )
+
+        headers_map = self._normalize_received_headers(hydrated.get("headers"))
+        in_reply_to = (
+            self._coerce_str(hydrated.get("in_reply_to"))
+            or self._coerce_str(hydrated.get("inReplyTo"))
+            or headers_map.get("in-reply-to")
+        )
+        references = self._coerce_str(hydrated.get("references")) or headers_map.get("references")
+        lead_id = extract_lead_id_from_reply_address(
+            to_address,
+            domain=self._settings.resend_reply_domain,
+        )
+        if not lead_id:
+            lead_id = self._state_repo.find_lead_id_by_email_headers(
+                in_reply_to=in_reply_to,
+                references=references,
+            )
+        if not lead_id:
+            log_processing_step(
+                component="orchestration",
+                step="handle_email_webhook.unmatched",
+                message="Inbound reply could not be matched to a lead",
+                trace_id=trace_id,
+                payload_ref=event.raw_payload_ref,
+                to_email=to_address,
+                resend_email_id=email_id,
+                level=logging.WARNING,
+            )
+            return ResponseEnvelope(
+                request_id=request_id,
+                trace_id=trace_id,
+                status="accepted",
+                data={
+                    "event_type": raw_type,
+                    "matched": False,
+                    "processed": False,
+                    "raw_payload_ref": event.raw_payload_ref,
+                    "resend_email_id": email_id,
+                },
+            )
+
+        session = self._state_repo.get_session_state(lead_id=lead_id)
+        if session is None:
+            log_processing_step(
+                component="orchestration",
+                step="handle_email_webhook.unknown_lead",
+                message="Resolved lead_id is not present in local state",
+                trace_id=trace_id,
+                lead_id=lead_id,
+                resend_email_id=email_id,
+                level=logging.WARNING,
+            )
+            return ResponseEnvelope(
+                request_id=request_id,
+                trace_id=trace_id,
+                status="accepted",
+                data={
+                    "event_type": raw_type,
+                    "matched": False,
+                    "processed": False,
+                    "reason": "unknown_lead",
+                    "lead_id": lead_id,
+                    "resend_email_id": email_id,
+                },
+            )
+
+        from_address = self._first_email_address(hydrated.get("from")) or event.from_email
+        subject = self._coerce_str(hydrated.get("subject")) or event.subject
+        text_body = self._coerce_str(hydrated.get("text")) or event.text_body
+        html_body = self._coerce_str(hydrated.get("html")) or event.html_body
+        rfc_message_id = normalize_message_id(self._coerce_str(hydrated.get("message_id")) or event.rfc_message_id)
+        received_at = self._coerce_datetime(hydrated.get("received_at") or hydrated.get("created_at")) or event.received_at
+        normalized_inbound_payload = {
+            "leadId": lead_id,
+            "from": from_address,
+            "to": to_address,
+            "subject": subject,
+            "text": text_body,
+            "html": html_body,
+            "headers": headers_map,
+            "resendEmailId": email_id,
+            "inReplyTo": in_reply_to,
+            "references": references,
+            "receivedAt": received_at.isoformat(),
+        }
+        WEBHOOK_LOGGER.info(
+            "resend_normalized_inbound_email trace_id=%s resend_email_id=%s payload=%s",
+            trace_id,
+            email_id,
+            self._serialize_for_log(normalized_inbound_payload),
+        )
+        inserted = self._state_repo.upsert_inbound_email(
+            resend_email_id=email_id,
+            lead_id=lead_id,
+            from_email=from_address,
+            to_email=to_address,
+            subject=subject,
+            text_body=text_body,
+            html_body=html_body,
+            headers=headers_map,
+            in_reply_to=in_reply_to,
+            references=references,
+            received_at=received_at,
+        )
+        if not inserted:
+            log_processing_step(
+                component="orchestration",
+                step="handle_email_webhook.duplicate",
+                message="Duplicate inbound email webhook ignored by idempotent store",
+                trace_id=trace_id,
+                lead_id=lead_id,
+                resend_email_id=email_id,
+            )
+            existing = self._state_repo.get_inbound_email(resend_email_id=email_id)
+            WEBHOOK_LOGGER.info(
+                "resend_inbound_duplicate trace_id=%s resend_email_id=%s existing_payload=%s",
+                trace_id,
+                email_id,
+                self._serialize_for_log(existing),
+            )
+            return ResponseEnvelope(
+                request_id=request_id,
+                trace_id=trace_id,
+                status="accepted",
+                data={
+                    "event_type": raw_type,
+                    "processed": False,
+                    "duplicate": True,
+                    "lead_id": lead_id,
+                    "resend_email_id": email_id,
+                },
+            )
+
+        content = (text_body or html_body or "").strip()
+        reply_request = LeadReplyRequest(
+            idempotency_key=f"webhook:resend:{email_id}",
+            lead_id=lead_id,
+            channel="email",
+            message_id=email_id,
+            content=content or "(empty inbound email)",
+            subject=subject,
+            rfc_message_id=rfc_message_id,
+            references_for_thread=references,
+            from_email=from_address,
+            received_at=received_at,
+        )
+        WEBHOOK_LOGGER.info(
+            "resend_inbound_reply_request trace_id=%s resend_email_id=%s payload=%s",
+            trace_id,
+            email_id,
+            self._serialize_for_log(reply_request.model_dump(mode="json")),
+        )
+        reply_env = await self.handle_reply(reply_request)
+        WEBHOOK_LOGGER.info(
+            "resend_inbound_reply_result trace_id=%s resend_email_id=%s response=%s",
+            trace_id,
+            email_id,
+            self._serialize_for_log(reply_env.model_dump(mode="json")),
+        )
+        return reply_env
+
+    async def _hydrate_received_email(
+        self,
+        *,
+        email_id: str,
+    ) -> dict[str, Any] | None:
+        if self._email_service is None:
+            return None
+        clean_id = (email_id or "").strip()
+        if not clean_id:
+            return None
+        try:
+            received = await self._email_service.get_received_email(email_id=clean_id)
+        except Exception:
+            return None
+        return received if isinstance(received, dict) else None
+
+    @staticmethod
+    def _extract_received_email_data(payload: dict[str, Any]) -> dict[str, Any]:
+        data = payload.get("data")
+        if isinstance(data, dict):
+            return data
+        return payload
+
+    @staticmethod
+    def _normalize_received_headers(raw_headers: Any) -> dict[str, str]:
+        normalized: dict[str, str] = {}
+        if isinstance(raw_headers, dict):
+            for key, value in raw_headers.items():
+                if key is None or value is None:
+                    continue
+                normalized[str(key).strip().lower()] = str(value).strip()
+            return normalized
+        if isinstance(raw_headers, list):
+            for item in raw_headers:
+                if not isinstance(item, dict):
+                    continue
+                key = item.get("name") or item.get("key")
+                value = item.get("value")
+                if key is None or value is None:
+                    continue
+                normalized[str(key).strip().lower()] = str(value).strip()
+        return normalized
+
+    @staticmethod
+    def _first_email_address(raw_value: Any) -> str | None:
+        values = raw_value if isinstance(raw_value, list) else [raw_value]
+        for value in values:
+            if isinstance(value, dict):
+                value = value.get("email") or value.get("address") or value.get("value")
+            text = OrchestrationRuntime._coerce_str(value)
+            if text:
+                return text
+        return None
+
+    @staticmethod
+    def _coerce_str(value: Any) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    @staticmethod
+    def _coerce_datetime(value: Any) -> datetime | None:
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                return datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _serialize_for_log(payload: Any) -> str:
+        try:
+            return json.dumps(payload, ensure_ascii=False, default=str)
+        except Exception:
+            return str(payload)
+
     async def _run_act2_enrichment_before_reply(
         self,
         *,
@@ -793,6 +1171,66 @@ class OrchestrationRuntime:
             trace_id=trace_id,
             status="success",
             data={"message_id": msg_id, "delivery_status": delivery},
+        )
+
+    def list_outreachs(self, *, limit: int = 200) -> ResponseEnvelope:
+        request_id = f"req_{uuid4().hex[:10]}"
+        trace_id = f"trace_outreachs_{uuid4().hex[:12]}"
+        rows = self._state_repo.list_outreach_drafts(limit=limit)
+        payload: list[dict[str, Any]] = []
+        for row in rows:
+            outbound, review = parse_outreach_stored(row["draft"])
+            payload.append(
+                {
+                    "lead_id": row["lead_id"],
+                    "company_id": row.get("company_id"),
+                    "company_name": row.get("company_name"),
+                    "company_domain": row.get("company_domain"),
+                    "updated_at": row["updated_at"],
+                    "last_send_idempotency": row.get("last_send_idempotency"),
+                    "draft_id": outbound.get("draft_id"),
+                    "subject": outbound.get("subject"),
+                    "to_email": outbound.get("to_email"),
+                    "review_status": outbound.get("review_status"),
+                    "review_id": review.get("review_id") if isinstance(review, dict) else None,
+                    "final_send_ok": review.get("final_send_ok") if isinstance(review, dict) else None,
+                }
+            )
+        return ResponseEnvelope(
+            request_id=request_id,
+            trace_id=trace_id,
+            status="success",
+            data={"outreachs": payload},
+        )
+
+    def get_outreach(self, *, lead_id: str) -> ResponseEnvelope:
+        request_id = f"req_{uuid4().hex[:10]}"
+        trace_id = f"trace_outreach_{uuid4().hex[:12]}"
+        row = self._state_repo.get_outreach_draft(lead_id=lead_id)
+        if row is None:
+            return self._failure(
+                request_id=request_id,
+                trace_id=trace_id,
+                code="NOT_FOUND",
+                message=f"No outreach draft for lead_id '{lead_id}'.",
+                retryable=False,
+            )
+        outbound, review = parse_outreach_stored(row["draft"])
+        run = self._state_repo.get_pipeline_run(lead_id=lead_id) or {}
+        return ResponseEnvelope(
+            request_id=request_id,
+            trace_id=trace_id,
+            status="success",
+            data={
+                "lead_id": lead_id,
+                "company_id": run.get("company_id"),
+                "company_name": run.get("company_name"),
+                "company_domain": run.get("company_domain"),
+                "updated_at": row.get("updated_at"),
+                "last_send_idempotency": row.get("last_send_idempotency"),
+                "outbound": outbound,
+                "review": review,
+            },
         )
 
     async def memory_session_write(self, request: MemorySessionWriteRequest) -> ResponseEnvelope:
@@ -1147,6 +1585,10 @@ class OrchestrationRuntime:
             lead_id=request.lead_id, idempotency_key=request.idempotency_key
         )
         meta = req.metadata or {}
+        reply_to_address = str(meta.get("reply_to_address") or "").strip() or build_lead_reply_address(
+            lead_id=request.lead_id,
+            domain=self._settings.resend_reply_domain,
+        )
         self._state_repo.append_message(
             lead_id=request.lead_id,
             channel="email",
@@ -1159,6 +1601,8 @@ class OrchestrationRuntime:
                 "resend_message_id": res.provider_message_id,
                 "draft_id": req.draft_id,
                 "email_thread_id": meta.get("email_thread_id"),
+                "reply_to_address": reply_to_address,
+                "resend_raw_response": res.raw_response or {},
             },
         )
         return None

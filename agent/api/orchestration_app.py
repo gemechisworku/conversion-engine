@@ -47,6 +47,7 @@ def create_orchestration_app() -> FastAPI:
             {"name": "leads", "description": "Lead intake, state, replies, escalation, compaction."},
             {"name": "pipelines", "description": "Frontend pipeline runs list and cleanup controls."},
             {"name": "outreach", "description": "Draft, review, send."},
+            {"name": "outreachs", "description": "List and inspect persisted outreach records."},
             {"name": "memory", "description": "Session, evidence edges, memory compaction."},
         ],
     )
@@ -63,6 +64,22 @@ def create_orchestration_app() -> FastAPI:
     @app.post("/lead/reply", tags=["leads"])
     async def post_lead_reply(req: LeadReplyRequest, request: Request) -> JSONResponse:
         env = await request.app.state.runtime.handle_reply(req)
+        return JSONResponse(env.model_dump(mode="json"))
+
+    @app.post(settings.webhook_route_resend, tags=["leads"])
+    async def post_resend_webhook(request: Request) -> JSONResponse:
+        raw_body = await request.body()
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                payload = {"payload": payload}
+        except Exception:
+            payload = {}
+        env = await request.app.state.runtime.handle_email_webhook(
+            payload=payload,
+            headers=dict(request.headers),
+            raw_body=raw_body,
+        )
         return JSONResponse(env.model_dump(mode="json"))
 
     @app.post("/lead/advance", tags=["leads"])
@@ -126,6 +143,19 @@ def create_orchestration_app() -> FastAPI:
     @app.post("/outreach/send", tags=["outreach"])
     async def post_outreach_send(req: OutreachSendRequest, request: Request) -> JSONResponse:
         env = await request.app.state.runtime.outreach_send(req)
+        return JSONResponse(env.model_dump(mode="json"))
+
+    @app.get("/outreachs", tags=["outreachs"])
+    async def get_outreachs(
+        request: Request,
+        limit: Annotated[int, Query(ge=1, le=500, description="Max outreach rows (newest first)")] = 200,
+    ) -> JSONResponse:
+        env = request.app.state.runtime.list_outreachs(limit=limit)
+        return JSONResponse(env.model_dump(mode="json"))
+
+    @app.get("/outreachs/{lead_id}", tags=["outreachs"])
+    async def get_outreach(lead_id: str, request: Request) -> JSONResponse:
+        env = request.app.state.runtime.get_outreach(lead_id=lead_id)
         return JSONResponse(env.model_dump(mode="json"))
 
     @app.post("/memory/session/write", tags=["memory"])

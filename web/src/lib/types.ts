@@ -70,3 +70,29 @@ export type LeadBriefsPayload = {
     updated_at?: string;
   };
 };
+
+export type OutreachListItem = {
+  lead_id: string;
+  company_id?: string | null;
+  company_name?: string | null;
+  company_domain?: string | null;
+  updated_at: string;
+  last_send_idempotency?: string | null;
+  draft_id?: string | null;
+  subject?: string | null;
+  to_email?: string | null;
+  review_status?: string | null;
+  review_id?: string | null;
+  final_send_ok?: boolean | null;
+};
+
+export type OutreachDetailPayload = {
+  lead_id: string;
+  company_id?: string | null;
+  company_name?: string | null;
+  company_domain?: string | null;
+  updated_at?: string | null;
+  last_send_idempotency?: string | null;
+  outbound?: Record<string, unknown>;
+  review?: Record<string, unknown> | null;
+};

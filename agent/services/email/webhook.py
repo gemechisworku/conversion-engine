@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import base64
 from datetime import UTC, datetime
 from typing import Any
 
@@ -49,12 +50,6 @@ class ResendWebhookParser:
             )
             rfc_message_id, in_reply_to, references = self._extract_threading_fields(payload)
 
-            if event_type == "reply":
-                if not from_email or not to_email or (not text_body and not html_body):
-                    return self._malformed_event(
-                        payload=payload,
-                        message="Reply webhook payload is missing required fields.",
-                    )
             return InboundEmailEvent(
                 event_type=event_type,
                 provider_message_id=provider_message_id,
@@ -90,6 +85,9 @@ class ResendWebhookParser:
         if not self._settings.resend_webhook_secret:
             return True
 
+        if self._has_svix_headers(headers):
+            return self._validate_svix_signature(headers=headers, raw_body=raw_body, payload=payload)
+
         signature_header = self._settings.resend_webhook_signature_header.lower()
         provided_signature = headers.get(signature_header, "")
         if not provided_signature:
@@ -108,6 +106,44 @@ class ResendWebhookParser:
             hashlib.sha256,
         ).hexdigest()
         return hmac.compare_digest(computed, provided_signature)
+
+    @staticmethod
+    def _has_svix_headers(headers: dict[str, str]) -> bool:
+        return bool(headers.get("svix-id") and headers.get("svix-timestamp") and headers.get("svix-signature"))
+
+    def _validate_svix_signature(
+        self,
+        *,
+        headers: dict[str, str],
+        raw_body: bytes | str | None,
+        payload: dict[str, Any],
+    ) -> bool:
+        secret = (self._settings.resend_webhook_secret or "").strip()
+        if secret.startswith("whsec_"):
+            secret = secret[len("whsec_") :]
+        try:
+            key = base64.b64decode(secret)
+        except Exception:
+            return False
+        svix_id = headers.get("svix-id", "")
+        svix_timestamp = headers.get("svix-timestamp", "")
+        svix_signature = headers.get("svix-signature", "")
+        if isinstance(raw_body, bytes):
+            body = raw_body.decode("utf-8")
+        elif isinstance(raw_body, str):
+            body = raw_body
+        else:
+            body = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        signed_content = f"{svix_id}.{svix_timestamp}.{body}".encode("utf-8")
+        expected = base64.b64encode(hmac.new(key, signed_content, hashlib.sha256).digest()).decode("utf-8")
+        candidates = []
+        for chunk in svix_signature.split():
+            if "," not in chunk:
+                continue
+            version, sig = chunk.split(",", 1)
+            if version.strip() == "v1":
+                candidates.append(sig.strip())
+        return any(hmac.compare_digest(expected, candidate) for candidate in candidates)
 
     def _extract_event_type(self, payload: dict[str, Any]) -> str | None:
         event_type = payload.get("type") or payload.get("event") or payload.get("event_type")

@@ -8,6 +8,7 @@ from typing import Any
 from agent.config.settings import Settings
 from agent.repositories.state_repo import SQLiteStateRepository
 from agent.services.email.client import EmailService
+from agent.services.email.reply_address import build_lead_reply_address
 from agent.services.email.schemas import OutboundEmailRequest
 from agent.services.enrichment.llm import OpenRouterJSONClient
 from agent.services.observability.langfuse_llm import langfuse_workflow_span
@@ -209,6 +210,10 @@ async def run_outreach_send_for_lead(
         deps.state_repo.mark_outreach_sent_idempotency(lead_id=lead_id, idempotency_key=idempotency_key)
         mid = res.provider_message_id or f"queued_{idempotency_key[:12]}"
         meta = req.metadata or {}
+        reply_to_address = str(meta.get("reply_to_address") or "").strip() or build_lead_reply_address(
+            lead_id=lead_id,
+            domain=deps.settings.resend_reply_domain,
+        )
         deps.state_repo.append_message(
             lead_id=lead_id,
             channel="email",
@@ -222,6 +227,8 @@ async def run_outreach_send_for_lead(
                 "draft_id": req.draft_id,
                 "review_id": review_id,
                 "email_thread_id": meta.get("email_thread_id"),
+                "reply_to_address": reply_to_address,
+                "resend_raw_response": res.raw_response or {},
             },
         )
         return mid, None

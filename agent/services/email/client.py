@@ -9,6 +9,7 @@ import httpx
 
 from agent.config.settings import Settings
 from agent.services.common.schemas import ErrorEnvelope, ProviderSendResult
+from agent.services.email.reply_address import build_lead_reply_address
 from agent.services.email.rfc_ids import merge_references_header, normalize_message_id
 from agent.services.email.router import EmailEventRouter
 from agent.services.email.schemas import InboundEmailEvent, OutboundEmailRequest
@@ -40,6 +41,10 @@ class ResendEmailClient:
     async def send_email(self, request: OutboundEmailRequest) -> ProviderSendResult:
         self._settings.require("resend_api_key")
         metadata = request.metadata or {}
+        reply_to_address = str(metadata.get("reply_to_address") or "").strip() or build_lead_reply_address(
+            lead_id=request.lead_id,
+            domain=self._settings.resend_reply_domain,
+        )
         policy_decisions = self._policy_service.check_email_send(
             trace_id=request.trace_id,
             lead_id=request.lead_id,
@@ -110,6 +115,7 @@ class ResendEmailClient:
         payload: dict[str, Any] = {
             "from": request.from_email or self._settings.resend_from_email,
             "to": [request.to_email],
+            "reply_to": reply_to_address,
             "subject": request.subject,
             "headers": resend_headers,
         }
@@ -146,12 +152,17 @@ class ResendEmailClient:
                 raw_response = self._safe_json(response)
                 if response.is_success:
                     provider_message_id = str(raw_response.get("id", "")).strip() or None
+                    response_meta = {
+                        **raw_response,
+                        "reply_to": reply_to_address,
+                        "from_email": payload["from"],
+                    }
                     result = ProviderSendResult(
                         provider="resend",
                         provider_message_id=provider_message_id,
                         accepted=True,
                         raw_status="queued",
-                        raw_response=raw_response,
+                        raw_response=response_meta,
                     )
                     log_trace_event(
                         event_type="email_send_succeeded",
@@ -204,6 +215,24 @@ class ResendEmailClient:
                     message=str(exc) or "Resend request failed.",
                 )
 
+    async def get_received_email(self, *, email_id: str) -> dict[str, Any] | None:
+        self._settings.require("resend_api_key")
+        clean_id = (email_id or "").strip()
+        if not clean_id:
+            return None
+        headers = {
+            "Authorization": f"Bearer {self._settings.resend_api_key}",
+        }
+        url = f"{self._settings.resend_api_url.rstrip('/')}/emails/receiving/{clean_id}"
+        try:
+            response = await self._get(url=url, headers=headers)
+        except httpx.HTTPError:
+            return None
+        if not response.is_success:
+            return None
+        payload = self._safe_json(response)
+        return payload if payload else None
+
     async def _post(
         self,
         *,
@@ -215,6 +244,17 @@ class ResendEmailClient:
             return await self._http_client.post(url, headers=headers, json=json)
         async with httpx.AsyncClient(timeout=self._settings.http_timeout_seconds) as client:
             return await client.post(url, headers=headers, json=json)
+
+    async def _get(
+        self,
+        *,
+        url: str,
+        headers: dict[str, str],
+    ) -> httpx.Response:
+        if self._http_client is not None:
+            return await self._http_client.get(url, headers=headers)
+        async with httpx.AsyncClient(timeout=self._settings.http_timeout_seconds) as client:
+            return await client.get(url, headers=headers)
 
     def _transport_error(
         self,
@@ -274,6 +314,9 @@ class EmailService:
 
     async def send_email(self, request: OutboundEmailRequest) -> ProviderSendResult:
         return await self._client.send_email(request)
+
+    async def get_received_email(self, *, email_id: str) -> dict[str, Any] | None:
+        return await self._client.get_received_email(email_id=email_id)
 
     async def handle_webhook(
         self,

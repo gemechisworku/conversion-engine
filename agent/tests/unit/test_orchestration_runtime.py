@@ -19,6 +19,7 @@ from agent.services.enrichment.merger import EnrichmentPipeline
 from agent.services.enrichment.news_playwright import PublicNewsPlaywrightRetriever
 from agent.services.orchestration.runtime import OrchestrationRuntime
 from agent.services.orchestration.schemas import LeadAdvanceRequest, LeadProcessRequest, LeadReplyRequest
+from agent.services.email.schemas import InboundEmailEvent
 
 
 FIXTURE_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "enrichment"
@@ -36,7 +37,7 @@ def _settings() -> Settings:
     )
 
 
-def _runtime() -> OrchestrationRuntime:
+def _runtime(*, email_service=None) -> OrchestrationRuntime:
     settings = _settings()
     repo = SQLiteStateRepository(db_path=settings.state_db_path)
     async def handler(_: httpx.Request) -> httpx.Response:
@@ -67,6 +68,7 @@ def _runtime() -> OrchestrationRuntime:
         state_repo=repo,
         enrichment_services=services,
         hubspot_service=None,
+        email_service=email_service,
     )
 
 
@@ -162,3 +164,348 @@ def test_invalid_advance_transition_rejected() -> None:
     assert result.status == "failure"
     assert result.error is not None
     assert result.error.error_code == "INVALID_STATE_TRANSITION"
+
+
+def _set_awaiting_reply(runtime: OrchestrationRuntime, *, lead_id: str) -> None:
+    session = runtime._state_repo.get_session_state(lead_id=lead_id) or {}
+    runtime._state_repo.upsert_session_state(
+        lead_id=lead_id,
+        payload={**session, "current_stage": "awaiting_reply"},
+    )
+
+
+def test_handle_email_webhook_routes_reply_to_correct_lead() -> None:
+    class _EmailServiceStub:
+        async def handle_webhook(self, *, payload, headers, raw_body=None):
+            del headers, raw_body
+            data = payload["data"]
+            return InboundEmailEvent(
+                event_type="reply",
+                provider_message_id=str(data["email_id"]),
+                from_email=str(data["from"]),
+                to_email=str(data["to"][0]),
+                subject=str(data["subject"]),
+                text_body=str(data["text"]),
+                rfc_message_id=str(data["message_id"]),
+                references=str(data["references"]),
+                raw_payload_ref="abc123def4567890",
+                raw_payload=payload,
+            )
+
+        async def get_received_email(self, *, email_id: str):
+            assert email_id == "recv_555"
+            return {
+                "id": email_id,
+                "from": "prospect@example.com",
+                "to": [f"{lead_id}@chuairkoon.resend.app"],
+                "subject": "Re: Intro",
+                "text": "Can you share available times next week?",
+                "html": "<p>Can you share available times next week?</p>",
+                "message_id": "<inbound-555@example.com>",
+                "headers": {"In-Reply-To": "<outbound@example.com>", "References": "<outbound@example.com>"},
+                "received_at": "2026-04-24T21:44:51Z",
+            }
+
+    runtime = _runtime(email_service=_EmailServiceStub())
+    processed = asyncio.run(
+        runtime.process_lead(
+            LeadProcessRequest(
+                idempotency_key="idem_webhook_1",
+                company_id="comp_webhook_1",
+                metadata={"company_name": "Acme AI", "company_domain": "acme.ai"},
+            )
+        )
+    )
+    lead_id = processed.data["lead_id"]
+    _set_awaiting_reply(runtime, lead_id=lead_id)
+
+    payload = {
+        "type": "email.received",
+        "data": {
+            "id": "re_555",
+            "email_id": "recv_555",
+            "message_id": "<inbound-555@example.com>",
+            "from": "prospect@example.com",
+            "to": [f"{lead_id}@chuairkoon.resend.app"],
+            "subject": "Re: Intro",
+            "text": "Can you share available times next week?",
+            "references": "<outbound@example.com>",
+        },
+    }
+    env = asyncio.run(runtime.handle_email_webhook(payload=payload, headers={}))
+    assert env.status == "accepted"
+    assert env.data["lead_id"] == lead_id
+    assert env.data["state"] == "reply_received"
+    assert env.data["next_action"] == "schedule"
+    stored = runtime._state_repo.get_inbound_email(resend_email_id="recv_555")
+    assert stored is not None
+    assert stored["lead_id"] == lead_id
+    assert stored["to_email"] == f"{lead_id}@chuairkoon.resend.app"
+
+
+def test_handle_email_webhook_hydrates_content_from_received_email_api() -> None:
+    class _EmailServiceStub:
+        async def handle_webhook(self, *, payload, headers, raw_body=None):
+            del headers, raw_body
+            data = payload["data"]
+            return InboundEmailEvent(
+                event_type="reply",
+                provider_message_id=str(data["email_id"]),
+                from_email=str(data["from"]),
+                to_email=str(data["to"][0]),
+                subject=str(data["subject"]),
+                text_body=None,
+                rfc_message_id=str(data["message_id"]),
+                references=str(data["references"]),
+                raw_payload_ref="abc123def4567000",
+                raw_payload=payload,
+            )
+
+        async def get_received_email(self, *, email_id: str):
+            assert email_id == "recv_101"
+            return {
+                "id": "recv_101",
+                "from": "prospect@example.com",
+                "to": ["lead_hydrated_1@chuairkoon.resend.app"],
+                "subject": "Re: Intro",
+                "text": "Hydrated inbound email content",
+                "message_id": "<inbound-hydrated@example.com>",
+                "headers": {"In-Reply-To": "<outbound@example.com>"},
+            }
+
+    runtime = _runtime(email_service=_EmailServiceStub())
+    lead_id = "lead_hydrated_1"
+    runtime._state_repo.upsert_session_state(
+        lead_id=lead_id,
+        payload={
+            "current_stage": "awaiting_reply",
+            "next_best_action": "wait",
+            "current_objective": "reply_wait",
+            "brief_refs": [],
+            "kb_refs": [],
+            "pending_actions": [],
+            "policy_flags": [],
+            "handoff_required": False,
+        },
+    )
+    payload = {
+        "type": "email.received",
+        "data": {
+            "id": "re_recv_101",
+            "email_id": "recv_101",
+            "message_id": "<inbound-hydrated@example.com>",
+            "from": "prospect@example.com",
+            "to": [f"{lead_id}@chuairkoon.resend.app"],
+            "subject": "Re: Intro",
+            "references": "<outbound@example.com>",
+        },
+    }
+    env = asyncio.run(runtime.handle_email_webhook(payload=payload, headers={}))
+    assert env.status == "accepted"
+    rows = runtime._state_repo.list_messages(lead_id=lead_id, limit=5)
+    assert any("Hydrated inbound email content" in str(r.get("content")) for r in rows)
+
+
+def test_handle_email_webhook_invalid_email_id_is_handled_gracefully() -> None:
+    class _EmailServiceStub:
+        async def handle_webhook(self, *, payload, headers, raw_body=None):
+            del headers, raw_body
+            return InboundEmailEvent(
+                event_type="reply",
+                provider_message_id=str(payload["data"]["email_id"]),
+                raw_payload_ref="abc123def4567001",
+                raw_payload=payload,
+            )
+
+        async def get_received_email(self, *, email_id: str):
+            del email_id
+            return None
+
+    runtime = _runtime(email_service=_EmailServiceStub())
+    payload = {"type": "email.received", "data": {"email_id": "recv_missing"}}
+    env = asyncio.run(runtime.handle_email_webhook(payload=payload, headers={}))
+    assert env.status == "accepted"
+    assert env.data["processed"] is False
+    assert env.data["reason"] == "received_email_fetch_failed"
+
+
+def test_handle_email_webhook_ignores_non_received_events() -> None:
+    class _EmailServiceStub:
+        async def handle_webhook(self, *, payload, headers, raw_body=None):
+            raise AssertionError("Should not parse non-email.received events")
+
+        async def get_received_email(self, *, email_id: str):
+            raise AssertionError("Should not fetch for non-email.received events")
+
+    runtime = _runtime(email_service=_EmailServiceStub())
+    env = asyncio.run(runtime.handle_email_webhook(payload={"type": "email.sent"}, headers={}))
+    assert env.status == "accepted"
+    assert env.data["ignored"] is True
+    assert env.data["processed"] is False
+
+
+def test_handle_email_webhook_rejects_malformed_to_address() -> None:
+    class _EmailServiceStub:
+        async def handle_webhook(self, *, payload, headers, raw_body=None):
+            del headers, raw_body
+            return InboundEmailEvent(
+                event_type="reply",
+                provider_message_id=str(payload["data"]["email_id"]),
+                raw_payload_ref="abc123def4567002",
+                raw_payload=payload,
+            )
+
+        async def get_received_email(self, *, email_id: str):
+            del email_id
+            return {"id": "recv_bad_to", "to": ["not-an-email"], "text": "Hello"}
+
+    runtime = _runtime(email_service=_EmailServiceStub())
+    payload = {"type": "email.received", "data": {"email_id": "recv_bad_to"}}
+    env = asyncio.run(runtime.handle_email_webhook(payload=payload, headers={}))
+    assert env.status == "accepted"
+    assert env.data["processed"] is False
+    assert env.data["reason"] == "invalid_to_address"
+
+
+def test_handle_email_webhook_duplicate_is_idempotent_no_duplicate_db_row() -> None:
+    lead_id = "lead_dupe_1"
+
+    class _EmailServiceStub:
+        async def handle_webhook(self, *, payload, headers, raw_body=None):
+            del headers, raw_body
+            return InboundEmailEvent(
+                event_type="reply",
+                provider_message_id=str(payload["data"]["email_id"]),
+                raw_payload_ref="abc123def4567003",
+                raw_payload=payload,
+            )
+
+        async def get_received_email(self, *, email_id: str):
+            del email_id
+            return {
+                "id": "recv_dupe_1",
+                "from": "prospect@example.com",
+                "to": [f"{lead_id}@chuairkoon.resend.app"],
+                "subject": "Re: Intro",
+                "text": "Please send times.",
+                "message_id": "<inbound-dupe@example.com>",
+                "headers": {"In-Reply-To": "<outbound@example.com>"},
+            }
+
+    runtime = _runtime(email_service=_EmailServiceStub())
+    runtime._state_repo.upsert_session_state(
+        lead_id=lead_id,
+        payload={
+            "current_stage": "awaiting_reply",
+            "next_best_action": "wait",
+            "current_objective": "reply_wait",
+            "brief_refs": [],
+            "kb_refs": [],
+            "pending_actions": [],
+            "policy_flags": [],
+            "handoff_required": False,
+        },
+    )
+    payload = {"type": "email.received", "data": {"email_id": "recv_dupe_1"}}
+
+    first = asyncio.run(runtime.handle_email_webhook(payload=payload, headers={}))
+    second = asyncio.run(runtime.handle_email_webhook(payload=payload, headers={}))
+
+    assert first.status == "accepted"
+    assert second.status == "accepted"
+    assert second.data["duplicate"] is True
+    assert runtime._state_repo.count_inbound_emails(resend_email_id="recv_dupe_1") == 1
+
+
+def test_handle_email_webhook_extracts_lead_id_from_recipient_local_part() -> None:
+    lead_id = "lead_extract_1"
+
+    class _EmailServiceStub:
+        async def handle_webhook(self, *, payload, headers, raw_body=None):
+            del headers, raw_body
+            return InboundEmailEvent(
+                event_type="reply",
+                provider_message_id=str(payload["data"]["email_id"]),
+                raw_payload_ref="abc123def4567004",
+                raw_payload=payload,
+            )
+
+        async def get_received_email(self, *, email_id: str):
+            del email_id
+            return {
+                "id": "recv_extract_1",
+                "from": "prospect@example.com",
+                "to": [f"{lead_id}@chuairkoon.resend.app"],
+                "subject": "Re: Intro",
+                "text": "Sounds good.",
+                "message_id": "<inbound-extract@example.com>",
+            }
+
+    runtime = _runtime(email_service=_EmailServiceStub())
+    runtime._state_repo.upsert_session_state(
+        lead_id=lead_id,
+        payload={
+            "current_stage": "awaiting_reply",
+            "next_best_action": "wait",
+            "current_objective": "reply_wait",
+            "brief_refs": [],
+            "kb_refs": [],
+            "pending_actions": [],
+            "policy_flags": [],
+            "handoff_required": False,
+        },
+    )
+    payload = {"type": "email.received", "data": {"email_id": "recv_extract_1"}}
+    env = asyncio.run(runtime.handle_email_webhook(payload=payload, headers={}))
+    assert env.status == "accepted"
+    assert env.data["lead_id"] == lead_id
+
+
+def test_handle_email_webhook_falls_back_to_thread_headers_when_to_unmatched() -> None:
+    lead_id = "lead_fallback_1"
+
+    class _EmailServiceStub:
+        async def handle_webhook(self, *, payload, headers, raw_body=None):
+            del headers, raw_body
+            return InboundEmailEvent(
+                event_type="reply",
+                provider_message_id=str(payload["data"]["email_id"]),
+                raw_payload_ref="abc123def4567005",
+                raw_payload=payload,
+            )
+
+        async def get_received_email(self, *, email_id: str):
+            del email_id
+            return {
+                "id": "recv_fallback_1",
+                "from": "prospect@example.com",
+                "to": ["someone@other-domain.example"],
+                "subject": "Re: Intro",
+                "text": "Following up.",
+                "message_id": "<inbound-fallback@example.com>",
+                "headers": {"In-Reply-To": "<thread-anchor@example.com>"},
+            }
+
+    runtime = _runtime(email_service=_EmailServiceStub())
+    runtime._state_repo.upsert_session_state(
+        lead_id=lead_id,
+        payload={
+            "current_stage": "awaiting_reply",
+            "next_best_action": "wait",
+            "current_objective": "reply_wait",
+            "brief_refs": [],
+            "kb_refs": [],
+            "pending_actions": [],
+            "policy_flags": [],
+            "handoff_required": False,
+        },
+    )
+    runtime._state_repo.email_thread_record_inbound(
+        lead_id=lead_id,
+        inbound_rfc_message_id="<thread-anchor@example.com>",
+        prior_references_fragment=None,
+    )
+    payload = {"type": "email.received", "data": {"email_id": "recv_fallback_1"}}
+    env = asyncio.run(runtime.handle_email_webhook(payload=payload, headers={}))
+    assert env.status == "accepted"
+    assert env.data["lead_id"] == lead_id

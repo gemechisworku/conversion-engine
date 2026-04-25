@@ -63,3 +63,10 @@ def test_get_lead_briefs_unknown_returns_failure() -> None:
     body = res.json()
     assert body["status"] == "failure"
     assert body["error"]["error_code"] == "INVALID_INPUT"
+
+
+def test_resend_webhook_route_is_registered() -> None:
+    app = create_orchestration_app()
+    with TestClient(app) as client:
+        res = client.post("/webhooks/resend", json={"type": "unknown"})
+    assert res.status_code == 200

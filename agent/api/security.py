@@ -35,6 +35,7 @@ def public_paths() -> frozenset[str]:
             "/openapi.json",
             "/docs",
             "/redoc",
+            "/webhooks/resend",
         }
     )
 

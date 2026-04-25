@@ -84,6 +84,26 @@ class SQLiteStateRepository:
                     recorded_at TEXT NOT NULL,
                     metadata TEXT NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS idx_message_log_lead_id ON message_log(lead_id);
+                CREATE INDEX IF NOT EXISTS idx_message_log_message_id ON message_log(message_id);
+
+                CREATE TABLE IF NOT EXISTS inbound_email_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    resend_email_id TEXT NOT NULL UNIQUE,
+                    lead_id TEXT NOT NULL,
+                    from_email TEXT,
+                    to_email TEXT NOT NULL,
+                    subject TEXT,
+                    text_body TEXT,
+                    html_body TEXT,
+                    headers_json TEXT NOT NULL,
+                    in_reply_to TEXT,
+                    references_header TEXT,
+                    received_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_inbound_email_log_lead_id ON inbound_email_log(lead_id);
+                CREATE INDEX IF NOT EXISTS idx_inbound_email_log_received_at ON inbound_email_log(received_at);
 
                 CREATE TABLE IF NOT EXISTS sms_consent_state (
                     lead_id TEXT PRIMARY KEY,
@@ -359,6 +379,99 @@ class SQLiteStateRepository:
             for row in rows
         ]
 
+    def upsert_inbound_email(
+        self,
+        *,
+        resend_email_id: str,
+        lead_id: str,
+        from_email: str | None,
+        to_email: str,
+        subject: str | None,
+        text_body: str | None,
+        html_body: str | None,
+        headers: dict[str, Any] | None,
+        in_reply_to: str | None,
+        references: str | None,
+        received_at: datetime,
+    ) -> bool:
+        row = {
+            "resend_email_id": (resend_email_id or "").strip(),
+            "lead_id": (lead_id or "").strip(),
+            "from_email": (from_email or "").strip() or None,
+            "to_email": (to_email or "").strip(),
+            "subject": (subject or "").strip() or None,
+            "text_body": text_body,
+            "html_body": html_body,
+            "headers_json": json.dumps(headers or {}),
+            "in_reply_to": normalize_message_id(in_reply_to),
+            "references_header": merge_references_header(references) if references else None,
+            "received_at": received_at.isoformat(),
+            "created_at": _utc_now(),
+        }
+        if not row["resend_email_id"] or not row["lead_id"] or not row["to_email"]:
+            return False
+        with self._conn() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO inbound_email_log (
+                    resend_email_id, lead_id, from_email, to_email, subject, text_body, html_body,
+                    headers_json, in_reply_to, references_header, received_at, created_at
+                ) VALUES (
+                    :resend_email_id, :lead_id, :from_email, :to_email, :subject, :text_body, :html_body,
+                    :headers_json, :in_reply_to, :references_header, :received_at, :created_at
+                )
+                ON CONFLICT(resend_email_id) DO NOTHING
+                """,
+                row,
+            )
+        return bool(cursor.rowcount)
+
+    def get_inbound_email(self, *, resend_email_id: str) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT resend_email_id, lead_id, from_email, to_email, subject, text_body, html_body,
+                       headers_json, in_reply_to, references_header, received_at, created_at
+                FROM inbound_email_log
+                WHERE resend_email_id = ?
+                LIMIT 1
+                """,
+                ((resend_email_id or "").strip(),),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "resend_email_id": row["resend_email_id"],
+            "lead_id": row["lead_id"],
+            "from_email": row["from_email"],
+            "to_email": row["to_email"],
+            "subject": row["subject"],
+            "text_body": row["text_body"],
+            "html_body": row["html_body"],
+            "headers": json.loads(row["headers_json"] or "{}"),
+            "in_reply_to": row["in_reply_to"],
+            "references": row["references_header"],
+            "received_at": row["received_at"],
+            "created_at": row["created_at"],
+        }
+
+    def count_inbound_emails(self, *, resend_email_id: str | None = None, lead_id: str | None = None) -> int:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if resend_email_id:
+            clauses.append("resend_email_id = ?")
+            params.append(resend_email_id.strip())
+        if lead_id:
+            clauses.append("lead_id = ?")
+            params.append(lead_id.strip())
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._conn() as conn:
+            row = conn.execute(
+                f"SELECT COUNT(1) AS count_value FROM inbound_email_log {where}",
+                tuple(params),
+            ).fetchone()
+        return int(row["count_value"]) if row is not None else 0
+
     def ensure_email_thread(self, *, lead_id: str) -> str:
         """Return the newest thread_id for this lead, creating one if needed."""
         now = _utc_now()
@@ -450,6 +563,48 @@ class SQLiteStateRepository:
                 (mid, merged, now, thread_id),
             )
             return thread_id
+
+    def find_lead_id_by_email_headers(
+        self,
+        *,
+        in_reply_to: str | None = None,
+        references: str | None = None,
+    ) -> str | None:
+        normalized = merge_references_header(in_reply_to, references)
+        if not normalized:
+            return None
+        candidates = [token for token in normalized.split(" ") if token]
+        if not candidates:
+            return None
+        with self._conn() as conn:
+            for message_id in candidates:
+                row = conn.execute(
+                    """
+                    SELECT lead_id
+                    FROM email_threads
+                    WHERE last_inbound_rfc_message_id = ?
+                    ORDER BY datetime(updated_at) DESC
+                    LIMIT 1
+                    """,
+                    (message_id,),
+                ).fetchone()
+                if row is not None and row["lead_id"]:
+                    return str(row["lead_id"])
+            like_clause = " OR ".join(["references_header LIKE ?" for _ in candidates])
+            like_params = tuple(f"%{message_id}%" for message_id in candidates)
+            row = conn.execute(
+                f"""
+                SELECT lead_id
+                FROM email_threads
+                WHERE {like_clause}
+                ORDER BY datetime(updated_at) DESC
+                LIMIT 1
+                """,
+                like_params,
+            ).fetchone()
+            if row is not None and row["lead_id"]:
+                return str(row["lead_id"])
+        return None
 
     def set_sms_consent(self, *, lead_id: str, allowed: bool) -> None:
         with self._conn() as conn:
@@ -763,6 +918,40 @@ class SQLiteStateRepository:
                 """,
                 (idempotency_key, _utc_now(), lead_id),
             )
+
+    def list_outreach_drafts(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    ods.lead_id,
+                    ods.draft_json,
+                    ods.updated_at,
+                    ods.last_send_idempotency,
+                    pr.company_id,
+                    pr.company_name,
+                    pr.company_domain
+                FROM outreach_draft_state ods
+                LEFT JOIN pipeline_runs pr ON pr.lead_id = ods.lead_id
+                ORDER BY ods.updated_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            out.append(
+                {
+                    "lead_id": row["lead_id"],
+                    "draft": json.loads(row["draft_json"]),
+                    "updated_at": row["updated_at"],
+                    "last_send_idempotency": row["last_send_idempotency"],
+                    "company_id": row["company_id"],
+                    "company_name": row["company_name"],
+                    "company_domain": row["company_domain"],
+                }
+            )
+        return out
 
     def get_idempotency_response(self, *, idempotency_key: str) -> dict[str, Any] | None:
         with self._conn() as conn:

@@ -3,9 +3,12 @@
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import { orchestrationFetch, OrchestrationApiError } from "@/lib/api";
-import type { EvidenceEdge, LeadBriefsPayload, LeadStatePayload, ResponseEnvelope } from "@/lib/types";
+import type { EvidenceEdge, LeadBriefsPayload, LeadStatePayload, OutreachDetailPayload, ResponseEnvelope } from "@/lib/types";
 
 type EvidenceResponse = { edges: EvidenceEdge[] };
+type DraftPayload = { draft_id: string; subject?: string; body?: string };
+type ReviewPayload = { review_id: string; status: string; final_send_ok: boolean };
+type SendPayload = { message_id?: string | null; delivery_status?: string };
 
 function humanStage(stage: string): string {
   const mapping: Record<string, string> = {
@@ -56,8 +59,30 @@ export function LeadDetail({ leadId }: { leadId: string }) {
   const [state, setState] = useState<ResponseEnvelope<LeadStatePayload> | null>(null);
   const [evidence, setEvidence] = useState<EvidenceEdge[] | null>(null);
   const [briefs, setBriefs] = useState<LeadBriefsPayload["briefs"] | null>(null);
+  const [outreach, setOutreach] = useState<OutreachDetailPayload | null>(null);
+  const [outreachToEmail, setOutreachToEmail] = useState("");
+  const [outreachMessage, setOutreachMessage] = useState<string | null>(null);
+  const [outreachError, setOutreachError] = useState<string | null>(null);
+  const [drafting, setDrafting] = useState(false);
+  const [reviewing, setReviewing] = useState(false);
+  const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+
+  const loadOutreach = useCallback(async () => {
+    try {
+      const o = await orchestrationFetch<OutreachDetailPayload>(`/outreachs/${encodeURIComponent(leadId)}`);
+      if (o.status === "success") {
+        setOutreach(o.data);
+        const outboundTo = typeof o.data.outbound?.to_email === "string" ? o.data.outbound.to_email : "";
+        if (outboundTo) setOutreachToEmail(outboundTo);
+      } else {
+        setOutreach(null);
+      }
+    } catch {
+      setOutreach(null);
+    }
+  }, [leadId]);
 
   const load = useCallback(async () => {
     setError(null);
@@ -68,6 +93,7 @@ export function LeadDetail({ leadId }: { leadId: string }) {
       if (s.status !== "success") {
         setEvidence([]);
         setBriefs(null);
+        setOutreach(null);
         return;
       }
       const [e, b] = await Promise.all([
@@ -76,15 +102,109 @@ export function LeadDetail({ leadId }: { leadId: string }) {
       ]);
       setEvidence(e.status === "success" && Array.isArray(e.data.edges) ? e.data.edges : []);
       setBriefs(b.status === "success" ? b.data.briefs : null);
+      await loadOutreach();
     } catch (err) {
       setState(null);
       setEvidence(null);
       setBriefs(null);
+      setOutreach(null);
       setError(err instanceof OrchestrationApiError ? err.message : "Failed to load lead");
     } finally {
       setLoading(false);
     }
+  }, [leadId, loadOutreach]);
+
+  const makeIdempotencyKey = useCallback((prefix: string) => {
+    return `${prefix}:${leadId}:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 8)}`;
   }, [leadId]);
+
+  async function onDraft() {
+    setOutreachMessage(null);
+    setOutreachError(null);
+    setDrafting(true);
+    try {
+      const env = await orchestrationFetch<DraftPayload>("/outreach/draft", {
+        method: "POST",
+        body: JSON.stringify({
+          lead_id: leadId,
+          to_email: outreachToEmail || undefined,
+          idempotency_key: makeIdempotencyKey("ui_outreach_draft"),
+        }),
+      });
+      if (env.status === "success") {
+        setOutreachMessage(`Draft created: ${env.data.draft_id}`);
+        await loadOutreach();
+      } else {
+        setOutreachError(env.error?.error_message || "Draft failed.");
+      }
+    } catch (err) {
+      setOutreachError(err instanceof OrchestrationApiError ? err.message : "Draft failed.");
+    } finally {
+      setDrafting(false);
+    }
+  }
+
+  async function onReview() {
+    setOutreachMessage(null);
+    setOutreachError(null);
+    const draftId = typeof outreach?.outbound?.draft_id === "string" ? outreach.outbound.draft_id : "";
+    if (!draftId) {
+      setOutreachError("Create a draft first.");
+      return;
+    }
+    setReviewing(true);
+    try {
+      const env = await orchestrationFetch<ReviewPayload>("/outreach/review", {
+        method: "POST",
+        body: JSON.stringify({ lead_id: leadId, draft_id: draftId }),
+      });
+      if (env.status === "success") {
+        setOutreachMessage(`Review complete: ${env.data.status}`);
+        await loadOutreach();
+      } else {
+        setOutreachError(env.error?.error_message || "Review failed.");
+      }
+    } catch (err) {
+      setOutreachError(err instanceof OrchestrationApiError ? err.message : "Review failed.");
+    } finally {
+      setReviewing(false);
+    }
+  }
+
+  async function onSend() {
+    setOutreachMessage(null);
+    setOutreachError(null);
+    const draftId = typeof outreach?.outbound?.draft_id === "string" ? outreach.outbound.draft_id : "";
+    const reviewId = typeof outreach?.review?.review_id === "string" ? outreach.review.review_id : "";
+    if (!draftId || !reviewId) {
+      setOutreachError("Review the draft first so review_id is available.");
+      return;
+    }
+    if (!confirm("Send this outreach now?")) return;
+    setSending(true);
+    try {
+      const env = await orchestrationFetch<SendPayload>("/outreach/send", {
+        method: "POST",
+        body: JSON.stringify({
+          lead_id: leadId,
+          draft_id: draftId,
+          review_id: reviewId,
+          to_email: outreachToEmail || undefined,
+          idempotency_key: makeIdempotencyKey("ui_outreach_send"),
+        }),
+      });
+      if (env.status === "success") {
+        setOutreachMessage(`Send result: ${env.data.delivery_status || "queued"}`);
+        await loadOutreach();
+      } else {
+        setOutreachError(env.error?.error_message || "Send failed.");
+      }
+    } catch (err) {
+      setOutreachError(err instanceof OrchestrationApiError ? err.message : "Send failed.");
+    } finally {
+      setSending(false);
+    }
+  }
 
   useEffect(() => {
     void load();
@@ -189,6 +309,62 @@ export function LeadDetail({ leadId }: { leadId: string }) {
             <summary className="cursor-pointer text-sm font-medium text-foreground">AI maturity score</summary>
             <pre className="mt-2 max-h-64 overflow-auto text-xs text-muted">
               {JSON.stringify(briefs?.ai_maturity_score || {}, null, 2)}
+            </pre>
+          </details>
+        </div>
+      </section>
+
+      <section className="rounded-lg border border-border bg-surface p-4 shadow-sm">
+        <h2 className="text-sm font-semibold text-foreground">Outreach</h2>
+        <p className="mt-1 text-xs text-muted">Draft, review, and send outreach for this lead.</p>
+        <div className="mt-3 grid gap-3 md:grid-cols-[1fr_auto_auto_auto] md:items-end">
+          <label className="text-sm">
+            <span className="font-medium text-foreground">To email (optional)</span>
+            <input
+              value={outreachToEmail}
+              onChange={(e) => setOutreachToEmail(e.target.value)}
+              placeholder="Use server default if empty"
+              className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-foreground outline-none ring-primary focus:ring-2"
+            />
+          </label>
+          <button
+            type="button"
+            onClick={() => void onDraft()}
+            disabled={drafting}
+            className="rounded-md border border-border px-3 py-2 text-sm font-medium text-foreground hover:bg-background disabled:opacity-50"
+          >
+            {drafting ? "Drafting..." : "Draft"}
+          </button>
+          <button
+            type="button"
+            onClick={() => void onReview()}
+            disabled={reviewing}
+            className="rounded-md border border-border px-3 py-2 text-sm font-medium text-foreground hover:bg-background disabled:opacity-50"
+          >
+            {reviewing ? "Reviewing..." : "Review"}
+          </button>
+          <button
+            type="button"
+            onClick={() => void onSend()}
+            disabled={sending}
+            className="rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50"
+          >
+            {sending ? "Sending..." : "Send"}
+          </button>
+        </div>
+        {outreachMessage && <p className="mt-3 text-sm text-primary">{outreachMessage}</p>}
+        {outreachError && <p className="mt-3 text-sm text-red-600 dark:text-red-400">{outreachError}</p>}
+        <div className="mt-4 grid gap-3 md:grid-cols-2">
+          <details className="rounded-md border border-border bg-background p-3" open>
+            <summary className="cursor-pointer text-sm font-medium text-foreground">Current draft</summary>
+            <pre className="mt-2 max-h-64 overflow-auto text-xs text-muted">
+              {JSON.stringify(outreach?.outbound || {}, null, 2)}
+            </pre>
+          </details>
+          <details className="rounded-md border border-border bg-background p-3" open>
+            <summary className="cursor-pointer text-sm font-medium text-foreground">Current review</summary>
+            <pre className="mt-2 max-h-64 overflow-auto text-xs text-muted">
+              {JSON.stringify(outreach?.review || {}, null, 2)}
             </pre>
           </details>
         </div>

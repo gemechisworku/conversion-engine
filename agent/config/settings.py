@@ -35,6 +35,7 @@ class Settings(BaseSettings):
 
     resend_api_key: str = Field(default="", alias="RESEND_API_KEY")
     resend_from_email: str = Field(default="", alias="RESEND_FROM_EMAIL")
+    resend_reply_domain: str = Field(default="chuairkoon.resend.app", alias="RESEND_REPLY_DOMAIN")
     resend_api_url: str = Field(default="https://api.resend.com", alias="RESEND_API_URL")
     resend_webhook_secret: str = Field(default="", alias="RESEND_WEBHOOK_SECRET")
     resend_webhook_signature_header: str = Field(
