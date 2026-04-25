@@ -1262,7 +1262,13 @@ class HubSpotMCPService:
         return text or None
 
 
-def map_enrichment_to_crm_payload(*, lead_id: str, enrichment_artifact: dict[str, Any]) -> CRMEnrichmentPayload:
+def map_enrichment_to_crm_payload(
+    *,
+    lead_id: str,
+    enrichment_artifact: dict[str, Any],
+    company_name: str | None = None,
+    company_domain: str | None = None,
+) -> CRMEnrichmentPayload:
     """Map normalized enrichment artifact into CRM enrichment fields."""
     signals = enrichment_artifact.get("signals", {}) if isinstance(enrichment_artifact, dict) else {}
 
@@ -1279,6 +1285,8 @@ def map_enrichment_to_crm_payload(*, lead_id: str, enrichment_artifact: dict[str
 
     return CRMEnrichmentPayload(
         lead_id=lead_id,
+        company_name=company_name,
+        company_domain=company_domain,
         funding_signal_summary=summary("crunchbase"),
         job_velocity_summary=summary("job_posts"),
         layoffs_signal_summary=summary("layoffs"),

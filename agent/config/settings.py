@@ -116,6 +116,7 @@ class Settings(BaseSettings):
         alias="OPENROUTER_API_URL",
     )
     openrouter_model: str = Field(default="openai/gpt-4.1-mini", alias="OPENROUTER_MODEL")
+    llm_call_log_dir: str = Field(default="outputs/llm_calls", alias="LLM_CALL_LOG_DIR")
     state_db_path: str = Field(default="outputs/runtime_state.db", alias="STATE_DB_PATH")
     hubspot_mcp_required_tools_csv: str = Field(default="", alias="HUBSPOT_MCP_REQUIRED_TOOLS_CSV")
     hubspot_mcp_required_tool_count: int = Field(default=9, alias="HUBSPOT_MCP_REQUIRED_TOOL_COUNT")

@@ -110,6 +110,69 @@ def test_ai_maturity_scoring_can_use_openrouter_json() -> None:
     assert score.confidence == 0.81
 
 
+def test_openrouter_generate_model_writes_per_call_log_success(tmp_path: Path) -> None:
+    artifact = _artifact()
+    deterministic = score_ai_maturity(company_id="comp_123", artifact=artifact)
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": json.dumps(deterministic.model_dump(mode="json"))}}],
+                "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
+            },
+        )
+
+    settings = Settings(
+        crunchbase_dataset_path=str(FIXTURE_DIR / "crunchbase_sample.json"),
+        openrouter_api_key="test_key",
+        openrouter_api_url="https://openrouter.test/chat/completions",
+        llm_call_log_dir=str(tmp_path / "llm_calls"),
+    )
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    llm = OpenRouterJSONClient(settings=settings, http_client=http_client)
+    score = asyncio.run(score_ai_maturity_with_llm(company_id="comp_123", artifact=artifact, llm=llm))
+    asyncio.run(http_client.aclose())
+
+    files = list((tmp_path / "llm_calls").glob("*.json"))
+    assert len(files) == 1
+    payload = json.loads(files[0].read_text(encoding="utf-8"))
+    assert payload["status"] == "success"
+    assert payload["model"] == settings.openrouter_model
+    assert payload["parsed_output"]["company_id"] == "comp_123"
+    assert payload["token_usage"]["prompt_tokens"] == 11
+    assert payload["token_usage"]["completion_tokens"] == 7
+    assert payload["token_usage"]["total_tokens"] == 18
+    assert score.company_id == "comp_123"
+
+
+def test_openrouter_generate_model_writes_per_call_log_error(tmp_path: Path) -> None:
+    artifact = _artifact()
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, json={"error": {"message": "rate limited"}})
+
+    settings = Settings(
+        crunchbase_dataset_path=str(FIXTURE_DIR / "crunchbase_sample.json"),
+        openrouter_api_key="test_key",
+        openrouter_api_url="https://openrouter.test/chat/completions",
+        llm_call_log_dir=str(tmp_path / "llm_calls"),
+    )
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    llm = OpenRouterJSONClient(settings=settings, http_client=http_client)
+    score = asyncio.run(score_ai_maturity_with_llm(company_id="comp_123", artifact=artifact, llm=llm))
+    asyncio.run(http_client.aclose())
+
+    files = list((tmp_path / "llm_calls").glob("*.json"))
+    assert len(files) == 1
+    payload = json.loads(files[0].read_text(encoding="utf-8"))
+    assert payload["status"] == "error"
+    assert payload["response_status_code"] == 429
+    assert "HTTPStatusError" in (payload["error"] or "")
+    assert payload["token_usage"]["total_tokens"] == 0
+    assert score.company_id == "comp_123"
+
+
 def test_icp_classifier_output() -> None:
     artifact = _artifact()
     score = score_ai_maturity(company_id="comp_123", artifact=artifact)

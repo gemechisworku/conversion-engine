@@ -31,6 +31,8 @@ class CRMEnrichmentPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     lead_id: str
+    company_name: str | None = None
+    company_domain: str | None = None
     enrichment_timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     funding_signal_summary: str | None = None
     job_velocity_summary: str | None = None

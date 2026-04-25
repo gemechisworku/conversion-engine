@@ -46,6 +46,8 @@ async def crm_sync_lead_intake_node(*, state: dict[str, Any], hubspot: HubSpotMC
         enrichment=map_enrichment_to_crm_payload(
             lead_id=lead_id,
             enrichment_artifact=artifact.model_dump(mode="json"),
+            company_name=state.get("company_name"),
+            company_domain=state.get("company_domain"),
         ),
         trace_id=state["trace_id"],
         idempotency_key=f"{state['idempotency_key']}:enrichment",
