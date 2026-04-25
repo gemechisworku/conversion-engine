@@ -107,9 +107,7 @@ export function PipelineRunsList({ refreshToken }: { refreshToken: number }) {
                 <tr key={row.lead_id} className="border-t border-border/70">
                   <td className="px-2 py-3">
                     <div className="font-medium text-foreground">{row.company_name}</div>
-                    <div className="text-xs text-muted">
-                      {row.company_domain || row.company_id} · lead {row.lead_id}
-                    </div>
+                    <div className="text-xs text-muted">{row.company_domain || row.company_id}</div>
                   </td>
                   <td className="px-2 py-3 text-foreground">{stageLabel[row.last_stage] || row.last_stage}</td>
                   <td className="px-2 py-3 text-foreground">{row.run_count}</td>

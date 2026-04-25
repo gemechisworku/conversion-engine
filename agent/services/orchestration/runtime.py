@@ -874,6 +874,25 @@ class OrchestrationRuntime:
             data={"pipelines": rows},
         )
 
+    def get_pipeline(self, *, lead_id: str) -> ResponseEnvelope:
+        request_id = f"req_{uuid4().hex[:10]}"
+        trace_id = f"trace_pipeline_get_{uuid4().hex[:12]}"
+        row = self._state_repo.get_pipeline_run(lead_id=lead_id)
+        if row is None:
+            return self._failure(
+                request_id=request_id,
+                trace_id=trace_id,
+                code="INVALID_INPUT",
+                message=f"Unknown lead_id '{lead_id}'.",
+                retryable=False,
+            )
+        return ResponseEnvelope(
+            request_id=request_id,
+            trace_id=trace_id,
+            status="success",
+            data={"pipeline": row},
+        )
+
     def delete_pipeline(self, *, lead_id: str) -> ResponseEnvelope:
         request_id = f"req_{uuid4().hex[:10]}"
         trace_id = f"trace_pipeline_del_{uuid4().hex[:12]}"
@@ -908,6 +927,7 @@ class OrchestrationRuntime:
         briefs = self._state_repo.get_briefs(lead_id=lead_id) or {}
         ai_block = briefs.get("ai_maturity_score", {})
         classification = briefs.get("hiring_signal_brief", {})
+        pipeline = self._state_repo.get_pipeline_run(lead_id=lead_id) or {}
         return ResponseEnvelope(
             request_id=request_id,
             trace_id=trace_id,
@@ -922,7 +942,30 @@ class OrchestrationRuntime:
                 "kb_refs": session.get("kb_refs", []),
                 "policy_flags": session.get("policy_flags", []),
                 "updated_at": session.get("updated_at"),
+                "company_id": pipeline.get("company_id"),
+                "company_name": pipeline.get("company_name"),
+                "company_domain": pipeline.get("company_domain"),
             },
+        )
+
+    def get_lead_briefs(self, *, lead_id: str) -> ResponseEnvelope:
+        request_id = f"req_{uuid4().hex[:10]}"
+        trace_id = f"trace_briefs_{uuid4().hex[:12]}"
+        session = self._state_repo.get_session_state(lead_id=lead_id)
+        if session is None:
+            return self._failure(
+                request_id=request_id,
+                trace_id=trace_id,
+                code="INVALID_INPUT",
+                message=f"Unknown lead_id '{lead_id}'.",
+                retryable=False,
+            )
+        briefs = self._state_repo.get_briefs(lead_id=lead_id) or {}
+        return ResponseEnvelope(
+            request_id=request_id,
+            trace_id=trace_id,
+            status="success",
+            data={"lead_id": lead_id, "briefs": briefs},
         )
 
     async def compact_context(self, request: LeadCompactRequest) -> ResponseEnvelope:

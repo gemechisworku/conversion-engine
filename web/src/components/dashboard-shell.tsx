@@ -7,6 +7,7 @@ import { ThemeToggle } from "@/components/theme-toggle";
 const nav = [
   { href: "/", label: "Overview" },
   { href: "/pipeline", label: "Pipeline" },
+  { href: "/runs", label: "Pipeline Runs" },
 ];
 
 export function DashboardShell({ children }: { children: React.ReactNode }) {

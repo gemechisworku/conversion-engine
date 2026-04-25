@@ -55,12 +55,16 @@ async def crm_sync_lead_intake_node(*, state: dict[str, Any], hubspot: HubSpotMC
         stage="brief_ready",
         trace_id=state["trace_id"],
         idempotency_key=f"{state['idempotency_key']}:stage",
+        company_name=state.get("company_name"),
+        company_domain=state.get("company_domain"),
     )
     await hubspot.attach_brief_refs(
         lead_id=lead_id,
         brief_refs=enriched.brief_refs,
         trace_id=state["trace_id"],
         idempotency_key=f"{state['idempotency_key']}:brief_refs",
+        company_name=state.get("company_name"),
+        company_domain=state.get("company_domain"),
     )
     log_processing_step(
         component="nodes.crm_sync",

@@ -75,12 +75,22 @@ def create_orchestration_app() -> FastAPI:
         env = request.app.state.runtime.get_state(lead_id=lead_id)
         return JSONResponse(env.model_dump(mode="json"))
 
+    @app.get("/lead/{lead_id}/briefs", tags=["leads"])
+    async def get_lead_briefs(lead_id: str, request: Request) -> JSONResponse:
+        env = request.app.state.runtime.get_lead_briefs(lead_id=lead_id)
+        return JSONResponse(env.model_dump(mode="json"))
+
     @app.get("/pipelines", tags=["pipelines"])
     async def get_pipelines(
         request: Request,
         limit: Annotated[int, Query(ge=1, le=500, description="Max pipeline rows (newest first)")] = 200,
     ) -> JSONResponse:
         env = request.app.state.runtime.list_pipelines(limit=limit)
+        return JSONResponse(env.model_dump(mode="json"))
+
+    @app.get("/pipelines/{lead_id}", tags=["pipelines"])
+    async def get_pipeline(lead_id: str, request: Request) -> JSONResponse:
+        env = request.app.state.runtime.get_pipeline(lead_id=lead_id)
         return JSONResponse(env.model_dump(mode="json"))
 
     @app.delete("/pipelines/{lead_id}", tags=["pipelines"])

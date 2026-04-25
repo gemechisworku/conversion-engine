@@ -17,6 +17,9 @@ export type ResponseEnvelope<T = Record<string, unknown>> = {
 export type LeadStatePayload = {
   lead_id: string;
   state: string;
+  company_id?: string | null;
+  company_name?: string | null;
+  company_domain?: string | null;
   segment?: string | null;
   segment_confidence?: number;
   ai_maturity_score?: number | null;
@@ -54,6 +57,16 @@ export type MemorySessionPayload = {
   lead_id: string;
   session_state: {
     current_stage: string;
+    updated_at?: string;
+  };
+};
+
+export type LeadBriefsPayload = {
+  lead_id: string;
+  briefs: {
+    hiring_signal_brief?: Record<string, unknown>;
+    competitor_gap_brief?: Record<string, unknown>;
+    ai_maturity_score?: Record<string, unknown>;
     updated_at?: string;
   };
 };

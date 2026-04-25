@@ -649,6 +649,31 @@ class SQLiteStateRepository:
             for row in rows
         ]
 
+    def get_pipeline_run(self, *, lead_id: str) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT lead_id, company_id, company_name, company_domain, run_count, last_stage, last_trace_id, started_at, updated_at
+                FROM pipeline_runs
+                WHERE lead_id = ?
+                LIMIT 1
+                """,
+                (lead_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "lead_id": row["lead_id"],
+            "company_id": row["company_id"],
+            "company_name": row["company_name"],
+            "company_domain": row["company_domain"],
+            "run_count": int(row["run_count"]),
+            "last_stage": row["last_stage"],
+            "last_trace_id": row["last_trace_id"],
+            "started_at": row["started_at"],
+            "updated_at": row["updated_at"],
+        }
+
     def upsert_act2_briefs(
         self,
         *,

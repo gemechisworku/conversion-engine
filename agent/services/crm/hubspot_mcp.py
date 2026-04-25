@@ -152,11 +152,18 @@ class HubSpotMCPService:
         stage: str,
         trace_id: str,
         idempotency_key: str,
+        company_name: str | None = None,
+        company_domain: str | None = None,
     ) -> CRMWriteResult:
+        payload: dict[str, Any] = {"stage": stage}
+        if company_name:
+            payload["company_name"] = company_name
+        if company_domain:
+            payload["company_domain"] = company_domain
         return await self.append_event(
             lead_id=lead_id,
             event_type="lead_stage_updated",
-            payload={"stage": stage},
+            payload=payload,
             trace_id=trace_id,
             idempotency_key=idempotency_key,
         )
@@ -168,11 +175,18 @@ class HubSpotMCPService:
         brief_refs: list[str],
         trace_id: str,
         idempotency_key: str,
+        company_name: str | None = None,
+        company_domain: str | None = None,
     ) -> CRMWriteResult:
+        payload: dict[str, Any] = {"brief_refs": brief_refs}
+        if company_name:
+            payload["company_name"] = company_name
+        if company_domain:
+            payload["company_domain"] = company_domain
         return await self.append_event(
             lead_id=lead_id,
             event_type="brief_refs_attached",
-            payload={"brief_refs": brief_refs},
+            payload=payload,
             trace_id=trace_id,
             idempotency_key=idempotency_key,
         )
@@ -512,34 +526,39 @@ class HubSpotMCPService:
         event_key = self._coerce_str(payload.get("event_key")) if isinstance(payload, dict) else None
         event_payload = payload.get("payload", {}) if isinstance(payload, dict) else {}
         company_name, company_domain = self._company_context_from_event_payload(event_payload)
-        anchor_company_id = await self._ensure_event_anchor_company(
-            lead_id=lead_id,
-            company_name=company_name,
-            company_domain=company_domain,
-        )
+        anchor_company_id: int | None = None
+        try:
+            anchor_company_id = await self._ensure_event_anchor_company(
+                lead_id=lead_id,
+                company_name=company_name,
+                company_domain=company_domain,
+            )
+        except _MCPCallError:
+            # Best effort: still write the note event even without a company association.
+            anchor_company_id = None
         note_body = self._render_event_note_body(
             lead_id=lead_id,
             event_type=event_type,
             event_key=event_key,
             event_payload=event_payload,
         )
+        note_obj: dict[str, Any] = {
+            "objectType": "notes",
+            "properties": {
+                "hs_note_body": note_body,
+            },
+        }
+        if anchor_company_id is not None:
+            note_obj["associations"] = [
+                {
+                    "targetObjectId": anchor_company_id,
+                    "targetObjectType": "companies",
+                }
+            ]
 
         return {
             "createRequest": {
-                "objects": [
-                    {
-                        "objectType": "notes",
-                        "properties": {
-                            "hs_note_body": note_body,
-                        },
-                        "associations": [
-                            {
-                                "targetObjectId": anchor_company_id,
-                                "targetObjectType": "companies",
-                            }
-                        ],
-                    }
-                ]
+                "objects": [note_obj]
             },
             "confirmationStatus": "CONFIRMATION_WAIVED_FOR_SESSION",
         }
@@ -554,11 +573,14 @@ class HubSpotMCPService:
             return None
 
         company_name, company_domain = self._company_context_from_event_payload(event_payload)
-        anchor_company_id = await self._ensure_event_anchor_company(
-            lead_id=lead_id,
-            company_name=company_name,
-            company_domain=company_domain,
-        )
+        try:
+            anchor_company_id = await self._ensure_event_anchor_company(
+                lead_id=lead_id,
+                company_name=company_name,
+                company_domain=company_domain,
+            )
+        except _MCPCallError:
+            return None
         properties = self._event_projection_properties(event_type=event_type, event_payload=event_payload)
         if not properties:
             return None
@@ -730,26 +752,13 @@ class HubSpotMCPService:
             }
             return await self._create_anchor_company(create_args=create_args)
 
-        anchor_name = f"Lead {lead_id}"
-        existing_id = await self._find_company_by_domain_or_name(domain=None, name=anchor_name)
-        if existing_id is not None:
-            return existing_id
-
-        create_args = {
-            "createRequest": {
-                "objects": [
-                    {
-                        "objectType": "companies",
-                        "properties": {
-                            "name": anchor_name,
-                            "description": f"event_anchor_for_lead_id={lead_id}",
-                        },
-                    }
-                ]
-            },
-            "confirmationStatus": "CONFIRMATION_WAIVED_FOR_SESSION",
-        }
-        return await self._create_anchor_company(create_args=create_args)
+        # Do not create synthetic "Lead <id>" companies; this is noisy for non-technical CRM users.
+        # If we cannot infer company context for this event, skip company association creation.
+        raise _MCPCallError(
+            "Unable to resolve company context for HubSpot event association (missing company_name/company_domain).",
+            retryable=False,
+            details={"lead_id": lead_id},
+        )
 
     async def _create_anchor_company(self, *, create_args: dict[str, Any]) -> int:
         create_result = await self._call_tool(name="manage_crm_objects", arguments=create_args)

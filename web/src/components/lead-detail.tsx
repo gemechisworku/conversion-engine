@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import { orchestrationFetch, OrchestrationApiError } from "@/lib/api";
-import type { EvidenceEdge, LeadStatePayload, ResponseEnvelope } from "@/lib/types";
+import type { EvidenceEdge, LeadBriefsPayload, LeadStatePayload, ResponseEnvelope } from "@/lib/types";
 
 type EvidenceResponse = { edges: EvidenceEdge[] };
 
@@ -55,6 +55,7 @@ function summarizePayload(payload: Record<string, unknown>): string {
 export function LeadDetail({ leadId }: { leadId: string }) {
   const [state, setState] = useState<ResponseEnvelope<LeadStatePayload> | null>(null);
   const [evidence, setEvidence] = useState<EvidenceEdge[] | null>(null);
+  const [briefs, setBriefs] = useState<LeadBriefsPayload["briefs"] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -66,15 +67,19 @@ export function LeadDetail({ leadId }: { leadId: string }) {
       setState(s);
       if (s.status !== "success") {
         setEvidence([]);
+        setBriefs(null);
         return;
       }
-      const e = await orchestrationFetch<EvidenceResponse>(
-        `/memory/evidence/${encodeURIComponent(leadId)}?limit=100`,
-      );
+      const [e, b] = await Promise.all([
+        orchestrationFetch<EvidenceResponse>(`/memory/evidence/${encodeURIComponent(leadId)}?limit=100`),
+        orchestrationFetch<LeadBriefsPayload>(`/lead/${encodeURIComponent(leadId)}/briefs`),
+      ]);
       setEvidence(e.status === "success" && Array.isArray(e.data.edges) ? e.data.edges : []);
+      setBriefs(b.status === "success" ? b.data.briefs : null);
     } catch (err) {
       setState(null);
       setEvidence(null);
+      setBriefs(null);
       setError(err instanceof OrchestrationApiError ? err.message : "Failed to load lead");
     } finally {
       setLoading(false);
@@ -112,15 +117,15 @@ export function LeadDetail({ leadId }: { leadId: string }) {
   }
 
   const d = state.data;
+  const companyTitle = d.company_name || d.company_id || "Company";
+  const companySubtitle = d.company_domain || d.company_id || "";
 
   return (
     <div className="space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
-          <h1 className="text-xl font-semibold text-foreground">{d.lead_id}</h1>
-          <p className="text-sm text-muted">
-            Trace <code className="rounded bg-background px-1">{state.trace_id}</code>
-          </p>
+          <h1 className="text-xl font-semibold text-foreground">{companyTitle}</h1>
+          {companySubtitle && <p className="text-sm text-muted">{companySubtitle}</p>}
         </div>
         <Link href="/pipeline" className="text-sm font-medium text-primary hover:underline">
           ← Pipeline
@@ -163,6 +168,31 @@ export function LeadDetail({ leadId }: { leadId: string }) {
           </button>
         </section>
       </div>
+
+      <section className="rounded-lg border border-border bg-surface p-4 shadow-sm">
+        <h2 className="text-sm font-semibold text-foreground">Briefs</h2>
+        <p className="mt-1 text-xs text-muted">Open each brief to inspect JSON details.</p>
+        <div className="mt-3 grid gap-3 md:grid-cols-3">
+          <details className="rounded-md border border-border bg-background p-3">
+            <summary className="cursor-pointer text-sm font-medium text-foreground">Hiring signal brief</summary>
+            <pre className="mt-2 max-h-64 overflow-auto text-xs text-muted">
+              {JSON.stringify(briefs?.hiring_signal_brief || {}, null, 2)}
+            </pre>
+          </details>
+          <details className="rounded-md border border-border bg-background p-3">
+            <summary className="cursor-pointer text-sm font-medium text-foreground">Competitor gap brief</summary>
+            <pre className="mt-2 max-h-64 overflow-auto text-xs text-muted">
+              {JSON.stringify(briefs?.competitor_gap_brief || {}, null, 2)}
+            </pre>
+          </details>
+          <details className="rounded-md border border-border bg-background p-3">
+            <summary className="cursor-pointer text-sm font-medium text-foreground">AI maturity score</summary>
+            <pre className="mt-2 max-h-64 overflow-auto text-xs text-muted">
+              {JSON.stringify(briefs?.ai_maturity_score || {}, null, 2)}
+            </pre>
+          </details>
+        </div>
+      </section>
 
       <section className="rounded-lg border border-border bg-surface p-4 shadow-sm">
         <h2 className="text-sm font-semibold text-foreground">Evidence graph (recent)</h2>

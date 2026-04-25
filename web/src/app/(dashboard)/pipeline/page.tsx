@@ -1,12 +1,9 @@
 "use client";
 
 import { HealthStatus } from "@/components/health-status";
-import { PipelineRunsList } from "@/components/pipeline-runs-list";
 import { ProcessLeadForm } from "@/components/process-lead-form";
-import { useState } from "react";
 
 export default function PipelinePage() {
-  const [refreshToken, setRefreshToken] = useState(0);
   return (
     <div className="mx-auto max-w-4xl space-y-8">
       <div>
@@ -16,8 +13,7 @@ export default function PipelinePage() {
         </p>
       </div>
       <HealthStatus />
-      <ProcessLeadForm onPipelineChanged={() => setRefreshToken((n) => n + 1)} />
-      <PipelineRunsList refreshToken={refreshToken} />
+      <ProcessLeadForm />
     </div>
   );
 }

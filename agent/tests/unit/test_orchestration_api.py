@@ -43,3 +43,23 @@ def test_delete_pipeline_unknown_returns_failure() -> None:
     body = res.json()
     assert body["status"] == "failure"
     assert body["error"]["error_code"] == "INVALID_INPUT"
+
+
+def test_get_pipeline_unknown_returns_failure() -> None:
+    app = create_orchestration_app()
+    with TestClient(app) as client:
+        res = client.get("/pipelines/lead_does_not_exist_zzzz")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "failure"
+    assert body["error"]["error_code"] == "INVALID_INPUT"
+
+
+def test_get_lead_briefs_unknown_returns_failure() -> None:
+    app = create_orchestration_app()
+    with TestClient(app) as client:
+        res = client.get("/lead/lead_does_not_exist_zzzz/briefs")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "failure"
+    assert body["error"]["error_code"] == "INVALID_INPUT"
