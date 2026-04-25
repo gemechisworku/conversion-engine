@@ -129,6 +129,10 @@ class Settings(BaseSettings):
     http_timeout_seconds: float = Field(default=20.0, alias="HTTP_TIMEOUT_SECONDS")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
+    # Orchestration REST (`agent/api/orchestration_app.py`) — SPA / frontend
+    orchestration_api_key: str = Field(default="", alias="ORCHESTRATION_API_KEY")
+    orchestration_cors_origins: str = Field(default="", alias="ORCHESTRATION_CORS_ORIGINS")
+
     serpapi_api_key: str = Field(default="", alias="SERPAPI_API_KEY")
 
     def require(self, *field_names: str) -> None:

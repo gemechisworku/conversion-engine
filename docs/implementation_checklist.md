@@ -8,7 +8,8 @@ This table maps the plan to concrete locations and status. **Done** = matches ru
 | **Phase 0** | Settings / secrets | `agent/config/settings.py` | Done |
 | **Phase 0** | Logging | `agent/config/logging.py` | Done |
 | **Phase 0** | Graph state objects | `agent/graphs/state.py` | Done |
-| **Phase 0** | Webhook contract verification | `specs/`, deploy docs | Partial — confirm vs Render |
+| **Phase 0** | Webhook contract verification | `specs/`, deploy docs | Done (deployed webhooks verified in env) |
+| **Phase FE** | Orchestration REST for SPA (`/health`, CORS, optional API key, OpenAPI tags) | `agent/api/orchestration_app.py`, `agent/api/middleware.py`, `agent/api/security.py`; `.env.example` `ORCHESTRATION_*` | **Done** |
 | **Phase 1** | Email client / webhook / router | `agent/services/email/` | Done |
 | **Phase 1** | Email tests | `agent/tests/unit/test_email_*.py` | Done |
 | **Phase 2** | SMS + warm policy | `agent/services/sms/`, `policy/channel_policy.py` | Done |
@@ -39,6 +40,7 @@ This table maps the plan to concrete locations and status. **Done** = matches ru
 - **`scheduling_langgraph`**: LangGraph with nodes `book_and_sync` → `transition`, invoked from `run_scheduling`.
 - **`lead_graph.run_lead_intake`**: Langfuse workflow spans around scoring / ICP / gap / hiring brief; `enrich_company` per-adapter spans when settings + trace present; evidence edges after brief persist.
 - **`GET /memory/evidence/{lead_id}`**: lists `evidence_graph_edges` for a known lead.
+- **Frontend-ready API**: `GET /health`; optional **`ORCHESTRATION_API_KEY`** (`X-API-Key` or `Bearer`); optional **`ORCHESTRATION_CORS_ORIGINS`** (comma-separated); OpenAPI **tags**; evidence list supports **`?limit=`** (1–500).
 
 ## Suggested next steps (remaining gaps)
 
