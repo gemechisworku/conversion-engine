@@ -66,8 +66,10 @@ export function LandingContent() {
         <div className="pointer-events-none absolute -right-20 -top-24 h-64 w-64 rounded-full bg-cyan-300/25 blur-3xl dark:bg-cyan-400/15" />
         <div className="pointer-events-none absolute -bottom-16 left-8 h-60 w-60 rounded-full bg-primary/25 blur-3xl dark:bg-primary/20" />
         <div className="relative space-y-7">
-          <p className="font-mono text-xs uppercase tracking-[0.24em] text-primary">Tenacious Ops</p>
-          <div className="space-y-3">
+          <p className="stage-reveal font-mono text-xs uppercase tracking-[0.24em] text-primary" style={{ animationDelay: "40ms" }}>
+            Tenacious Ops
+          </p>
+          <div className="stage-reveal space-y-3" style={{ animationDelay: "120ms" }}>
             <h1 className="max-w-3xl text-4xl font-semibold tracking-tight text-foreground md:text-5xl">
               From signal research to booked calls.
             </h1>
@@ -75,21 +77,21 @@ export function LandingContent() {
               One orchestration surface for lead intake, outreach, reply handling, and scheduling.
             </p>
           </div>
-          <div className="flex flex-wrap items-center gap-3">
+          <div className="stage-reveal flex flex-wrap items-center gap-3" style={{ animationDelay: "200ms" }}>
             <Link
               href="/pipeline"
-              className="rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground transition hover:opacity-90"
+              className="rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground transition-all duration-300 hover:-translate-y-0.5 hover:opacity-90"
             >
               Open Pipeline
             </Link>
             <Link
               href="/runs"
-              className="rounded-lg border border-border bg-background/70 px-4 py-2 text-sm font-semibold text-foreground transition hover:bg-background"
+              className="rounded-lg border border-border bg-background/70 px-4 py-2 text-sm font-semibold text-foreground transition-all duration-300 hover:-translate-y-0.5 hover:bg-background"
             >
               View Runs
             </Link>
           </div>
-          <div className="flex flex-wrap gap-2">
+          <div className="stage-reveal flex flex-wrap gap-2" style={{ animationDelay: "280ms" }}>
             {PILLARS.map((pill) => (
               <span
                 key={pill}
@@ -117,17 +119,21 @@ export function LandingContent() {
           <div className="relative mx-auto flex min-w-[980px] items-start justify-between px-6">
             <div className="absolute left-20 right-20 top-9 h-px bg-gradient-to-r from-primary/20 via-primary/60 to-cyan-500/40" />
             {WORKFLOW_STEPS.map((step, index) => (
-              <div key={step.id} className="group relative flex w-32 shrink-0 flex-col items-center text-center">
+              <div
+                key={step.id}
+                className="stage-reveal group relative flex w-32 shrink-0 flex-col items-center text-center"
+                style={{ animationDelay: `${140 + index * 75}ms` }}
+              >
                 <button
                   type="button"
-                  className="relative z-10 flex h-[72px] w-[72px] items-center justify-center rounded-2xl border border-primary/40 bg-background/90 text-sm font-semibold text-foreground shadow-sm transition group-hover:-translate-y-0.5 group-hover:border-primary/70 group-focus-visible:outline-none group-focus-visible:ring-2 group-focus-visible:ring-primary/60"
+                  className="relative z-10 flex h-[72px] w-[72px] items-center justify-center rounded-2xl border border-primary/40 bg-background/90 text-sm font-semibold text-foreground shadow-sm transition-all duration-300 group-hover:-translate-y-1 group-hover:scale-[1.03] group-hover:border-primary/70 group-hover:shadow-lg group-focus-visible:outline-none group-focus-visible:ring-2 group-focus-visible:ring-primary/60"
                   aria-label={`${step.title}: ${step.detail}`}
                 >
                   {String(index + 1).padStart(2, "0")}
                 </button>
                 <p className="mt-3 text-xs font-semibold uppercase tracking-[0.16em] text-foreground/90">{step.title}</p>
 
-                <div className="pointer-events-none absolute left-1/2 top-28 z-20 w-60 -translate-x-1/2 rounded-2xl border border-border/80 bg-surface/95 p-3 text-left opacity-0 shadow-xl backdrop-blur transition duration-200 group-hover:opacity-100 group-focus-within:opacity-100">
+                <div className="pointer-events-none absolute left-1/2 top-28 z-20 w-60 -translate-x-1/2 translate-y-1 rounded-2xl border border-border/80 bg-surface/95 p-3 text-left opacity-0 shadow-xl backdrop-blur transition-all duration-200 group-hover:translate-y-0 group-hover:opacity-100 group-focus-within:translate-y-0 group-focus-within:opacity-100">
                   <p className="font-mono text-xs font-semibold text-primary">{step.state}</p>
                   <p className="mt-2 text-xs leading-relaxed text-muted">{step.detail}</p>
                 </div>

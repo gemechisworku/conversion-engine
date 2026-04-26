@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
+import sys
 from urllib.parse import urlparse
 from urllib.robotparser import RobotFileParser
 from datetime import UTC, datetime
@@ -14,6 +17,8 @@ from agent.config.settings import Settings
 from agent.services.enrichment.schemas import SignalSnapshot, SourceRef
 
 ROLE_PATTERN = re.compile(r"<[^>]+>|\s+")
+LOGGER = logging.getLogger("agent.enrichment.jobs")
+MAX_JOB_SOURCE_TIMEOUT_SECONDS = 8.0
 
 
 class JobsPlaywrightCollector:
@@ -29,6 +34,9 @@ class JobsPlaywrightCollector:
     ) -> None:
         self._settings = settings
         self._http_client = http_client
+        self._playwright_fallback_enabled = bool(settings.jobs_playwright_fallback_enabled)
+        self._playwright_attempt_lock = asyncio.Lock()
+        self._subprocess_supported: bool | None = None
 
     async def collect(self, *, company_domain: str, company_name: str | None = None) -> SignalSnapshot:
         slug = self._slug(company_name or company_domain)
@@ -40,12 +48,29 @@ class JobsPlaywrightCollector:
         ]
         html_pages: list[tuple[str, str]] = []
         blocked_urls: list[str] = []
-        for url in urls:
-            allowed = await self._robots_allowed(url=url)
+        per_request_timeout = min(float(self._settings.http_timeout_seconds), MAX_JOB_SOURCE_TIMEOUT_SECONDS)
+
+        async def inspect_url(url: str, *, client: httpx.AsyncClient | None = None) -> tuple[str, str | None, bool]:
+            allowed = await self._robots_allowed(url=url, timeout=per_request_timeout, client=client)
             if not allowed:
+                return url, None, True
+            html = await self._fetch_html(url=url, timeout=per_request_timeout, client=client)
+            return url, html, False
+
+        async def collect_with_client(client: httpx.AsyncClient | None) -> list[tuple[str, str | None, bool]]:
+            tasks = [inspect_url(url, client=client) for url in urls]
+            return await asyncio.gather(*tasks)
+
+        if self._http_client is not None:
+            results = await collect_with_client(self._http_client)
+        else:
+            async with httpx.AsyncClient(timeout=per_request_timeout) as client:
+                results = await collect_with_client(client)
+
+        for url, html, blocked in results:
+            if blocked:
                 blocked_urls.append(url)
                 continue
-            html = await self._fetch_html(url=url)
             if html:
                 html_pages.append((url, html))
 
@@ -82,40 +107,86 @@ class JobsPlaywrightCollector:
             source_refs=[SourceRef(source_name="jobs_playwright", source_url=url) for url, _ in html_pages],
         )
 
-    async def _fetch_html(self, *, url: str) -> str | None:
+    async def _fetch_html(
+        self,
+        *,
+        url: str,
+        timeout: float | None = None,
+        client: httpx.AsyncClient | None = None,
+    ) -> str | None:
         try:
-            response = await self._get(url=url)
+            response = await self._get(url=url, timeout=timeout, client=client)
             if response.is_success and "text/html" in response.headers.get("Content-Type", "text/html"):
                 return response.text
         except httpx.HTTPError:
             pass
         if self._http_client is None:
-            return await self._fetch_html_with_playwright(url=url)
+            return await self._fetch_html_with_playwright(url=url, timeout=timeout)
         return None
 
-    async def _fetch_html_with_playwright(self, *, url: str) -> str | None:
-        try:
-            from playwright.async_api import async_playwright
-        except ImportError:
+    async def _fetch_html_with_playwright(self, *, url: str, timeout: float | None = None) -> str | None:
+        if not self._playwright_fallback_enabled:
             return None
-        try:
-            async with async_playwright() as playwright:
-                browser = await playwright.chromium.launch(headless=True)
-                page = await browser.new_page(user_agent="TenaciousConversionEngineBot")
-                await page.goto(url, wait_until="domcontentloaded", timeout=int(self._settings.http_timeout_seconds * 1000))
-                html = await page.content()
-                await browser.close()
-                return html
-        except Exception:
+        if not await self._subprocess_spawn_supported():
+            self._playwright_fallback_enabled = False
             return None
+        html: str | None = None
+        async with self._playwright_attempt_lock:
+            if not self._playwright_fallback_enabled:
+                return None
+            try:
+                from playwright.async_api import async_playwright
+            except ImportError:
+                self._playwright_fallback_enabled = False
+                return None
+            try:
+                timeout_ms = int((timeout or self._settings.http_timeout_seconds) * 1000)
+                async with async_playwright() as playwright:
+                    browser = await playwright.chromium.launch(headless=True)
+                    page = await browser.new_page(user_agent="TenaciousConversionEngineBot")
+                    await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                    html = await page.content()
+                    await browser.close()
+            except Exception as exc:
+                text = str(exc).lower()
+                if "access is denied" in text or "permission" in text or "winerror 5" in text:
+                    self._playwright_fallback_enabled = False
+                    LOGGER.info("Playwright fallback disabled for jobs collector after permission failure.")
+            if html is None:
+                self._playwright_fallback_enabled = False
+            return html
 
-    async def _robots_allowed(self, *, url: str) -> bool:
+    async def _subprocess_spawn_supported(self) -> bool:
+        if self._subprocess_supported is not None:
+            return self._subprocess_supported
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                "pass",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+            self._subprocess_supported = True
+        except Exception as exc:
+            self._subprocess_supported = False
+            LOGGER.info("Jobs collector subprocess checks failed; skipping Playwright fallback.", extra={"error": str(exc)})
+        return self._subprocess_supported
+
+    async def _robots_allowed(
+        self,
+        *,
+        url: str,
+        timeout: float | None = None,
+        client: httpx.AsyncClient | None = None,
+    ) -> bool:
         parsed = urlparse(url)
         if not parsed.scheme or not parsed.netloc:
             return False
         robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
         try:
-            response = await self._get(url=robots_url)
+            response = await self._get(url=robots_url, timeout=timeout, client=client)
         except httpx.HTTPError:
             return True
         if not response.is_success:
@@ -125,11 +196,19 @@ class JobsPlaywrightCollector:
         parser.parse(response.text.splitlines())
         return parser.can_fetch("TenaciousConversionEngineBot", url)
 
-    async def _get(self, *, url: str) -> httpx.Response:
-        if self._http_client is not None:
-            return await self._http_client.get(url, timeout=self._settings.http_timeout_seconds)
-        async with httpx.AsyncClient(timeout=self._settings.http_timeout_seconds) as client:
-            return await client.get(url)
+    async def _get(
+        self,
+        *,
+        url: str,
+        timeout: float | None = None,
+        client: httpx.AsyncClient | None = None,
+    ) -> httpx.Response:
+        request_timeout = timeout or self._settings.http_timeout_seconds
+        active_client = client or self._http_client
+        if active_client is not None:
+            return await active_client.get(url, timeout=request_timeout)
+        async with httpx.AsyncClient(timeout=request_timeout) as one_off_client:
+            return await one_off_client.get(url)
 
     @staticmethod
     def _extract_role_titles(html_pages: list[str]) -> list[str]:

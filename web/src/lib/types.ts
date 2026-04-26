@@ -93,6 +93,9 @@ export type MemorySessionPayload = {
   lead_id: string;
   session_state: {
     current_stage: string;
+    current_objective?: string;
+    next_best_action?: string;
+    pending_actions?: Array<Record<string, unknown>>;
     updated_at?: string;
   };
 };

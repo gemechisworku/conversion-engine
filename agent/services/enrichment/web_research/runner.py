@@ -73,7 +73,11 @@ def _dedupe_ranked(pages: list[RankedPage]) -> list[RankedPage]:
 
 
 def build_research_runner(*, settings: Settings, http_client: httpx.AsyncClient | None = None) -> ControlledWebResearchRunner:
-    fetcher = PageFetcher(settings=settings, http_client=http_client, use_playwright_fallback=http_client is None)
+    fetcher = PageFetcher(
+        settings=settings,
+        http_client=http_client,
+        use_playwright_fallback=http_client is None and settings.web_research_playwright_fallback_enabled,
+    )
     deps = ResearchDeps(
         settings=settings,
         http_client=http_client,

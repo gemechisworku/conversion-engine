@@ -139,6 +139,11 @@ class Settings(BaseSettings):
     orchestration_cors_allow_localhost_dev: bool = Field(default=True, alias="ORCHESTRATION_CORS_ALLOW_LOCALHOST_DEV")
 
     serpapi_api_key: str = Field(default="", alias="SERPAPI_API_KEY")
+    jobs_playwright_fallback_enabled: bool = Field(default=False, alias="JOBS_PLAYWRIGHT_FALLBACK_ENABLED")
+    web_research_playwright_fallback_enabled: bool = Field(
+        default=False,
+        alias="WEB_RESEARCH_PLAYWRIGHT_FALLBACK_ENABLED",
+    )
 
     def require(self, *field_names: str) -> None:
         """Raise a ValueError if required settings are not configured."""

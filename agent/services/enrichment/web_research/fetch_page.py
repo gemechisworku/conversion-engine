@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import sys
+
 import httpx
 
 from agent.config.settings import Settings
 from agent.services.enrichment.web_research.html_extract import is_blocked_or_low_signal
+
+LOGGER = logging.getLogger("agent.enrichment.web_research")
 
 
 class PageFetcher:
@@ -22,6 +28,9 @@ class PageFetcher:
         self._settings = settings
         self._http_client = http_client
         self._use_playwright_fallback = use_playwright_fallback
+        self._playwright_fallback_enabled = bool(use_playwright_fallback)
+        self._playwright_attempt_lock = asyncio.Lock()
+        self._subprocess_supported: bool | None = None
 
     async def fetch_html(self, *, url: str, timeout: float) -> str | None:
         headers = {
@@ -44,21 +53,56 @@ class PageFetcher:
 
     async def fetch_html_with_fallback(self, *, url: str, timeout: float) -> str | None:
         html = await self.fetch_html(url=url, timeout=timeout)
-        if html or self._http_client is not None or not self._use_playwright_fallback:
+        if html or self._http_client is not None or not self._use_playwright_fallback or not self._playwright_fallback_enabled:
             return html
-        try:
-            from playwright.async_api import async_playwright
-        except ImportError as exc:  # pragma: no cover
-            raise RuntimeError("Playwright is not installed.") from exc
-        async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True)
+        if not await self._subprocess_spawn_supported():
+            self._playwright_fallback_enabled = False
+            return None
+        fallback_html: str | None = None
+        async with self._playwright_attempt_lock:
+            if not self._playwright_fallback_enabled:
+                return None
             try:
-                context = await browser.new_context(ignore_https_errors=True)
-                page = await context.new_page()
-                await page.goto(url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
-                return await page.content()
-            finally:
-                await browser.close()
+                from playwright.async_api import async_playwright
+            except ImportError as exc:  # pragma: no cover
+                self._playwright_fallback_enabled = False
+                raise RuntimeError("Playwright is not installed.") from exc
+            try:
+                async with async_playwright() as playwright:
+                    browser = await playwright.chromium.launch(headless=True)
+                    try:
+                        context = await browser.new_context(ignore_https_errors=True)
+                        page = await context.new_page()
+                        await page.goto(url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
+                        fallback_html = await page.content()
+                    finally:
+                        await browser.close()
+            except Exception as exc:
+                text = str(exc).lower()
+                if "access is denied" in text or "permission" in text or "winerror 5" in text:
+                    self._playwright_fallback_enabled = False
+                    LOGGER.info("Playwright fallback disabled for web research after permission failure.")
+            if fallback_html is None:
+                self._playwright_fallback_enabled = False
+            return fallback_html
+
+    async def _subprocess_spawn_supported(self) -> bool:
+        if self._subprocess_supported is not None:
+            return self._subprocess_supported
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                "pass",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+            self._subprocess_supported = True
+        except Exception as exc:
+            self._subprocess_supported = False
+            LOGGER.info("Web research subprocess checks failed; skipping Playwright fallback.", extra={"error": str(exc)})
+        return self._subprocess_supported
 
     @staticmethod
     def page_usable(*, html: str) -> bool:
