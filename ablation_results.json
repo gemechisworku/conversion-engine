@@ -1,0 +1,176 @@
+{
+  "status": "completed_held_out_policy_replay",
+  "generated_at": "2026-04-25T19:08:34.044018+00:00",
+  "target_failure_mode": "multi_thread_leakage",
+  "method_name": "Thread-Scoped Context Firewall (TSCF)",
+  "evaluation_mode": "held_out_policy_replay_simulation",
+  "seed": 42,
+  "bootstrap_B": 5000,
+  "held_out": {
+    "selection_method": "sha256(seed:probe_id)-sorted",
+    "heldout_probe_count": 20,
+    "heldout_probe_ids": [
+      "MTL-001",
+      "MTL-002",
+      "MTL-003",
+      "MTL-004",
+      "MTL-005",
+      "ICP-004",
+      "SIG-004",
+      "TON-004",
+      "BEN-001",
+      "TON-001",
+      "SIG-002",
+      "DCC-003",
+      "ICP-002",
+      "REL-002",
+      "COST-002",
+      "SIG-001",
+      "GAP-002",
+      "REL-003",
+      "DCC-002",
+      "GAP-001"
+    ],
+    "heldout_mtl_probe_ids": [
+      "MTL-001",
+      "MTL-002",
+      "MTL-003",
+      "MTL-004",
+      "MTL-005"
+    ],
+    "attempts_per_probe": 8,
+    "total_simulations": 800
+  },
+  "variants": [
+    {
+      "id": "A0",
+      "name": "day1_baseline",
+      "description": "Lead-scoped context retrieval baseline",
+      "metrics": {
+        "thread_isolation_violation_rate": 0.325,
+        "wrong_thread_reference_rate": 0.225,
+        "safe_success": 0.675,
+        "reply_progression_rate": 0.8625,
+        "booking_progression_rate": 0.84375,
+        "handoff_rate": 0.16875,
+        "cost_usd_per_simulation": 0.832523125,
+        "p50_latency_ms": 2202.0,
+        "p95_latency_ms": 2428.0
+      }
+    },
+    {
+      "id": "A1",
+      "name": "partition_only",
+      "description": "Participant key + thread-scoped retrieval",
+      "metrics": {
+        "thread_isolation_violation_rate": 0.2,
+        "wrong_thread_reference_rate": 0.15,
+        "safe_success": 0.8,
+        "reply_progression_rate": 0.90625,
+        "booking_progression_rate": 0.8625,
+        "handoff_rate": 0.13125,
+        "cost_usd_per_simulation": 0.85833375,
+        "p50_latency_ms": 2305.0,
+        "p95_latency_ms": 2498.0
+      }
+    },
+    {
+      "id": "A2",
+      "name": "partition_plus_ambiguity_gate",
+      "description": "A1 + ambiguity gate",
+      "metrics": {
+        "thread_isolation_violation_rate": 0.125,
+        "wrong_thread_reference_rate": 0.075,
+        "safe_success": 0.875,
+        "reply_progression_rate": 0.9,
+        "booking_progression_rate": 0.88125,
+        "handoff_rate": 0.14375,
+        "cost_usd_per_simulation": 0.900226875,
+        "p50_latency_ms": 2433.0,
+        "p95_latency_ms": 2657.0
+      }
+    },
+    {
+      "id": "A3",
+      "name": "full_tscf_method",
+      "description": "A2 + contamination detector + guarded regeneration",
+      "metrics": {
+        "thread_isolation_violation_rate": 0.0,
+        "wrong_thread_reference_rate": 0.0,
+        "safe_success": 1.0,
+        "reply_progression_rate": 0.89375,
+        "booking_progression_rate": 0.8875,
+        "handoff_rate": 0.1625,
+        "cost_usd_per_simulation": 0.950285625,
+        "p50_latency_ms": 2718.0,
+        "p95_latency_ms": 2932.0
+      }
+    }
+  ],
+  "comparison_baselines": {
+    "automated_optimization": {
+      "name": "AUTOOPT",
+      "metrics": {
+        "thread_isolation_violation_rate": 0.125,
+        "wrong_thread_reference_rate": 0.075,
+        "safe_success": 0.875,
+        "reply_progression_rate": 0.8875,
+        "booking_progression_rate": 0.88125,
+        "handoff_rate": 0.1375,
+        "cost_usd_per_simulation": 0.920334375,
+        "p50_latency_ms": 2657.0,
+        "p95_latency_ms": 2931.0
+      }
+    },
+    "published_tau2_reference": {
+      "source": "baseline.md",
+      "pass_at_1": 0.7267,
+      "pass_at_1_ci95": [
+        0.6504,
+        0.7917
+      ],
+      "note": "Informational benchmark; not thread-isolation-specific."
+    }
+  },
+  "deltas": {
+    "delta_A_method_minus_day1": {
+      "metric": "safe_success",
+      "mean": 0.324945,
+      "ci95": [
+        0.275,
+        0.375
+      ],
+      "p_value": 0.0,
+      "passes_requirement": true
+    },
+    "delta_B_method_minus_autoopt": {
+      "metric": "safe_success",
+      "mean": 0.125,
+      "ci95": [
+        0.125,
+        0.125
+      ],
+      "p_value": 0.0,
+      "informational_explanation_required_if_negative": true
+    },
+    "delta_C_method_minus_tau2_reference": {
+      "metric": "safe_success_vs_reference_proxy",
+      "mean": 0.2733,
+      "ci95": [
+        0.2733,
+        0.2733
+      ],
+      "informational_only": true
+    }
+  },
+  "statistical_test": {
+    "method": "bootstrap_tasks",
+    "alpha": 0.05,
+    "decision_rule": "DeltaA_mean>0 AND DeltaA_CI95_low>0 AND p_value<0.05"
+  },
+  "notes": [
+    "This is a held-out policy replay simulation using Act III observed baseline trigger rates.",
+    "Trace-level outcomes are deterministic given seed and variant policy multipliers.",
+    "Use live sealed-slice evaluation for final external benchmark claims."
+  ]
+}
