@@ -58,7 +58,6 @@ class LeadRespondRequest(BaseModel):
     content: str
     subject: str | None = None
     to_email: str | None = None
-    to_number: str | None = None
 
 
 class LeadSchedulePrepareRequest(BaseModel):
@@ -144,8 +143,6 @@ class OutreachSendRequest(BaseModel):
     review_id: str
     channel: str = "email"
     to_email: str | None = None
-    to_number: str | None = None
-    include_scheduling_link: bool = False
     idempotency_key: str | None = None
 
 

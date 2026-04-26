@@ -145,6 +145,46 @@ def test_calcom_booking_returns_normalized_object() -> None:
     assert result.status == "confirmed"
 
 
+def test_calcom_booking_http_400_surfaces_provider_message() -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={
+                "status": "error",
+                "error": {
+                    "code": "BadRequestException",
+                    "message": "User either already has booking at this time or is not available",
+                },
+            },
+        )
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    settings = _settings()
+    cal_service = CalComService(
+        settings=settings,
+        policy_service=OutboundPolicyService(settings),
+        http_client=http_client,
+    )
+    req = BookingRequest(
+        lead_id="lead_1",
+        trace_id="trace_1",
+        slot_id="slot_1",
+        starts_at=datetime.fromisoformat("2026-04-24T10:00:00+00:00"),
+        ends_at=datetime.fromisoformat("2026-04-24T10:30:00+00:00"),
+        timezone="UTC",
+        prospect_email="prospect@example.com",
+        confirmed_by_prospect=True,
+        idempotency_key="lead_1:slot_1",
+    )
+    result = asyncio.run(cal_service.book_discovery_call(req))
+    asyncio.run(http_client.aclose())
+
+    assert result.succeeded is False
+    assert result.error is not None
+    assert "not available" in result.error.error_message
+    assert result.error.details.get("provider_message") == "User either already has booking at this time or is not available"
+
+
 def test_successful_booking_triggers_hubspot_update() -> None:
     calls: list[str] = []
     tools_called: list[str] = []

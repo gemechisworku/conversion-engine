@@ -222,6 +222,36 @@ describe("LeadDetail", () => {
     await screen.findByText(/Extracted meeting preference/i);
     expect(screen.getByText(/Tuesday at 4 PM EAT works for me/i)).toBeInTheDocument();
     expect(screen.queryByLabelText(/Outbound reply content/i)).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Book extracted time/i })).toBeInTheDocument();
+    expect(screen.getByLabelText(/Booking date/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/Booking time/i)).toBeInTheDocument();
+    expect(screen.getByText(/Default time is 09:00/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Book selected time/i })).toBeInTheDocument();
+  });
+
+  it("sends selected booking date and time from pickers", async () => {
+    const leadId = "lead_test_4";
+    wireDefaultApiMocks(leadId, { nextAction: "schedule" });
+    render(<LeadDetail leadId={leadId} />);
+
+    await screen.findByText("Acme Test");
+    await userEvent.click(screen.getByRole("tab", { name: "Conversation" }));
+
+    const dateInput = await screen.findByLabelText(/Booking date/i);
+    const timeInput = screen.getByLabelText(/Booking time/i);
+    await userEvent.clear(dateInput);
+    await userEvent.type(dateInput, "2026-04-30");
+    await userEvent.clear(timeInput);
+    await userEvent.type(timeInput, "09:30");
+
+    await userEvent.click(screen.getByRole("button", { name: /Book selected time/i }));
+    await waitFor(() => {
+      expect(screen.getByText(/Booking confirmed/i)).toBeInTheDocument();
+    });
+
+    const scheduleBookCall = orchestrationFetchMock.mock.calls.find((call) => call[0] === "/lead/schedule/book");
+    expect(scheduleBookCall).toBeTruthy();
+    const body = JSON.parse(String((scheduleBookCall?.[1] as { body?: string })?.body || "{}"));
+    expect(body.starts_at_iso).toBe("2026-04-30T09:30:00");
+    expect(body.timezone).toBe("Africa/Addis_Ababa");
   });
 });

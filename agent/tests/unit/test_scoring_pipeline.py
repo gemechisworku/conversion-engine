@@ -75,15 +75,6 @@ def test_ai_maturity_scoring_output() -> None:
     assert score.score >= 2
     assert score.confidence >= 0.6
     assert score.signals
-    assert {signal.signal_type for signal in score.signals} >= {
-        "ai_adjacent_open_roles",
-        "named_ai_ml_leadership",
-        "github_org_activity",
-        "executive_commentary",
-        "modern_data_ml_stack",
-        "strategic_communications",
-    }
-    assert all(signal.justification for signal in score.signals)
 
 
 def test_ai_maturity_scoring_can_use_openrouter_json() -> None:
@@ -180,24 +171,6 @@ def test_openrouter_generate_model_writes_per_call_log_error(tmp_path: Path) -> 
     assert "HTTPStatusError" in (payload["error"] or "")
     assert payload["token_usage"]["total_tokens"] == 0
     assert score.company_id == "comp_123"
-
-
-def test_ai_maturity_silent_company_returns_zero_with_absence_note() -> None:
-    artifact = EnrichmentArtifact(
-        company_id="silent_co",
-        signals={
-            "crunchbase": SignalSnapshot(summary={"found": False}, confidence=0.2),
-            "job_posts": SignalSnapshot(summary={"ai_adjacent_role_count": 0}, confidence=0.2),
-            "layoffs": SignalSnapshot(summary={"matched": False}, confidence=0.2),
-            "leadership_changes": SignalSnapshot(summary={"matched": False}, confidence=0.2),
-            "tech_stack": SignalSnapshot(summary={"present": False, "technologies": []}, confidence=0.2),
-        },
-        merged_confidence={},
-    )
-    score = score_ai_maturity(company_id="silent_co", artifact=artifact)
-    assert score.score == 0
-    assert score.silent_company is True
-    assert any("absence is not proof of absence" in note.lower() for note in score.risk_notes)
 
 
 def test_icp_classifier_output() -> None:

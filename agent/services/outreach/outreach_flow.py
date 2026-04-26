@@ -159,7 +159,6 @@ async def run_outreach_send_for_lead(
     idempotency_key: str,
     to_email: str | None,
     email_service: EmailService | None,
-    override_text_body: str | None = None,
 ) -> tuple[str | None, str | None]:
     """POST /outreach/send — guardrails per outreach_api.md §Guardrails."""
     with langfuse_workflow_span(
@@ -204,8 +203,6 @@ async def run_outreach_send_for_lead(
             "trace_id": trace_id,
             "idempotency_key": idempotency_key,
         }
-        if override_text_body is not None:
-            merged["text_body"] = override_text_body
         req = OutboundEmailRequest.model_validate(merged)
         res = await email_service.send_email(req)
         if not res.accepted:
