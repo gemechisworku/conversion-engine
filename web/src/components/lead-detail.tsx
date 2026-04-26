@@ -129,6 +129,53 @@ function inferTraceIds(leadId: string): string[] {
   return [...set];
 }
 
+const DEFAULT_SCHEDULE_TIME = "09:00";
+
+function normalizeScheduleTimezone(raw?: string | null): string {
+  const value = (raw || "").trim();
+  if (!value || value.toLowerCase() === "unknown") return "UTC";
+  return value;
+}
+
+function todayIsoDate(): string {
+  const now = new Date();
+  const y = now.getUTCFullYear();
+  const m = String(now.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(now.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+function parseScheduleDateTime(startAtIso?: string | null, timezone?: string | null): { date: string; time: string } {
+  const fallback = { date: todayIsoDate(), time: DEFAULT_SCHEDULE_TIME };
+  if (!startAtIso) return fallback;
+  const parsed = new Date(startAtIso);
+  if (!Number.isNaN(parsed.getTime())) {
+    try {
+      const fmt = new Intl.DateTimeFormat("en-CA", {
+        timeZone: normalizeScheduleTimezone(timezone),
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        hourCycle: "h23",
+      });
+      const parts = fmt.formatToParts(parsed);
+      const byType: Record<string, string> = {};
+      for (const part of parts) byType[part.type] = part.value;
+      const date = `${byType.year}-${byType.month}-${byType.day}`;
+      const time = `${byType.hour}:${byType.minute}`;
+      if (date && time) return { date, time };
+    } catch {
+      // Fall through to regex fallback if timezone is not recognized.
+    }
+  }
+  const regex = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})/;
+  const match = regex.exec(startAtIso);
+  if (!match) return fallback;
+  return { date: match[1], time: match[2] };
+}
+
 export function LeadDetail({ leadId }: { leadId: string }) {
   const { pushToast } = useToast();
   const [state, setState] = useState<ResponseEnvelope<LeadStatePayload> | null>(null);
@@ -153,6 +200,10 @@ export function LeadDetail({ leadId }: { leadId: string }) {
   const [sessionPatch, setSessionPatch] = useState("{\n  \"next_best_action\": \"clarify\"\n}");
   const [transitionReason, setTransitionReason] = useState("Operator transition");
   const [transitionTarget, setTransitionTarget] = useState<string>("");
+  const [scheduleDateInput, setScheduleDateInput] = useState("");
+  const [scheduleTimeInput, setScheduleTimeInput] = useState(DEFAULT_SCHEDULE_TIME);
+  const [scheduleTimezoneInput, setScheduleTimezoneInput] = useState("UTC");
+  const [scheduleInputsEdited, setScheduleInputsEdited] = useState(false);
 
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [sendDialogOpen, setSendDialogOpen] = useState(false);
@@ -197,7 +248,33 @@ export function LeadDetail({ leadId }: { leadId: string }) {
 
   useEffect(() => {
     setSchedulePrepare(null);
+    setScheduleDateInput("");
+    setScheduleTimeInput(DEFAULT_SCHEDULE_TIME);
+    setScheduleTimezoneInput("UTC");
+    setScheduleInputsEdited(false);
   }, [leadId]);
+
+  useEffect(() => {
+    const nextAction = String((conversation?.session_state as Record<string, unknown> | undefined)?.next_best_action || "");
+    if (nextAction !== "schedule") return;
+    if (scheduleInputsEdited) return;
+    const schedulingContext =
+      ((conversation?.conversation_state?.scheduling_context || {}) as Record<string, unknown>) || {};
+    const slots = Array.isArray(schedulingContext.slots_proposed)
+      ? (schedulingContext.slots_proposed as Array<Record<string, unknown>>)
+      : [];
+    const startAt =
+      schedulePrepare?.meeting_time_start_at ||
+      (slots.find((slot) => typeof slot.start_at === "string")?.start_at as string | undefined) ||
+      null;
+    const timezone = normalizeScheduleTimezone(
+      schedulePrepare?.meeting_timezone || (schedulingContext.timezone as string | undefined),
+    );
+    const parsed = parseScheduleDateTime(startAt, timezone);
+    setScheduleDateInput(parsed.date);
+    setScheduleTimeInput(parsed.time);
+    setScheduleTimezoneInput(timezone);
+  }, [conversation, scheduleInputsEdited, schedulePrepare]);
 
   const currentState = state?.status === "success" ? state.data.state : "";
   const allowedTransitions = useMemo(() => transitionAllowList[currentState] ?? [], [currentState]);
@@ -372,12 +449,24 @@ export function LeadDetail({ leadId }: { leadId: string }) {
         throw new Error(env.error?.error_message || "Failed to prepare scheduling context.");
       }
       setSchedulePrepare(env.data);
+      const timezone = normalizeScheduleTimezone(env.data.meeting_timezone);
+      const parsed = parseScheduleDateTime(env.data.meeting_time_start_at, timezone);
+      setScheduleInputsEdited(false);
+      setScheduleDateInput(parsed.date);
+      setScheduleTimeInput(parsed.time);
+      setScheduleTimezoneInput(timezone);
       setSuccess("Scheduling context prepared from conversation history.");
       await load();
     });
   }
 
   async function onBookScheduling() {
+    if (!scheduleDateInput || !scheduleTimeInput) {
+      setActionError("Select both booking date and time before booking.");
+      return;
+    }
+    const normalizedTimezone = normalizeScheduleTimezone(scheduleTimezoneInput);
+    const startsAtIso = `${scheduleDateInput}T${scheduleTimeInput}:00`;
     await withAction("book_schedule", async () => {
       const env = await orchestrationFetch<LeadScheduleBookPayload>("/lead/schedule/book", {
         method: "POST",
@@ -385,8 +474,8 @@ export function LeadDetail({ leadId }: { leadId: string }) {
           idempotency_key: makeIdem("ui_schedule_book", leadId),
           lead_id: leadId,
           confirmed_by_prospect: true,
-          starts_at_iso: schedulePrepare?.meeting_time_start_at || undefined,
-          timezone: schedulePrepare?.meeting_timezone || undefined,
+          starts_at_iso: startsAtIso,
+          timezone: normalizedTimezone,
         }),
       });
       if (env.status !== "success") {
@@ -545,6 +634,7 @@ export function LeadDetail({ leadId }: { leadId: string }) {
     (scheduleSlots.find((slot) => typeof slot.start_at === "string")?.start_at as string | undefined) ||
     "";
   const scheduleTimezone = String(schedulePrepare?.meeting_timezone || schedulingContext.timezone || "unknown");
+  const selectedScheduleTimezone = normalizeScheduleTimezone(scheduleTimezoneInput || scheduleTimezone);
   const schedulingPortalUrl = schedulePrepare?.scheduling_portal_url || "";
   const visibleMessages = messages.filter((row) => {
     const kind = typeof row.metadata?.kind === "string" ? row.metadata.kind : "";
@@ -865,6 +955,47 @@ export function LeadDetail({ leadId }: { leadId: string }) {
                       </p>
                       <p className="text-muted">Timezone: {scheduleTimezone}</p>
                     </div>
+                    <div className="grid gap-2 sm:grid-cols-3">
+                      <label className="text-xs text-muted">
+                        Booking date
+                        <input
+                          type="date"
+                          value={scheduleDateInput}
+                          onChange={(e) => {
+                            setScheduleDateInput(e.target.value);
+                            setScheduleInputsEdited(true);
+                          }}
+                          className="mt-1 w-full rounded-md border border-border bg-background px-2 py-2 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/30"
+                        />
+                      </label>
+                      <label className="text-xs text-muted">
+                        Booking time
+                        <input
+                          type="time"
+                          value={scheduleTimeInput}
+                          onChange={(e) => {
+                            setScheduleTimeInput(e.target.value);
+                            setScheduleInputsEdited(true);
+                          }}
+                          className="mt-1 w-full rounded-md border border-border bg-background px-2 py-2 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/30"
+                        />
+                      </label>
+                      <label className="text-xs text-muted">
+                        Timezone
+                        <input
+                          value={selectedScheduleTimezone}
+                          onChange={(e) => {
+                            setScheduleTimezoneInput(e.target.value);
+                            setScheduleInputsEdited(true);
+                          }}
+                          placeholder="Africa/Addis_Ababa"
+                          className="mt-1 w-full rounded-md border border-border bg-background px-2 py-2 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/30"
+                        />
+                      </label>
+                    </div>
+                    <p className="text-[11px] text-muted">
+                      Default time is {DEFAULT_SCHEDULE_TIME}. Select an appropriate time before scheduling.
+                    </p>
                     <div className="flex flex-wrap gap-2">
                       <Button
                         variant="secondary"
@@ -888,9 +1019,9 @@ export function LeadDetail({ leadId }: { leadId: string }) {
                         variant="primary"
                         size="sm"
                         onClick={() => void onBookScheduling()}
-                        disabled={busyKey !== null || !scheduleMeetingText}
+                        disabled={busyKey !== null || !scheduleMeetingText || !scheduleDateInput || !scheduleTimeInput}
                       >
-                        {busyKey === "book_schedule" ? "Booking..." : "Book extracted time (Cal + HubSpot)"}
+                        {busyKey === "book_schedule" ? "Booking..." : "Book selected time (Cal + HubSpot)"}
                       </Button>
                     </div>
                   </>

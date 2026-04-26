@@ -20,7 +20,7 @@ from agent.graphs.state import LeadGraphState
 from agent.graphs.transitions import InvalidStateTransitionError, validate_lead_transition
 from agent.repositories.state_repo import SQLiteStateRepository
 from agent.services.calendar.calcom_client import CalComService, book_and_sync_crm
-from agent.services.calendar.schemas import BookingRequest
+from agent.services.calendar.schemas import AvailabilityRequest, BookingRequest, CalendarSlot
 from agent.services.common.schemas import ErrorEnvelope
 from agent.services.crm.schemas import CRMWriteResult
 from agent.services.crm.hubspot_mcp import HubSpotMCPService
@@ -53,11 +53,7 @@ from agent.services.orchestration.schemas import (
 )
 from agent.services.outreach.outreach_flow import OutreachFlowDeps, run_outreach_draft_only, run_outreach_review_for_lead, run_outreach_send_for_lead
 from agent.services.outreach.outreach_payload import parse_outreach_stored
-from agent.services.policy.channel_handoff import append_scheduling_cta, decide_channel_handoff
-from agent.services.policy.channel_policy import LeadChannelState
 from agent.services.policy.outbound_policy import OutboundPolicyService
-from agent.services.sms.client import SMSService
-from agent.services.sms.schemas import OutboundSMSRequest
 
 WEBHOOK_LOGGER = logging.getLogger("agent.webhooks.resend")
 
@@ -76,7 +72,6 @@ class OrchestrationRuntime:
         hubspot_service: HubSpotMCPService | None = None,
         calcom_service: CalComService | None = None,
         email_service: EmailService | None = None,
-        sms_service: SMSService | None = None,
     ) -> None:
         self._settings = settings
         self._state_repo = state_repo
@@ -84,7 +79,6 @@ class OrchestrationRuntime:
         self._hubspot = hubspot_service
         self._calcom = calcom_service
         self._email_service = email_service
-        self._sms_service = sms_service
         self._policy = OutboundPolicyService(settings)
         self._lead_intake_graph = compile_lead_intake_graph(
             LeadIntakeGraphDeps(
@@ -851,10 +845,16 @@ class OrchestrationRuntime:
         tz_name = timezone_hint or self._resolve_tz_name_from_text(meeting_text)
         tzinfo = date_tz.gettz(tz_name) if tz_name else None
         now = datetime.now(tz=tzinfo or UTC)
-        default_dt = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        relative_day_offset = self._relative_day_offset_from_text(meeting_text)
+        parse_text = meeting_text
+        if relative_day_offset is not None:
+            parse_text = re.sub(r"\b(today|tomorrow)\b", " ", meeting_text, flags=re.IGNORECASE)
+            parse_text = re.sub(r"\s+", " ", parse_text).strip() or meeting_text
+        default_base = now + timedelta(days=relative_day_offset or 0)
+        default_dt = default_base.replace(hour=9, minute=0, second=0, microsecond=0)
         try:
             parsed = date_parser.parse(
-                meeting_text,
+                parse_text,
                 fuzzy=True,
                 default=default_dt,
                 tzinfos={
@@ -871,9 +871,21 @@ class OrchestrationRuntime:
             return None, tz_name
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=tzinfo or UTC)
+        if relative_day_offset is not None:
+            relative_date = (now + timedelta(days=relative_day_offset)).date()
+            parsed = parsed.replace(year=relative_date.year, month=relative_date.month, day=relative_date.day)
         if parsed < now - timedelta(minutes=5):
-            parsed = parsed + timedelta(days=7)
+            parsed = parsed + timedelta(days=1 if relative_day_offset is not None else 7)
         return parsed, (tz_name or (parsed.tzname() if parsed.tzinfo is not None else None))
+
+    @staticmethod
+    def _relative_day_offset_from_text(meeting_text: str) -> int | None:
+        lowered = meeting_text.lower()
+        if re.search(r"\btomorrow\b", lowered):
+            return 1
+        if re.search(r"\btoday\b", lowered):
+            return 0
+        return None
 
     def _resolve_scheduling_portal_url(
         self,
@@ -917,96 +929,6 @@ class OrchestrationRuntime:
             return None
         return " ".join(part.capitalize() for part in local.split() if part)
 
-    def _channel_state_for_lead(self, *, lead_id: str) -> LeadChannelState:
-        rows = self._state_repo.list_messages(lead_id=lead_id, limit=200)
-        has_prior_email_reply = any(
-            row.get("direction") == "inbound" and str(row.get("channel") or "").lower() == "email"
-            for row in rows
-        )
-        has_recent_inbound_sms = any(
-            row.get("direction") == "inbound" and str(row.get("channel") or "").lower() == "sms"
-            for row in rows
-        )
-        conversation = self._state_repo.get_conversation_state(lead_id=lead_id) or {}
-        explicit_warm_status = bool(
-            conversation.get("last_customer_intent") in {"interest", "schedule"}
-            or has_prior_email_reply
-            or has_recent_inbound_sms
-        )
-        return LeadChannelState(
-            lead_id=lead_id,
-            has_prior_email_reply=has_prior_email_reply,
-            explicit_warm_status=explicit_warm_status,
-            has_recent_inbound_sms=has_recent_inbound_sms,
-        )
-
-    def _latest_inbound_sms_number(self, *, lead_id: str) -> str | None:
-        rows = self._state_repo.list_messages(lead_id=lead_id, limit=200)
-        for row in rows:
-            if row.get("direction") != "inbound" or str(row.get("channel") or "").lower() != "sms":
-                continue
-            metadata = row.get("metadata")
-            if isinstance(metadata, dict):
-                from_number = str(metadata.get("from_number") or "").strip()
-                if from_number:
-                    return from_number
-        return self._state_repo.get_bound_phone_for_lead(lead_id=lead_id)
-
-    def _should_include_scheduling_link(
-        self,
-        *,
-        session: dict[str, Any],
-        conversation: dict[str, Any],
-    ) -> bool:
-        next_action = str(session.get("next_best_action") or "").strip().lower()
-        if next_action in {"schedule", "delegate_scheduler"}:
-            return True
-        last_intent = str(conversation.get("last_customer_intent") or "").strip().lower()
-        return last_intent == "schedule"
-
-    async def _append_hubspot_channel_handoff_event(
-        self,
-        *,
-        lead_id: str,
-        trace_id: str,
-        requested_channel: str,
-        resolved_channel: str,
-        reason: str,
-        idempotency_key: str,
-    ) -> None:
-        if self._hubspot is None:
-            return
-        await self._hubspot.append_event(
-            lead_id=lead_id,
-            event_type="channel_handoff",
-            payload={
-                "requested_channel": requested_channel,
-                "resolved_channel": resolved_channel,
-                "reason": reason,
-            },
-            trace_id=trace_id,
-            idempotency_key=idempotency_key,
-        )
-
-    async def _append_hubspot_scheduling_link_event(
-        self,
-        *,
-        lead_id: str,
-        trace_id: str,
-        channel: str,
-        scheduling_portal_url: str,
-        idempotency_key: str,
-    ) -> None:
-        if self._hubspot is None:
-            return
-        await self._hubspot.append_event(
-            lead_id=lead_id,
-            event_type="scheduling_link_shared",
-            payload={"channel": channel, "scheduling_portal_url": scheduling_portal_url},
-            trace_id=trace_id,
-            idempotency_key=idempotency_key,
-        )
-
     async def respond_to_lead(self, request: LeadRespondRequest) -> ResponseEnvelope:
         request_id = f"req_{uuid4().hex[:10]}"
         trace_id = f"trace_respond_{uuid4().hex[:12]}"
@@ -1023,12 +945,20 @@ class OrchestrationRuntime:
         if cached is not None:
             return ResponseEnvelope.model_validate(cached)
         channel = request.channel.strip().lower()
-        if channel not in {"email", "sms"}:
+        if channel != "email":
             return self._failure(
                 request_id=request_id,
                 trace_id=trace_id,
                 code="INVALID_INPUT",
-                message=f"Unsupported channel '{request.channel}'.",
+                message=f"Unsupported channel '{request.channel}'. Only email replies are supported in this action.",
+                retryable=False,
+            )
+        if self._email_service is None:
+            return self._failure(
+                request_id=request_id,
+                trace_id=trace_id,
+                code="CONFIG_ERROR",
+                message="EmailService not configured.",
                 retryable=False,
             )
         content = request.content.strip()
@@ -1040,235 +970,95 @@ class OrchestrationRuntime:
                 message="Outbound reply content is required.",
                 retryable=False,
             )
-        conversation = self._state_repo.get_conversation_state(lead_id=request.lead_id) or {}
-        lead_channel_state = self._channel_state_for_lead(lead_id=request.lead_id)
-        handoff = decide_channel_handoff(
-            lead_id=request.lead_id,
-            requested_channel=channel,
-            lead_state=lead_channel_state,
-            trace_id=trace_id,
-        )
-        if not handoff.allowed:
-            await self._append_hubspot_channel_handoff_event(
-                lead_id=request.lead_id,
-                trace_id=trace_id,
-                requested_channel=channel,
-                resolved_channel=handoff.resolved_channel,
-                reason=handoff.reason,
-                idempotency_key=f"{request.idempotency_key}:handoff_blocked",
-            )
+        to_email = (request.to_email or "").strip()
+        if not to_email:
+            latest_inbound = self._state_repo.get_latest_inbound_email_for_lead(lead_id=request.lead_id) or {}
+            to_email = str(latest_inbound.get("from_email") or "").strip()
+            if not to_email:
+                rows = self._state_repo.list_messages(lead_id=request.lead_id, limit=100)
+                for row in rows:
+                    if row.get("direction") == "inbound" and row.get("channel") == "email":
+                        meta = row.get("metadata", {}) if isinstance(row.get("metadata"), dict) else {}
+                        candidate = str(meta.get("from_email") or "").strip()
+                        if candidate:
+                            to_email = candidate
+                            break
+        if not to_email or "@" not in to_email:
             return self._failure(
                 request_id=request_id,
                 trace_id=trace_id,
-                code="POLICY_BLOCKED",
-                message=handoff.reason,
+                code="INVALID_INPUT",
+                message="Recipient email could not be resolved. Provide to_email explicitly.",
                 retryable=False,
             )
-        scheduling_portal_url: str | None = None
-        outbound_channel = handoff.resolved_channel
-        sent_message_id: str
-        if outbound_channel == "email":
-            if self._email_service is None:
-                return self._failure(
-                    request_id=request_id,
-                    trace_id=trace_id,
-                    code="CONFIG_ERROR",
-                    message="EmailService not configured.",
-                    retryable=False,
-                )
-            to_email = (request.to_email or "").strip()
-            if not to_email:
-                latest_inbound = self._state_repo.get_latest_inbound_email_for_lead(lead_id=request.lead_id) or {}
-                to_email = str(latest_inbound.get("from_email") or "").strip()
-                if not to_email:
-                    rows = self._state_repo.list_messages(lead_id=request.lead_id, limit=100)
-                    for row in rows:
-                        if row.get("direction") == "inbound" and row.get("channel") == "email":
-                            meta = row.get("metadata", {}) if isinstance(row.get("metadata"), dict) else {}
-                            candidate = str(meta.get("from_email") or "").strip()
-                            if candidate:
-                                to_email = candidate
-                                break
-            if not to_email or "@" not in to_email:
-                return self._failure(
-                    request_id=request_id,
-                    trace_id=trace_id,
-                    code="INVALID_INPUT",
-                    message="Recipient email could not be resolved. Provide to_email explicitly.",
-                    retryable=False,
-                )
-            latest_inbound = self._state_repo.get_latest_inbound_email_for_lead(lead_id=request.lead_id) or {}
-            inbound_subject = str(latest_inbound.get("subject") or "").strip()
-            subject = (request.subject or "").strip()
-            if not subject:
-                if inbound_subject.lower().startswith("re:"):
-                    subject = inbound_subject
-                elif inbound_subject:
-                    subject = f"Re: {inbound_subject}"
-                else:
-                    subject = "Re: Follow-up"
-            outbound_content = content
-            if self._should_include_scheduling_link(session=session, conversation=conversation):
-                scheduling_portal_url = self._resolve_scheduling_portal_url(
-                    lead_id=request.lead_id,
-                    meeting_text=None,
-                    starts_at=None,
-                    prospect_email=to_email,
-                )
-                outbound_content = append_scheduling_cta(
-                    content=outbound_content,
-                    channel="email",
-                    scheduling_portal_url=scheduling_portal_url,
-                )
-            in_reply_to, references = self._state_repo.get_email_thread_reply_headers(lead_id=request.lead_id)
-            outbound = OutboundEmailRequest(
-                lead_id=request.lead_id,
-                draft_id=f"reply_draft_{uuid4().hex[:12]}",
-                review_id=f"ui_reply_review_{uuid4().hex[:12]}",
-                review_status="approved_with_edits",
-                trace_id=trace_id,
-                idempotency_key=request.idempotency_key,
-                to_email=to_email,
-                subject=subject,
-                text_body=outbound_content,
-                in_reply_to=in_reply_to,
-                references=references,
-                metadata={
-                    "kind": "next_action_reply_send",
-                    "source_next_action": session.get("next_best_action"),
-                    "unsupported_claims": False,
-                    "bench_verified": False,
-                    "scheduling_portal_url": scheduling_portal_url,
-                },
-            )
-            result = await self._email_service.send_email(outbound)
-            if not result.accepted:
-                return self._failure(
-                    request_id=request_id,
-                    trace_id=trace_id,
-                    code="ORCHESTRATION_FAILED",
-                    message=result.error.error_message if result.error else "Failed to send outbound reply.",
-                    retryable=bool(result.error.retryable) if result.error else False,
-                )
-            sent_message_id = result.provider_message_id or f"reply_sent_{uuid4().hex[:12]}"
-            reply_to_address = build_lead_reply_address(
-                lead_id=request.lead_id,
-                domain=self._settings.resend_reply_domain,
-            )
-            self._state_repo.append_message(
-                lead_id=request.lead_id,
-                channel="email",
-                message_id=sent_message_id,
-                direction="outbound",
-                content=outbound_content,
-                metadata={
-                    "kind": "reply_sent",
-                    "subject": subject,
-                    "to_email": to_email,
-                    "in_reply_to": in_reply_to,
-                    "references": references,
-                    "reply_to_address": reply_to_address,
-                    "resend_message_id": result.provider_message_id,
-                    "resend_raw_response": result.raw_response or {},
-                    "scheduling_portal_url": scheduling_portal_url,
-                },
-            )
-        else:
-            if self._sms_service is None:
-                return self._failure(
-                    request_id=request_id,
-                    trace_id=trace_id,
-                    code="CONFIG_ERROR",
-                    message="SMSService not configured.",
-                    retryable=False,
-                )
-            to_number = (request.to_number or "").strip() or (self._latest_inbound_sms_number(lead_id=request.lead_id) or "")
-            if not to_number:
-                return self._failure(
-                    request_id=request_id,
-                    trace_id=trace_id,
-                    code="INVALID_INPUT",
-                    message="Recipient phone number could not be resolved. Provide to_number explicitly.",
-                    retryable=False,
-                )
-            outbound_content = content
-            if self._should_include_scheduling_link(session=session, conversation=conversation):
-                latest_inbound = self._state_repo.get_latest_inbound_email_for_lead(lead_id=request.lead_id) or {}
-                scheduling_portal_url = self._resolve_scheduling_portal_url(
-                    lead_id=request.lead_id,
-                    meeting_text=None,
-                    starts_at=None,
-                    prospect_email=str(latest_inbound.get("from_email") or "").strip() or None,
-                )
-                outbound_content = append_scheduling_cta(
-                    content=outbound_content,
-                    channel="sms",
-                    scheduling_portal_url=scheduling_portal_url,
-                )
-            sms_request = OutboundSMSRequest(
-                lead_id=request.lead_id,
-                draft_id=f"reply_sms_draft_{uuid4().hex[:12]}",
-                review_id=f"ui_reply_sms_review_{uuid4().hex[:12]}",
-                review_status="approved_with_edits",
-                trace_id=trace_id,
-                idempotency_key=request.idempotency_key,
-                to_number=to_number,
-                message=outbound_content,
-                lead_channel_state=lead_channel_state,
-                metadata={
-                    "kind": "next_action_reply_send",
-                    "source_next_action": session.get("next_best_action"),
-                    "unsupported_claims": False,
-                    "bench_verified": False,
-                    "scheduling_portal_url": scheduling_portal_url,
-                },
-            )
-            sms_result = await self._sms_service.send_warm_lead_sms(sms_request)
-            if not sms_result.accepted:
-                return self._failure(
-                    request_id=request_id,
-                    trace_id=trace_id,
-                    code="ORCHESTRATION_FAILED",
-                    message=sms_result.error.error_message if sms_result.error else "Failed to send outbound SMS reply.",
-                    retryable=bool(sms_result.error.retryable) if sms_result.error else False,
-                )
-            sent_message_id = sms_result.provider_message_id or f"reply_sms_{uuid4().hex[:12]}"
-            self._state_repo.append_message(
-                lead_id=request.lead_id,
-                channel="sms",
-                message_id=sent_message_id,
-                direction="outbound",
-                content=outbound_content,
-                metadata={
-                    "kind": "reply_sent",
-                    "to_number": to_number,
-                    "provider_message_id": sms_result.provider_message_id,
-                    "provider_raw_response": sms_result.raw_response or {},
-                    "scheduling_portal_url": scheduling_portal_url,
-                },
-            )
-        await self._append_hubspot_channel_handoff_event(
+        latest_inbound = self._state_repo.get_latest_inbound_email_for_lead(lead_id=request.lead_id) or {}
+        inbound_subject = str(latest_inbound.get("subject") or "").strip()
+        subject = (request.subject or "").strip()
+        if not subject:
+            if inbound_subject.lower().startswith("re:"):
+                subject = inbound_subject
+            elif inbound_subject:
+                subject = f"Re: {inbound_subject}"
+            else:
+                subject = "Re: Follow-up"
+        in_reply_to, references = self._state_repo.get_email_thread_reply_headers(lead_id=request.lead_id)
+        outbound = OutboundEmailRequest(
             lead_id=request.lead_id,
+            draft_id=f"reply_draft_{uuid4().hex[:12]}",
+            review_id=f"ui_reply_review_{uuid4().hex[:12]}",
+            review_status="approved_with_edits",
             trace_id=trace_id,
-            requested_channel=channel,
-            resolved_channel=outbound_channel,
-            reason=handoff.reason,
-            idempotency_key=f"{request.idempotency_key}:handoff",
+            idempotency_key=request.idempotency_key,
+            to_email=to_email,
+            subject=subject,
+            text_body=content,
+            in_reply_to=in_reply_to,
+            references=references,
+            metadata={
+                "kind": "next_action_reply_send",
+                "source_next_action": session.get("next_best_action"),
+                "unsupported_claims": False,
+                "bench_verified": False,
+            },
         )
-        if scheduling_portal_url:
-            await self._append_hubspot_scheduling_link_event(
-                lead_id=request.lead_id,
+        result = await self._email_service.send_email(outbound)
+        if not result.accepted:
+            return self._failure(
+                request_id=request_id,
                 trace_id=trace_id,
-                channel=outbound_channel,
-                scheduling_portal_url=scheduling_portal_url,
-                idempotency_key=f"{request.idempotency_key}:sched_link",
+                code="ORCHESTRATION_FAILED",
+                message=result.error.error_message if result.error else "Failed to send outbound reply.",
+                retryable=bool(result.error.retryable) if result.error else False,
             )
+        sent_message_id = result.provider_message_id or f"reply_sent_{uuid4().hex[:12]}"
+        reply_to_address = build_lead_reply_address(
+            lead_id=request.lead_id,
+            domain=self._settings.resend_reply_domain,
+        )
+        self._state_repo.append_message(
+            lead_id=request.lead_id,
+            channel="email",
+            message_id=sent_message_id,
+            direction="outbound",
+            content=content,
+            metadata={
+                "kind": "reply_sent",
+                "subject": subject,
+                "to_email": to_email,
+                "in_reply_to": in_reply_to,
+                "references": references,
+                "reply_to_address": reply_to_address,
+                "resend_message_id": result.provider_message_id,
+                "resend_raw_response": result.raw_response or {},
+            },
+        )
+        conversation = self._state_repo.get_conversation_state(lead_id=request.lead_id) or {}
         self._state_repo.upsert_conversation_state(
             lead_id=request.lead_id,
             payload={
                 **conversation,
                 "current_stage": "waiting",
-                "current_channel": outbound_channel,
+                "current_channel": "email",
                 "last_outbound_message_id": sent_message_id,
                 "pending_actions": [{"action_type": "wait_for_reply", "status": "pending"}],
             },
@@ -1496,6 +1286,8 @@ class OrchestrationRuntime:
             or str(scheduling_ctx_dict.get("timezone") or "").strip()
             or "UTC"
         )
+        if starts_at is not None and starts_at.tzinfo is None:
+            starts_at = starts_at.replace(tzinfo=date_tz.gettz(timezone_text) or UTC)
         if starts_at is None:
             return self._failure(
                 request_id=request_id,
@@ -1518,10 +1310,26 @@ class OrchestrationRuntime:
 
         prospect_name = self._prospect_name_from_latest_inbound(latest_inbound)
         ends_at = starts_at + timedelta(minutes=request.duration_minutes)
+        matched_slot, availability_error = await self._validate_requested_slot_availability(
+            lead_id=request.lead_id,
+            trace_id=trace_id,
+            starts_at=starts_at,
+            ends_at=ends_at,
+            timezone_text=timezone_text,
+        )
+        if availability_error is not None:
+            return self._failure(
+                request_id=request_id,
+                trace_id=trace_id,
+                code=availability_error.error_code,
+                message=availability_error.error_message,
+                retryable=availability_error.retryable,
+                details=availability_error.details,
+            )
         booking_request = BookingRequest(
             lead_id=request.lead_id,
             trace_id=trace_id,
-            slot_id=f"inferred_{starts_at.isoformat()}",
+            slot_id=matched_slot.slot_id if matched_slot is not None else f"inferred_{starts_at.isoformat()}",
             starts_at=starts_at,
             ends_at=ends_at,
             timezone=timezone_text,
@@ -1569,6 +1377,7 @@ class OrchestrationRuntime:
                     else "Booking failed before confirmation."
                 ),
                 retryable=bool(booking.error.retryable) if booking.error is not None else False,
+                details=booking.error.details if booking.error is not None else None,
             )
 
         next_session = {
@@ -1937,84 +1746,6 @@ class OrchestrationRuntime:
         )
         return reply_env
 
-    async def handle_sms_webhook(
-        self,
-        *,
-        payload: dict[str, Any],
-        headers: dict[str, str] | None,
-        raw_body: bytes | str | None = None,
-    ) -> ResponseEnvelope:
-        request_id = f"req_{uuid4().hex[:10]}"
-        trace_id = f"trace_sms_webhook_{uuid4().hex[:12]}"
-        if self._sms_service is None:
-            return self._failure(
-                request_id=request_id,
-                trace_id=trace_id,
-                code="CONFIG_ERROR",
-                message="SMSService not configured.",
-                retryable=False,
-            )
-        event = await self._sms_service.handle_inbound_sms(payload=payload, headers=headers, raw_body=raw_body)
-        if event.error is not None:
-            return ResponseEnvelope(
-                request_id=request_id,
-                trace_id=trace_id,
-                status="accepted",
-                data={
-                    "event_type": event.event_type,
-                    "processed": False,
-                    "reason": event.error.error_code,
-                    "raw_payload_ref": event.raw_payload_ref,
-                },
-            )
-        if event.event_type != "inbound_sms":
-            return ResponseEnvelope(
-                request_id=request_id,
-                trace_id=trace_id,
-                status="accepted",
-                data={
-                    "event_type": event.event_type,
-                    "processed": True,
-                    "raw_payload_ref": event.raw_payload_ref,
-                },
-            )
-        lead_id = self._state_repo.find_lead_by_phone(phone_number=event.from_number)
-        if not lead_id:
-            return ResponseEnvelope(
-                request_id=request_id,
-                trace_id=trace_id,
-                status="accepted",
-                data={
-                    "event_type": event.event_type,
-                    "processed": False,
-                    "reason": "unknown_lead",
-                    "from_number": event.from_number,
-                },
-            )
-        sms_message_id = event.provider_message_id or f"sms_in_{uuid4().hex[:10]}"
-        self._state_repo.append_message(
-            lead_id=lead_id,
-            channel="sms",
-            message_id=sms_message_id,
-            direction="inbound",
-            content=(event.text or "").strip(),
-            metadata={
-                "from_number": event.from_number,
-                "to_number": event.to_number,
-                "raw_payload_ref": event.raw_payload_ref,
-            },
-        )
-        reply_request = LeadReplyRequest(
-            idempotency_key=f"webhook:africastalking:{event.provider_message_id or event.raw_payload_ref}",
-            lead_id=lead_id,
-            channel="sms",
-            message_id=sms_message_id,
-            content=(event.text or "").strip() or "(empty inbound sms)",
-            from_number=event.from_number,
-            received_at=event.received_at,
-        )
-        return await self.handle_reply(reply_request)
-
     async def _hydrate_received_email(
         self,
         *,
@@ -2362,207 +2093,26 @@ class OrchestrationRuntime:
         request_id = f"req_{uuid4().hex[:10]}"
         trace_id = f"trace_outreach_send_{uuid4().hex[:12]}"
         idem = request.idempotency_key or f"outreach_send:{request.lead_id}:{uuid4().hex[:12]}"
-        requested_channel = (request.channel or "email").strip().lower()
-        if requested_channel not in {"email", "sms"}:
+        mid, err = await run_outreach_send_for_lead(
+            self._outreach_flow_deps(),
+            lead_id=request.lead_id,
+            draft_id=request.draft_id,
+            review_id=request.review_id,
+            trace_id=trace_id,
+            idempotency_key=idem,
+            to_email=request.to_email,
+            email_service=self._email_service,
+        )
+        if err:
             return self._failure(
                 request_id=request_id,
                 trace_id=trace_id,
-                code="INVALID_INPUT",
-                message=f"Unsupported channel '{request.channel}'.",
+                code="ORCHESTRATION_FAILED",
+                message=err,
                 retryable=False,
             )
-        lead_state = self._channel_state_for_lead(lead_id=request.lead_id)
-        handoff = decide_channel_handoff(
-            lead_id=request.lead_id,
-            requested_channel=requested_channel,
-            lead_state=lead_state,
-            trace_id=trace_id,
-        )
-        if not handoff.allowed:
-            await self._append_hubspot_channel_handoff_event(
-                lead_id=request.lead_id,
-                trace_id=trace_id,
-                requested_channel=requested_channel,
-                resolved_channel=handoff.resolved_channel,
-                reason=handoff.reason,
-                idempotency_key=f"{idem}:handoff_blocked",
-            )
-            return self._failure(
-                request_id=request_id,
-                trace_id=trace_id,
-                code="POLICY_BLOCKED",
-                message=handoff.reason,
-                retryable=False,
-            )
-        scheduling_portal_url: str | None = None
-        delivery = "skipped_no_provider"
-        msg_id: str | None = None
-        if handoff.resolved_channel == "email":
-            override_text_body: str | None = None
-            if request.include_scheduling_link:
-                row = self._state_repo.get_outreach_draft(lead_id=request.lead_id)
-                outbound_d = {}
-                if row is not None:
-                    outbound_d, _ = parse_outreach_stored(row["draft"])
-                to_email = (request.to_email or str(outbound_d.get("to_email") or "")).strip() or None
-                scheduling_portal_url = self._resolve_scheduling_portal_url(
-                    lead_id=request.lead_id,
-                    meeting_text=None,
-                    starts_at=None,
-                    prospect_email=to_email,
-                )
-                override_text_body = append_scheduling_cta(
-                    content=str(outbound_d.get("text_body") or ""),
-                    channel="email",
-                    scheduling_portal_url=scheduling_portal_url,
-                )
-            mid, err = await run_outreach_send_for_lead(
-                self._outreach_flow_deps(),
-                lead_id=request.lead_id,
-                draft_id=request.draft_id,
-                review_id=request.review_id,
-                trace_id=trace_id,
-                idempotency_key=idem,
-                to_email=request.to_email,
-                email_service=self._email_service,
-                override_text_body=override_text_body,
-            )
-            if err:
-                return self._failure(
-                    request_id=request_id,
-                    trace_id=trace_id,
-                    code="ORCHESTRATION_FAILED",
-                    message=err,
-                    retryable=False,
-                )
-            delivery = "queued" if mid and mid != "skipped_no_email_service" else "skipped_no_provider"
-            msg_id = None if mid == "skipped_no_email_service" else mid
-        else:
-            if self._sms_service is None:
-                return self._failure(
-                    request_id=request_id,
-                    trace_id=trace_id,
-                    code="CONFIG_ERROR",
-                    message="SMSService not configured.",
-                    retryable=False,
-                )
-            row = self._state_repo.get_outreach_draft(lead_id=request.lead_id)
-            if row is None:
-                return self._failure(
-                    request_id=request_id,
-                    trace_id=trace_id,
-                    code="INVALID_INPUT",
-                    message=f"No outreach draft for lead_id '{request.lead_id}'.",
-                    retryable=False,
-                )
-            outbound_d, review = parse_outreach_stored(row["draft"])
-            outbound = OutboundEmailRequest.model_validate(outbound_d)
-            if outbound.draft_id != request.draft_id:
-                return self._failure(
-                    request_id=request_id,
-                    trace_id=trace_id,
-                    code="INVALID_INPUT",
-                    message="draft_id mismatch.",
-                    retryable=False,
-                )
-            if not isinstance(review, dict) or review.get("review_id") != request.review_id:
-                return self._failure(
-                    request_id=request_id,
-                    trace_id=trace_id,
-                    code="INVALID_INPUT",
-                    message="review_id mismatch.",
-                    retryable=False,
-                )
-            if not review.get("final_send_ok"):
-                return self._failure(
-                    request_id=request_id,
-                    trace_id=trace_id,
-                    code="POLICY_BLOCKED",
-                    message="Review does not allow send (final_send_ok is false).",
-                    retryable=False,
-                )
-            to_number = (request.to_number or "").strip() or (self._latest_inbound_sms_number(lead_id=request.lead_id) or "")
-            if not to_number:
-                return self._failure(
-                    request_id=request_id,
-                    trace_id=trace_id,
-                    code="INVALID_INPUT",
-                    message="Recipient phone number could not be resolved. Provide to_number explicitly.",
-                    retryable=False,
-                )
-            sms_text = (outbound.text_body or "").strip()
-            if request.include_scheduling_link:
-                scheduling_portal_url = self._resolve_scheduling_portal_url(
-                    lead_id=request.lead_id,
-                    meeting_text=None,
-                    starts_at=None,
-                    prospect_email=(request.to_email or outbound.to_email).strip() or None,
-                )
-                sms_text = append_scheduling_cta(
-                    content=sms_text,
-                    channel="sms",
-                    scheduling_portal_url=scheduling_portal_url,
-                )
-            sms_request = OutboundSMSRequest(
-                lead_id=request.lead_id,
-                draft_id=outbound.draft_id,
-                review_id=request.review_id,
-                review_status=outbound.review_status,
-                trace_id=trace_id,
-                idempotency_key=idem,
-                to_number=to_number,
-                message=sms_text,
-                lead_channel_state=lead_state,
-                metadata={
-                    **(outbound.metadata or {}),
-                    "kind": "first_touch_sms",
-                    "scheduling_portal_url": scheduling_portal_url,
-                },
-            )
-            sms_result = await self._sms_service.send_warm_lead_sms(sms_request)
-            if not sms_result.accepted:
-                return self._failure(
-                    request_id=request_id,
-                    trace_id=trace_id,
-                    code="ORCHESTRATION_FAILED",
-                    message=sms_result.error.error_message if sms_result.error else "send_failed",
-                    retryable=bool(sms_result.error.retryable) if sms_result.error else False,
-                )
-            self._state_repo.mark_outreach_sent_idempotency(lead_id=request.lead_id, idempotency_key=idem)
-            msg_id = sms_result.provider_message_id or f"sms_queued_{idem[-10:]}"
-            self._state_repo.append_message(
-                lead_id=request.lead_id,
-                channel="sms",
-                message_id=f"outreach_sms_sent_{idem[:16]}",
-                direction="outbound",
-                content=sms_text,
-                metadata={
-                    "kind": "first_touch_sent",
-                    "provider_message_id": sms_result.provider_message_id,
-                    "draft_id": outbound.draft_id,
-                    "review_id": request.review_id,
-                    "to_number": to_number,
-                    "provider_raw_response": sms_result.raw_response or {},
-                    "scheduling_portal_url": scheduling_portal_url,
-                },
-            )
-            delivery = "queued"
-        await self._append_hubspot_channel_handoff_event(
-            lead_id=request.lead_id,
-            trace_id=trace_id,
-            requested_channel=requested_channel,
-            resolved_channel=handoff.resolved_channel,
-            reason=handoff.reason,
-            idempotency_key=f"{idem}:handoff",
-        )
-        if scheduling_portal_url:
-            await self._append_hubspot_scheduling_link_event(
-                lead_id=request.lead_id,
-                trace_id=trace_id,
-                channel=handoff.resolved_channel,
-                scheduling_portal_url=scheduling_portal_url,
-                idempotency_key=f"{idem}:sched_link",
-            )
+        delivery = "queued" if mid and mid != "skipped_no_email_service" else "skipped_no_provider"
+        msg_id = None if mid == "skipped_no_email_service" else mid
         if delivery == "queued":
             session = self._state_repo.get_session_state(lead_id=request.lead_id)
             if session is not None:
@@ -2587,7 +2137,7 @@ class OrchestrationRuntime:
                 payload={
                     **conversation,
                     "current_stage": "waiting",
-                    "current_channel": handoff.resolved_channel,
+                    "current_channel": request.channel,
                     "last_outbound_message_id": msg_id,
                     "pending_actions": [{"action_type": "wait_for_reply", "status": "pending"}],
                 },
@@ -3156,6 +2706,83 @@ class OrchestrationRuntime:
         )
         return env
 
+    async def _validate_requested_slot_availability(
+        self,
+        *,
+        lead_id: str,
+        trace_id: str,
+        starts_at: datetime,
+        ends_at: datetime,
+        timezone_text: str,
+    ) -> tuple[CalendarSlot | None, ErrorEnvelope | None]:
+        if self._calcom is None or not hasattr(self._calcom, "get_available_slots"):
+            return None, None
+        tzinfo = date_tz.gettz(timezone_text) or UTC
+        local_start = starts_at.astimezone(tzinfo)
+        day_start = local_start.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = day_start + timedelta(days=1)
+        try:
+            slots = await self._calcom.get_available_slots(
+                AvailabilityRequest(
+                    lead_id=lead_id,
+                    trace_id=trace_id,
+                    timezone=timezone_text,
+                    window_start=day_start,
+                    window_end=day_end,
+                )
+            )
+        except Exception as exc:
+            return None, ErrorEnvelope(
+                error_code="SOURCE_UNAVAILABLE",
+                error_message="Could not validate slot availability with Cal.com before booking.",
+                retryable=True,
+                details={"reason": str(exc)},
+            )
+
+        matched = self._match_requested_slot(
+            slots=slots,
+            starts_at=starts_at,
+            ends_at=ends_at,
+        )
+        if matched is not None:
+            return matched, None
+        return None, ErrorEnvelope(
+            error_code="BOOKING_FAILED",
+            error_message=(
+                "Requested time is not currently available in Cal.com. "
+                "Ask the prospect to pick an available slot."
+            ),
+            retryable=False,
+            details={
+                "requested_start_at": starts_at.isoformat(),
+                "requested_end_at": ends_at.isoformat(),
+                "timezone": timezone_text,
+                "available_slots": [
+                    {"slot_id": slot.slot_id, "start_at": slot.start_at.isoformat(), "end_at": slot.end_at.isoformat()}
+                    for slot in slots[:5]
+                ],
+            },
+        )
+
+    @staticmethod
+    def _match_requested_slot(
+        *,
+        slots: list[CalendarSlot],
+        starts_at: datetime,
+        ends_at: datetime,
+    ) -> CalendarSlot | None:
+        requested_start_utc = starts_at.astimezone(UTC)
+        requested_end_utc = ends_at.astimezone(UTC)
+        for slot in slots:
+            slot_start_utc = slot.start_at.astimezone(UTC)
+            slot_end_utc = slot.end_at.astimezone(UTC)
+            if abs((slot_start_utc - requested_start_utc).total_seconds()) > 60:
+                continue
+            if slot_end_utc + timedelta(seconds=60) < requested_end_utc:
+                continue
+            return slot
+        return None
+
     @staticmethod
     def _lead_id_for_company(*, company_id: str) -> str:
         digest = hashlib.sha256(company_id.encode("utf-8")).hexdigest()[:10]
@@ -3169,6 +2796,7 @@ class OrchestrationRuntime:
         code: str,
         message: str,
         retryable: bool,
+        details: dict[str, Any] | None = None,
     ) -> ResponseEnvelope:
         log_processing_step(
             component="orchestration",
@@ -3178,6 +2806,7 @@ class OrchestrationRuntime:
             error_code=code,
             error_message=message,
             retryable=retryable,
+            error_details=details or {},
             level=logging.WARNING,
         )
         return ResponseEnvelope(
@@ -3185,6 +2814,6 @@ class OrchestrationRuntime:
             trace_id=trace_id,
             status="failure",
             data={},
-            error=ErrorEnvelope(error_code=code, error_message=message, retryable=retryable),
+            error=ErrorEnvelope(error_code=code, error_message=message, retryable=retryable, details=details or {}),
             timestamp=datetime.now(UTC),
         )

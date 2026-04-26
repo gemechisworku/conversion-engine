@@ -157,11 +157,15 @@ class CalComService:
             json=payload,
         )
         if response.status_code >= 400:
+            provider_message = self._extract_error_message(raw)
+            message = f"Cal.com returned HTTP {response.status_code}."
+            if provider_message:
+                message = f"{message} {provider_message}"
             error = ErrorEnvelope(
                 error_code="BOOKING_FAILED",
-                error_message=f"Cal.com returned HTTP {response.status_code}.",
+                error_message=message,
                 retryable=response.status_code >= 500,
-                details={"response": raw},
+                details={"response": raw, "provider_message": provider_message},
             )
             return BookingResult(
                 lead_id=request.lead_id,
@@ -278,6 +282,25 @@ class CalComService:
             return parsed if isinstance(parsed, dict) else {"payload": parsed}
         except ValueError:
             return {}
+
+    @staticmethod
+    def _extract_error_message(payload: dict[str, Any]) -> str | None:
+        if not isinstance(payload, dict):
+            return None
+        error = payload.get("error")
+        if isinstance(error, dict):
+            message = error.get("message")
+            if isinstance(message, str) and message.strip():
+                return message.strip()
+            details = error.get("details")
+            if isinstance(details, dict):
+                details_message = details.get("message")
+                if isinstance(details_message, str) and details_message.strip():
+                    return details_message.strip()
+        top_level_message = payload.get("message")
+        if isinstance(top_level_message, str) and top_level_message.strip():
+            return top_level_message.strip()
+        return None
 
     @staticmethod
     def _parse_dt(value: Any):

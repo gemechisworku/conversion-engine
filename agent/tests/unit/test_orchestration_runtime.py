@@ -29,7 +29,7 @@ from agent.services.orchestration.schemas import (
     LeadReplyRequest,
     OutreachSendRequest,
 )
-from agent.services.calendar.schemas import BookingResult
+from agent.services.calendar.schemas import BookingResult, CalendarSlot
 from agent.services.crm.schemas import CRMWriteResult
 from agent.services.email.schemas import InboundEmailEvent
 from agent.services.outreach.outreach_payload import wrap_v2
@@ -50,7 +50,7 @@ def _settings() -> Settings:
     )
 
 
-def _runtime(*, email_service=None, sms_service=None, hubspot_service=None, calcom_service=None) -> OrchestrationRuntime:
+def _runtime(*, email_service=None, hubspot_service=None, calcom_service=None) -> OrchestrationRuntime:
     settings = _settings()
     repo = SQLiteStateRepository(db_path=settings.state_db_path)
     async def handler(_: httpx.Request) -> httpx.Response:
@@ -83,7 +83,6 @@ def _runtime(*, email_service=None, sms_service=None, hubspot_service=None, calc
         hubspot_service=hubspot_service,
         calcom_service=calcom_service,
         email_service=email_service,
-        sms_service=sms_service,
     )
 
 
@@ -733,147 +732,6 @@ def test_respond_to_lead_sends_outbound_reply_and_waits_for_followup() -> None:
     assert any(m["message_id"] == "reply_msg_123" and m["direction"] == "outbound" for m in messages)
 
 
-def test_respond_to_lead_supports_sms_with_warm_gate_and_scheduling_link() -> None:
-    class _SMSServiceStub:
-        async def send_warm_lead_sms(self, request):
-            assert request.to_number == "+254700000111"
-            assert "https://cal.com" in request.message
-            return ProviderSendResult(
-                provider="africastalking",
-                provider_message_id="sms_reply_123",
-                accepted=True,
-                raw_status="queued",
-                raw_response={"messageId": "sms_reply_123"},
-            )
-
-    runtime = _runtime(sms_service=_SMSServiceStub())
-    lead_id = "lead_reply_sms_1"
-    runtime._state_repo.upsert_session_state(
-        lead_id=lead_id,
-        payload={
-            "current_stage": "scheduling",
-            "next_best_action": "schedule",
-            "current_objective": "reply_handling",
-            "brief_refs": [],
-            "kb_refs": [],
-            "pending_actions": [{"action_type": "delegate_scheduler", "status": "pending"}],
-            "policy_flags": [],
-            "handoff_required": False,
-        },
-    )
-    runtime._state_repo.upsert_conversation_state(
-        lead_id=lead_id,
-        payload={
-            "current_stage": "inbound_received",
-            "current_channel": "email",
-            "last_inbound_message_id": "msg_in_sms_1",
-            "last_customer_intent": "schedule",
-            "last_customer_sentiment": "neutral",
-            "qualification_status": "likely_qualified",
-            "pending_actions": [{"action_type": "delegate_scheduler", "status": "pending"}],
-            "policy_flags": [],
-            "scheduling_context": {"booking_status": "none", "timezone": None, "slots_proposed": []},
-        },
-    )
-    runtime._state_repo.append_message(
-        lead_id=lead_id,
-        channel="email",
-        message_id="warm_email_1",
-        direction="inbound",
-        content="Yes, we can continue on SMS.",
-        metadata={"from_email": "prospect@example.com"},
-    )
-
-    env = asyncio.run(
-        runtime.respond_to_lead(
-            LeadRespondRequest(
-                idempotency_key="idem_respond_sms_1",
-                lead_id=lead_id,
-                channel="sms",
-                to_number="+254700000111",
-                content="Great, sharing options now.",
-            )
-        )
-    )
-    assert env.status == "success"
-    assert env.data["message_id"] == "sms_reply_123"
-    conversation = runtime._state_repo.get_conversation_state(lead_id=lead_id)
-    assert conversation is not None
-    assert conversation["current_channel"] == "sms"
-
-
-def test_outreach_send_supports_sms_path() -> None:
-    class _SMSServiceStub:
-        async def send_warm_lead_sms(self, request):
-            assert request.to_number == "+254700000222"
-            return ProviderSendResult(
-                provider="africastalking",
-                provider_message_id="sms_outreach_123",
-                accepted=True,
-                raw_status="queued",
-                raw_response={"messageId": "sms_outreach_123"},
-            )
-
-    runtime = _runtime(sms_service=_SMSServiceStub())
-    processed = asyncio.run(
-        runtime.process_lead(
-            LeadProcessRequest(
-                idempotency_key="idem_send_sms_1",
-                company_id="comp_send_sms_1",
-                metadata={"company_name": "Acme AI", "company_domain": "acme.ai"},
-            )
-        )
-    )
-    lead_id = processed.data["lead_id"]
-    runtime._state_repo.append_message(
-        lead_id=lead_id,
-        channel="email",
-        message_id="warm_email_2",
-        direction="inbound",
-        content="Open to continuing over SMS.",
-        metadata={"from_email": "prospect@example.com"},
-    )
-    runtime._state_repo.upsert_outreach_draft(
-        lead_id=lead_id,
-        draft=wrap_v2(
-            outbound={
-                "lead_id": lead_id,
-                "draft_id": "draft_send_sms_1",
-                "review_id": "review_send_sms_1",
-                "review_status": "approved",
-                "trace_id": "trace_send_sms_1",
-                "idempotency_key": "idem_send_sms_1",
-                "to_email": "prospect@example.com",
-                "subject": "Hello",
-                "text_body": "Hello from Tenacious",
-                "metadata": {},
-            },
-            review={
-                "review_id": "review_send_sms_1",
-                "status": "approved",
-                "final_send_ok": True,
-            },
-        ),
-    )
-    send_env = asyncio.run(
-        runtime.outreach_send(
-            OutreachSendRequest(
-                lead_id=lead_id,
-                draft_id="draft_send_sms_1",
-                review_id="review_send_sms_1",
-                channel="sms",
-                to_number="+254700000222",
-                idempotency_key="idem_send_sms_1",
-            )
-        )
-    )
-    assert send_env.status == "success"
-    assert send_env.data["delivery_status"] == "queued"
-    conversation = runtime._state_repo.get_conversation_state(lead_id=lead_id)
-    assert conversation is not None
-    assert conversation["current_channel"] == "sms"
-
-
 def test_prepare_scheduling_extracts_meeting_time_from_history() -> None:
     runtime = _runtime()
     lead_id = "lead_schedule_prepare_1"
@@ -932,6 +790,15 @@ def test_prepare_scheduling_extracts_meeting_time_from_history() -> None:
 
 def test_book_scheduling_books_with_cal_and_syncs_hubspot() -> None:
     class _CalServiceStub:
+        async def get_available_slots(self, request):
+            return [
+                CalendarSlot(
+                    slot_id="slot_exact_match",
+                    start_at=request.window_start.replace(hour=16, minute=0),
+                    end_at=request.window_start.replace(hour=16, minute=15),
+                )
+            ]
+
         async def book_discovery_call(self, request):
             return BookingResult(
                 booking_id="booking_123",
@@ -1028,3 +895,98 @@ def test_book_scheduling_books_with_cal_and_syncs_hubspot() -> None:
     assert str(conversation["scheduling_context"].get("booking_status")) == "confirmed"
     assert any(item.endswith(":booked") for item in hubspot.stage_updates)
     assert lead_id in hubspot.bookings
+
+
+def test_book_scheduling_blocks_when_requested_slot_unavailable() -> None:
+    class _CalServiceUnavailableStub:
+        def __init__(self) -> None:
+            self.book_called = False
+
+        async def get_available_slots(self, request):
+            del request
+            return []
+
+        async def book_discovery_call(self, request):
+            del request
+            self.book_called = True
+            return BookingResult(
+                booking_id="booking_should_not_happen",
+                lead_id="lead_unavailable",
+                slot_id="slot_unavailable",
+                status="confirmed",
+            )
+
+    cal = _CalServiceUnavailableStub()
+    runtime = _runtime(calcom_service=cal, hubspot_service=None)
+    lead_id = "lead_schedule_book_unavailable"
+    runtime._state_repo.upsert_session_state(
+        lead_id=lead_id,
+        payload={
+            "current_stage": "scheduling",
+            "next_best_action": "schedule",
+            "current_objective": "reply_handling",
+            "brief_refs": [],
+            "kb_refs": [],
+            "pending_actions": [{"action_type": "delegate_scheduler", "status": "pending"}],
+            "policy_flags": [],
+            "handoff_required": False,
+        },
+    )
+    runtime._state_repo.upsert_conversation_state(
+        lead_id=lead_id,
+        payload={
+            "current_stage": "inbound_received",
+            "current_channel": "email",
+            "last_inbound_message_id": "msg_sched_in_unavailable",
+            "last_customer_intent": "schedule",
+            "last_customer_sentiment": "neutral",
+            "qualification_status": "likely_qualified",
+            "pending_actions": [{"action_type": "delegate_scheduler", "status": "pending"}],
+            "policy_flags": [],
+            "scheduling_context": {
+                "booking_status": "none",
+                "timezone": "Africa/Addis_Ababa",
+                "requested_time_text": "Tomorrow at 4 PM EAT works for me.",
+                "slots_proposed": [{"source": "thread_extraction", "text": "Tomorrow at 4 PM EAT works for me."}],
+            },
+        },
+    )
+    runtime._state_repo.upsert_inbound_email(
+        resend_email_id="recv_sched_book_unavailable",
+        lead_id=lead_id,
+        from_email="prospect@example.com",
+        to_email=f"{lead_id}@chuairkoon.resend.app",
+        subject="Re: Intro",
+        text_body="Tomorrow at 4 PM EAT works for me.",
+        html_body=None,
+        headers={},
+        in_reply_to="<outbound@example.com>",
+        references="<outbound@example.com>",
+        received_at=datetime.now(UTC),
+    )
+    env = asyncio.run(
+        runtime.book_scheduling(
+            LeadScheduleBookRequest(
+                idempotency_key="idem_schedule_book_unavailable",
+                lead_id=lead_id,
+                confirmed_by_prospect=True,
+            )
+        )
+    )
+    assert env.status == "failure"
+    assert env.error is not None
+    assert env.error.error_code == "BOOKING_FAILED"
+    assert cal.book_called is False
+
+
+def test_resolve_meeting_start_understands_tomorrow_without_week_jump() -> None:
+    runtime = _runtime()
+    parsed, timezone = runtime._resolve_meeting_start_from_text(
+        meeting_text="Tomorrow at 4 PM EAT works for me.",
+        timezone_hint="Africa/Addis_Ababa",
+    )
+    assert parsed is not None
+    assert timezone == "Africa/Addis_Ababa"
+    now = datetime.now(tz=parsed.tzinfo)
+    assert (parsed.date() - now.date()).days == 1
+    assert parsed.hour == 16
