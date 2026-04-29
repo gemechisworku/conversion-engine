@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -146,7 +147,10 @@ class CompetitorGapAnalyst:
         if self._http_client is not None:
             response = await self._http_client.get(url, timeout=self._settings.http_timeout_seconds)
         else:
-            async with httpx.AsyncClient(timeout=self._settings.http_timeout_seconds) as client:
+            async with httpx.AsyncClient(
+                timeout=self._settings.http_timeout_seconds,
+                trust_env=self._settings.http_trust_env_proxy,
+            ) as client:
                 response = await client.get(url)
         if not response.is_success:
             return []
@@ -215,7 +219,11 @@ class CompetitorGapAnalyst:
     def _artifact_from_row(self, *, row: dict[str, Any], company_id: str) -> EnrichmentArtifact:
         industries = CrunchbaseAdapter._industry_values(row)
         tech_stack = CrunchbaseAdapter._tech_stack(row=row)
-        funding_events = CrunchbaseAdapter._funding_events(row=row, lookback_days=180)
+        funding_events = CrunchbaseAdapter._funding_events(
+            row=row,
+            lookback_days=180,
+            reference_now=self._reference_now(),
+        )
         ai_roles = self._coerce_int(row.get("ai_roles") or row.get("ml_roles"))
         engineering_roles = self._coerce_int(row.get("engineering_roles") or row.get("job_posts"))
         if engineering_roles == 0 and ai_roles > 0:
@@ -254,6 +262,19 @@ class CompetitorGapAnalyst:
             },
             merged_confidence={},
         )
+
+    def _reference_now(self) -> datetime:
+        value = self._settings.enrichment_reference_date.strip()
+        if not value:
+            return datetime.now(UTC)
+        text = value.replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return datetime.now(UTC)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
 
     @staticmethod
     def _percentile(*, value: int, values: list[int]) -> float:

@@ -41,7 +41,11 @@ class PageFetcher:
             if self._http_client is not None:
                 response = await self._http_client.get(url, headers=headers, timeout=timeout)
             else:
-                async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
+                async with httpx.AsyncClient(
+                    timeout=timeout,
+                    headers=headers,
+                    trust_env=self._settings.http_trust_env_proxy,
+                ) as client:
                     response = await client.get(url)
         except httpx.HTTPError:
             return None

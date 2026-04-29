@@ -33,6 +33,27 @@ class CRMEnrichmentPayload(BaseModel):
     lead_id: str
     company_name: str | None = None
     company_domain: str | None = None
+    company_id: str | None = None
+    crunchbase_company_name: str | None = None
+    crunchbase_domain: str | None = None
+    crunchbase_url: str | None = None
+    industry: str | None = None
+    industries: list[str] = Field(default_factory=list)
+    location: str | None = None
+    country_code: str | None = None
+    region: str | None = None
+    employee_count: str | None = None
+    company_type: str | None = None
+    legal_name: str | None = None
+    company_description: str | None = None
+    founded_date: str | None = None
+    operating_status: str | None = None
+    funding_round: str | None = None
+    funding_amount_usd: str | None = None
+    funding_total_usd: str | None = None
+    funding_date: str | None = None
+    funding_event_count_180d: int = 0
+    tech_stack: list[str] = Field(default_factory=list)
     enrichment_timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     funding_signal_summary: str | None = None
     job_velocity_summary: str | None = None

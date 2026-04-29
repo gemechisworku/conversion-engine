@@ -43,18 +43,38 @@ class CrunchbaseAdapter:
             )
         record_id = str(record.get("company_id") or record.get("id") or "").strip()
         confidence = 0.95 if record_id == company_id else 0.8
+        reference_now = self._reference_now()
+        funding_events_180d = self._funding_events(
+            row=record,
+            lookback_days=180,
+            reference_now=reference_now,
+        )
+        funding_round = self._funding_round(row=record, events=funding_events_180d)
+        funding_amount_usd = self._funding_amount_usd(row=record, events=funding_events_180d)
+        funding_date = self._funding_date(row=record, events=funding_events_180d)
+        funding_total_usd = self._funding_total_usd(row=record)
         return SignalSnapshot(
             summary={
                 "company_id": record.get("company_id") or company_id,
                 "company_name": self._company_name(record),
                 "domain": self._domain(record),
+                "source_url": self._clean_text(record.get("source_url")) or self._clean_text(record.get("url")),
+                "crunchbase_url": self._clean_text(record.get("url")) or self._clean_text(record.get("source_url")),
                 "industry": self._industry(record),
                 "industries": self._industry_values(record),
-                "funding_round": record.get("funding_round"),
-                "funding_amount_usd": record.get("funding_amount_usd"),
-                "funding_date": record.get("funding_date"),
-                "funding_events_180d": self._funding_events(row=record, lookback_days=180),
-                "location": record.get("location") or record.get("address"),
+                "country_code": self._clean_text(record.get("country_code")),
+                "region": self._clean_text(record.get("region")),
+                "company_type": self._clean_text(record.get("company_type") or record.get("type")),
+                "legal_name": self._clean_text(record.get("legal_name")),
+                "description": self._description(record),
+                "founded_date": self._clean_text(record.get("founded_date")),
+                "operating_status": self._clean_text(record.get("operating_status")),
+                "funding_round": funding_round,
+                "funding_amount_usd": funding_amount_usd,
+                "funding_total_usd": funding_total_usd,
+                "funding_date": funding_date,
+                "funding_events_180d": funding_events_180d,
+                "location": self._location_text(record),
                 "employee_count": record.get("num_employees"),
                 "tech_stack": self._tech_stack(row=record),
                 "leadership_hire": self._jsonish(record.get("leadership_hire")),
@@ -311,11 +331,11 @@ class CrunchbaseAdapter:
 
     @staticmethod
     def _company_name(row: dict[str, Any]) -> str:
-        return str(row.get("company_name") or row.get("name") or "").strip()
+        return CrunchbaseAdapter._clean_text(row.get("company_name") or row.get("name"))
 
     @staticmethod
     def _domain(row: dict[str, Any]) -> str:
-        raw = str(row.get("domain") or row.get("website") or "").strip().lower()
+        raw = CrunchbaseAdapter._clean_text(row.get("domain") or row.get("website")).lower()
         if not raw:
             return ""
         parsed = urlparse(raw if "://" in raw else f"https://{raw}")
@@ -331,14 +351,19 @@ class CrunchbaseAdapter:
     @staticmethod
     def _industry(row: dict[str, Any]) -> str:
         values = CrunchbaseAdapter._industry_values(row)
-        return values[0] if values else str(row.get("industry") or "").strip()
+        return values[0] if values else CrunchbaseAdapter._clean_text(row.get("industry"))
 
     @staticmethod
     def _industry_values(row: dict[str, Any]) -> list[str]:
         raw = row.get("industries") or row.get("industry") or ""
         if isinstance(raw, list):
-            return [str(item.get("value") if isinstance(item, dict) else item).strip() for item in raw if item]
-        text = str(raw).strip()
+            values: list[str] = []
+            for item in raw:
+                value = CrunchbaseAdapter._clean_text(item.get("value") if isinstance(item, dict) else item)
+                if value:
+                    values.append(value)
+            return values
+        text = CrunchbaseAdapter._clean_text(raw)
         if not text:
             return []
         try:
@@ -349,9 +374,9 @@ class CrunchbaseAdapter:
             values: list[str] = []
             for item in parsed:
                 if isinstance(item, dict):
-                    value = str(item.get("value") or item.get("id") or "").strip()
+                    value = CrunchbaseAdapter._clean_text(item.get("value") or item.get("id"))
                 else:
-                    value = str(item).strip()
+                    value = CrunchbaseAdapter._clean_text(item)
                 if value:
                     values.append(value)
             return values
@@ -372,7 +397,13 @@ class CrunchbaseAdapter:
             return text
 
     @classmethod
-    def _funding_events(cls, *, row: dict[str, Any], lookback_days: int) -> list[dict[str, Any]]:
+    def _funding_events(
+        cls,
+        *,
+        row: dict[str, Any],
+        lookback_days: int,
+        reference_now: datetime | None = None,
+    ) -> list[dict[str, Any]]:
         parsed = cls._jsonish(row.get("funding_rounds_list") or row.get("funding_rounds"))
         rows: list[Any]
         if isinstance(parsed, list):
@@ -381,7 +412,8 @@ class CrunchbaseAdapter:
             rows = parsed.get("items") if isinstance(parsed.get("items"), list) else [parsed]
         else:
             rows = []
-        cutoff = datetime.now(UTC) - timedelta(days=lookback_days)
+        now = reference_now or datetime.now(UTC)
+        cutoff = now - timedelta(days=lookback_days)
         events: list[dict[str, Any]] = []
         for item in rows:
             if not isinstance(item, dict):
@@ -396,10 +428,14 @@ class CrunchbaseAdapter:
             event_date = cls._parse_dt(date_text)
             if event_date is None or event_date < cutoff:
                 continue
+            funding_round = item.get("funding_round")
+            if isinstance(funding_round, dict):
+                funding_round = funding_round.get("value") or funding_round.get("name")
             events.append(
                 {
                     "round": item.get("investment_type")
                     or item.get("funding_type")
+                    or funding_round
                     or item.get("series")
                     or item.get("name")
                     or item.get("round")
@@ -409,17 +445,114 @@ class CrunchbaseAdapter:
                     "evidence_ref": "crunchbase_signal",
                 }
             )
+        events.sort(key=lambda item: str(item.get("announced_on") or ""), reverse=True)
         return events
 
     @staticmethod
     def _nested_amount_usd(item: dict[str, Any]) -> Any:
-        for key in ("money_raised", "amount", "funding_total", "raised_amount"):
+        for key in (
+            "money_raised",
+            "amount",
+            "funding_total",
+            "raised_amount",
+            "funds_raised",
+            "funds_total",
+            "org_funding_total",
+        ):
             value = item.get(key)
             if isinstance(value, dict):
                 return value.get("value_usd") or value.get("value")
             if value not in (None, ""):
                 return value
         return None
+
+    @classmethod
+    def _funding_round(cls, *, row: dict[str, Any], events: list[dict[str, Any]]) -> str | None:
+        explicit = cls._clean_text(row.get("funding_round"))
+        if explicit:
+            return explicit
+        if events:
+            round_name = cls._clean_text(events[0].get("round"))
+            if round_name:
+                return round_name
+        stage = cls._clean_text(row.get("investment_stage"))
+        if stage:
+            return stage
+        return None
+
+    @classmethod
+    def _funding_amount_usd(cls, *, row: dict[str, Any], events: list[dict[str, Any]]) -> Any:
+        explicit = row.get("funding_amount_usd")
+        if explicit not in (None, ""):
+            return explicit
+        if events:
+            event_amount = events[0].get("amount_usd")
+            if event_amount not in (None, ""):
+                return event_amount
+        funds_raised = cls._jsonish(row.get("funds_raised"))
+        if isinstance(funds_raised, dict):
+            return funds_raised.get("value_usd") or funds_raised.get("value")
+        if isinstance(funds_raised, list):
+            return None
+        if funds_raised not in (None, ""):
+            return funds_raised
+        return None
+
+    @classmethod
+    def _funding_total_usd(cls, *, row: dict[str, Any]) -> Any:
+        funds_total = cls._jsonish(row.get("funds_total"))
+        if isinstance(funds_total, dict):
+            return funds_total.get("value_usd") or funds_total.get("value")
+        if isinstance(funds_total, list):
+            funds_total = None
+        if funds_total not in (None, ""):
+            return funds_total
+        funds_raised = cls._jsonish(row.get("funds_raised"))
+        if isinstance(funds_raised, dict):
+            return funds_raised.get("value_usd") or funds_raised.get("value")
+        if isinstance(funds_raised, list):
+            return None
+        if funds_raised not in (None, ""):
+            return funds_raised
+        return None
+
+    @classmethod
+    def _funding_date(cls, *, row: dict[str, Any], events: list[dict[str, Any]]) -> str | None:
+        explicit = cls._clean_text(row.get("funding_date"))
+        if explicit:
+            return explicit
+        if events:
+            event_date = cls._clean_text(events[0].get("announced_on"))
+            if event_date:
+                return event_date
+        return None
+
+    @classmethod
+    def _location_text(cls, row: dict[str, Any]) -> str:
+        preferred = cls._clean_text(row.get("address"))
+        if preferred:
+            return preferred
+        raw = row.get("location")
+        parsed = cls._jsonish(raw)
+        if isinstance(parsed, list):
+            names: list[str] = []
+            for item in parsed:
+                if not isinstance(item, dict):
+                    value = cls._clean_text(item)
+                else:
+                    value = cls._clean_text(item.get("name") or item.get("value"))
+                if value and value not in names:
+                    names.append(value)
+            if names:
+                return ", ".join(names)
+        return cls._clean_text(raw)
+
+    @classmethod
+    def _description(cls, row: dict[str, Any]) -> str:
+        primary = cls._clean_text(row.get("about"))
+        if primary:
+            return primary
+        return cls._clean_text(row.get("full_description"))
 
     @staticmethod
     def _parse_dt(value: str) -> datetime | None:
@@ -444,23 +577,45 @@ class CrunchbaseAdapter:
         if isinstance(parsed, list):
             for item in parsed:
                 if isinstance(item, dict):
-                    name = str(item.get("name") or item.get("value") or "").strip()
+                    name = cls._clean_text(item.get("name") or item.get("value"))
                 else:
-                    name = str(item).strip()
+                    name = cls._clean_text(item)
                 if name and name not in values:
                     values.append(name)
         elif isinstance(parsed, dict):
             for key, value in parsed.items():
-                if value and str(key) not in values:
-                    values.append(str(key))
+                name = cls._clean_text(key)
+                if value and name and name not in values:
+                    values.append(name)
         return values[:25]
 
     @staticmethod
     def _digits(value: str) -> str:
         return "".join(char for char in value if char.isdigit())
 
+    @staticmethod
+    def _clean_text(value: Any) -> str:
+        text = str(value).strip() if value is not None else ""
+        if not text:
+            return ""
+        if text.lower() in {"null", "none", "nan", "n/a", "[]", "{}"}:
+            return ""
+        return text
+
+    def _reference_now(self) -> datetime:
+        value = self._settings.enrichment_reference_date.strip()
+        if not value:
+            return datetime.now(UTC)
+        parsed = self._parse_dt(value)
+        if parsed is None:
+            return datetime.now(UTC)
+        return parsed
+
     async def _get(self, *, url: str) -> httpx.Response:
         if self._http_client is not None:
             return await self._http_client.get(url, timeout=self._settings.http_timeout_seconds)
-        async with httpx.AsyncClient(timeout=self._settings.http_timeout_seconds) as client:
+        async with httpx.AsyncClient(
+            timeout=self._settings.http_timeout_seconds,
+            trust_env=self._settings.http_trust_env_proxy,
+        ) as client:
             return await client.get(url)

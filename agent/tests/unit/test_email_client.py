@@ -179,3 +179,30 @@ def test_send_email_blocked_without_approved_review() -> None:
     assert result.accepted is False
     assert result.error is not None
     assert result.error.error_code == "POLICY_BLOCKED"
+
+
+def test_list_received_emails_returns_payload() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/emails/receiving"
+        assert request.url.params.get("limit") == "10"
+        return httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [{"id": "recv_1", "to": ["lead_123@chuairkoon.resend.app"]}],
+                "has_more": False,
+            },
+        )
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = ResendEmailClient(
+        settings=_settings(),
+        policy_service=OutboundPolicyService(_settings()),
+        http_client=http_client,
+    )
+    payload = asyncio.run(client.list_received_emails(limit=10))
+    asyncio.run(http_client.aclose())
+
+    assert isinstance(payload, dict)
+    assert payload.get("object") == "list"
+    assert isinstance(payload.get("data"), list)

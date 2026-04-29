@@ -22,9 +22,12 @@ _SEGMENTS = {SEGMENT_1, SEGMENT_2, SEGMENT_3, SEGMENT_4}
 
 
 class _ICPLLMAdjudication(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # LLMs may echo helper fields (e.g., classification_id) from the heuristic
+    # payload. Ignore extras so valid adjudications are not discarded.
+    model_config = ConfigDict(extra="ignore")
 
     agree_with_heuristic: bool = True
+    classification_id: str | None = None
     primary_segment: str
     alternate_segment: str | None = None
     confidence: float = Field(ge=0.0, le=1.0)
@@ -82,6 +85,8 @@ async def classify_icp_with_care(
         return heuristic
 
     flags = _extract_icp_flags(artifact=artifact, ai_maturity=ai_maturity)
+    heuristic_payload = heuristic.model_dump(mode="json")
+    heuristic_payload.pop("classification_id", None)
     adjudication = await llm.generate_model(
         system_prompt=(
             "You adjudicate B2B lead ICP classification for Tenacious Consulting. "
@@ -98,7 +103,7 @@ async def classify_icp_with_care(
         user_payload={
             "ICP_DEFINITION": icp_doc[:24_000],
             "SIGNAL_FLAGS": flags,
-            "HEURISTIC_CLASSIFICATION": heuristic.model_dump(mode="json"),
+            "HEURISTIC_CLASSIFICATION": heuristic_payload,
             "AI_MATURITY": {"score": ai_maturity.score, "confidence": ai_maturity.confidence},
         },
         response_model=_ICPLLMAdjudication,
@@ -175,31 +180,34 @@ def _extract_icp_flags(*, artifact: EnrichmentArtifact, ai_maturity: AIMaturityS
     layoffs = _summary_dict(artifact, "layoffs")
     leadership = _summary_dict(artifact, "leadership_changes")
 
-    funding_round = _to_str(crunchbase.get("funding_round")).lower()
-    funding_date = _parse_dt(_to_str(crunchbase.get("funding_date")))
+    funding_event = _latest_funding_event(crunchbase=crunchbase)
+    funding_round = (
+        _to_str(funding_event.get("round") if funding_event else None)
+        or _to_str(crunchbase.get("funding_round"))
+    ).lower()
+    funding_date = _parse_dt(
+        _to_str(funding_event.get("announced_on") if funding_event else None)
+        or _to_str(crunchbase.get("funding_date"))
+    )
     now = datetime.now(UTC)
     funding_age_days = (now - funding_date).days if funding_date else None
+    funding_events_180d = crunchbase.get("funding_events_180d")
+    funding_events_count = len(funding_events_180d) if isinstance(funding_events_180d, list) else 0
+    funding_within_window = funding_events_count > 0 or (
+        funding_date is not None and funding_age_days is not None and funding_age_days <= 180
+    )
     funding_series_ab_180d = (
-        funding_date is not None
-        and funding_age_days is not None
-        and funding_age_days <= 180
+        funding_within_window
         and ("series a" in funding_round or "series b" in funding_round)
     )
 
     layoff_matched = bool(layoffs.get("matched"))
-    layoff_date = _parse_dt(_to_str(layoffs.get("layoff_date")))
-    layoff_age_days = (now - layoff_date).days if layoff_date else (0 if layoff_matched else None)
-    layoff_within_120d = layoff_matched and (layoff_age_days is None or layoff_age_days <= 120)
+    layoff_within_120d = layoff_matched
     layoff_pct = _to_float(layoffs.get("affected_percent"))
 
     leadership_role = _to_str(leadership.get("role_name")).lower()
-    leadership_date = _parse_dt(_to_str(leadership.get("date")))
-    leadership_age = (now - leadership_date).days if leadership_date else None
     cto_vp_recent = bool(
-        leadership.get("matched", True)
-        and leadership_date
-        and leadership_age is not None
-        and leadership_age <= 90
+        leadership.get("matched", False)
         and ("cto" in leadership_role or "vp" in leadership_role or "chief technology" in leadership_role)
     )
 
@@ -219,11 +227,13 @@ def _extract_icp_flags(*, artifact: EnrichmentArtifact, ai_maturity: AIMaturityS
     specialist_title_hit = any(k in titles_blob for k in specialist_keywords)
     specialized_capability_signal = (ai_roles >= 2 and engineering_roles >= 5) or specialist_title_hit
 
-    seg1_layoff_disqual = layoff_matched and layoff_pct >= 15 and layoff_age_days is not None and layoff_age_days <= 90
+    seg1_layoff_disqual = layoff_matched and layoff_pct >= 15
 
     return {
         "funding_series_ab_within_180d": funding_series_ab_180d,
         "funding_round_raw": crunchbase.get("funding_round"),
+        "funding_round_effective": funding_round,
+        "funding_event_count_180d": funding_events_count,
         "funding_age_days": funding_age_days,
         "layoff_matched": layoff_matched,
         "layoff_within_120d": layoff_within_120d,
@@ -244,16 +254,12 @@ def _segment_scores(
     flags: dict[str, Any],
 ) -> dict[str, float]:
     scores: dict[str, float] = {SEGMENT_1: 0.0, SEGMENT_2: 0.0, SEGMENT_3: 0.0, SEGMENT_4: 0.0}
-    crunchbase = _summary_dict(artifact, "crunchbase")
     jobs = _summary_dict(artifact, "job_posts")
     layoffs = _summary_dict(artifact, "layoffs")
     leadership = _summary_dict(artifact, "leadership_changes")
 
-    funding_round = _to_str(crunchbase.get("funding_round")).lower()
-    funding_date = _parse_dt(_to_str(crunchbase.get("funding_date")))
-    if funding_date and (datetime.now(UTC) - funding_date).days <= 180:
-        if funding_round.startswith("series a") or funding_round.startswith("series b"):
-            scores[SEGMENT_1] += 0.7
+    if bool(flags.get("funding_series_ab_within_180d")):
+        scores[SEGMENT_1] += 0.7
 
     engineering_roles = _to_int(jobs.get("engineering_role_count"))
     ai_roles = _to_int(jobs.get("ai_adjacent_role_count"))
@@ -362,3 +368,22 @@ def _parse_dt(value: str) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
     return parsed
+
+
+def _latest_funding_event(*, crunchbase: dict[str, Any]) -> dict[str, Any] | None:
+    events = crunchbase.get("funding_events_180d")
+    if not isinstance(events, list):
+        return None
+    parsed_events: list[tuple[datetime, dict[str, Any]]] = []
+    for raw in events:
+        if not isinstance(raw, dict):
+            continue
+        date_text = _to_str(raw.get("announced_on"))
+        dt = _parse_dt(date_text)
+        if dt is None:
+            continue
+        parsed_events.append((dt, raw))
+    if not parsed_events:
+        return None
+    parsed_events.sort(key=lambda item: item[0], reverse=True)
+    return parsed_events[0][1]

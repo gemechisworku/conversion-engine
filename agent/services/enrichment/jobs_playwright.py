@@ -17,6 +17,42 @@ from agent.config.settings import Settings
 from agent.services.enrichment.schemas import SignalSnapshot, SourceRef
 
 ROLE_PATTERN = re.compile(r"<[^>]+>|\s+")
+SCRIPT_STYLE_PATTERN = re.compile(r"(?is)<(script|style)\b.*?>.*?</\1>")
+TAG_PATTERN = re.compile(r"<[^>]+>")
+JOB_TITLE_PATTERN = re.compile(
+    r"""(?ix)
+    \b
+    (?:
+      (?:senior|sr\.?|staff|lead|principal|junior|jr\.?|mid|head|director|manager)\s+
+    )?
+    (?:
+      machine\ learning|
+      ml|
+      ai|
+      data|
+      software|
+      backend|
+      front(?:-|\s)?end|
+      full(?:-|\s)?stack|
+      platform|
+      devops|
+      site\ reliability|
+      sre|
+      cloud
+    )
+    (?:
+      \s+
+      (?:
+        machine\ learning|ml|ai|data|platform|software|backend|front(?:-|\s)?end|cloud
+      )
+    ){0,2}
+    \s+
+    (?:
+      engineer|developer|scientist|architect|manager|specialist|analyst|researcher
+    )
+    \b
+    """
+)
 LOGGER = logging.getLogger("agent.enrichment.jobs")
 MAX_JOB_SOURCE_TIMEOUT_SECONDS = 8.0
 
@@ -43,9 +79,16 @@ class JobsPlaywrightCollector:
         urls = [
             f"https://{company_domain}/careers",
             f"https://{company_domain}/jobs",
-            f"https://builtin.com/company/{slug}/jobs",
-            f"https://wellfound.com/company/{slug}/jobs",
+            f"https://{company_domain}/careers/jobs",
+            f"https://{company_domain}/about/careers",
         ]
+        if slug and len(slug) >= 4:
+            urls.extend(
+                [
+                    f"https://builtin.com/company/{slug}/jobs",
+                    f"https://wellfound.com/company/{slug}/jobs",
+                ]
+            )
         html_pages: list[tuple[str, str]] = []
         blocked_urls: list[str] = []
         per_request_timeout = min(float(self._settings.http_timeout_seconds), MAX_JOB_SOURCE_TIMEOUT_SECONDS)
@@ -64,7 +107,10 @@ class JobsPlaywrightCollector:
         if self._http_client is not None:
             results = await collect_with_client(self._http_client)
         else:
-            async with httpx.AsyncClient(timeout=per_request_timeout) as client:
+            async with httpx.AsyncClient(
+                timeout=per_request_timeout,
+                trust_env=self._settings.http_trust_env_proxy,
+            ) as client:
                 results = await collect_with_client(client)
 
         for url, html, blocked in results:
@@ -207,33 +253,75 @@ class JobsPlaywrightCollector:
         active_client = client or self._http_client
         if active_client is not None:
             return await active_client.get(url, timeout=request_timeout)
-        async with httpx.AsyncClient(timeout=request_timeout) as one_off_client:
+        async with httpx.AsyncClient(
+            timeout=request_timeout,
+            trust_env=self._settings.http_trust_env_proxy,
+        ) as one_off_client:
             return await one_off_client.get(url)
 
     @staticmethod
     def _extract_role_titles(html_pages: list[str]) -> list[str]:
         role_titles: list[str] = []
         for html in html_pages:
-            matches = re.findall(
-                r"(?i)(Senior|Staff|Lead|Principal)?\s*(Data|ML|AI|Software|Backend|Frontend|Platform)[^<\n]{0,60}",
-                html,
-            )
-            for match in matches:
-                title = " ".join(part for part in match if part).strip()
-                normalized = ROLE_PATTERN.sub(" ", title).strip()
-                if normalized and normalized not in role_titles:
-                    role_titles.append(normalized)
+            stripped = SCRIPT_STYLE_PATTERN.sub(" ", html)
+            text = TAG_PATTERN.sub("\n", stripped)
+            for raw_line in text.splitlines():
+                line = ROLE_PATTERN.sub(" ", raw_line).strip()
+                if len(line) < 10:
+                    continue
+                for match in JOB_TITLE_PATTERN.finditer(line):
+                    normalized = JobsPlaywrightCollector._normalize_title(match.group(0))
+                    if normalized and normalized not in role_titles:
+                        role_titles.append(normalized)
         return role_titles
 
     @staticmethod
     def _is_engineering_role(title: str) -> bool:
         lower = title.lower()
-        return any(token in lower for token in ("software", "backend", "frontend", "platform", "ml", "data"))
+        return any(
+            token in lower
+            for token in (
+                "engineer",
+                "developer",
+                "architect",
+                "software",
+                "backend",
+                "frontend",
+                "platform",
+                "devops",
+                "site reliability",
+                "sre",
+                "data",
+                "machine learning",
+                "ml",
+                "ai",
+            )
+        )
 
     @staticmethod
     def _is_ai_adjacent(title: str) -> bool:
         lower = title.lower()
-        return any(token in lower for token in ("ai", "ml", "machine learning", "data"))
+        return any(token in lower for token in ("ai", "ml", "machine learning", "llm", "data scientist"))
+
+    @staticmethod
+    def _normalize_title(value: str) -> str:
+        collapsed = ROLE_PATTERN.sub(" ", value).strip()
+        if not collapsed:
+            return ""
+        words = collapsed.split()
+        if len(words) < 2:
+            return ""
+        normalized_words: list[str] = []
+        for word in words:
+            cleaned = re.sub(r"[^a-zA-Z0-9\-]", "", word)
+            if not cleaned:
+                continue
+            upper = cleaned.upper()
+            if upper in {"AI", "ML", "LLM", "SRE"}:
+                normalized_words.append(upper)
+            else:
+                normalized_words.append(cleaned.capitalize())
+        return " ".join(normalized_words)
 
     @staticmethod
     def _slug(value: str) -> str:

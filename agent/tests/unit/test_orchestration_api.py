@@ -102,6 +102,13 @@ def test_resend_webhook_route_is_registered() -> None:
     assert res.status_code == 200
 
 
+def test_africastalking_webhook_route_is_registered() -> None:
+    app = create_orchestration_app()
+    with TestClient(app) as client:
+        res = client.post("/webhooks/africastalking", json={"event_type": "unknown"})
+    assert res.status_code == 200
+
+
 def test_post_lead_respond_unknown_returns_failure() -> None:
     app = create_orchestration_app()
     with TestClient(app) as client:

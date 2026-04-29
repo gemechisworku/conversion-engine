@@ -233,6 +233,32 @@ class ResendEmailClient:
         payload = self._safe_json(response)
         return payload if payload else None
 
+    async def list_received_emails(
+        self,
+        *,
+        limit: int = 25,
+        before: str | None = None,
+        after: str | None = None,
+    ) -> dict[str, Any] | None:
+        self._settings.require("resend_api_key")
+        headers = {
+            "Authorization": f"Bearer {self._settings.resend_api_key}",
+        }
+        url = f"{self._settings.resend_api_url.rstrip('/')}/emails/receiving"
+        params: dict[str, str | int] = {"limit": max(1, min(100, int(limit)))}
+        if before:
+            params["before"] = before.strip()
+        if after:
+            params["after"] = after.strip()
+        try:
+            response = await self._get(url=url, headers=headers, params=params)
+        except httpx.HTTPError:
+            return None
+        if not response.is_success:
+            return None
+        payload = self._safe_json(response)
+        return payload if payload else None
+
     async def _post(
         self,
         *,
@@ -242,7 +268,10 @@ class ResendEmailClient:
     ) -> httpx.Response:
         if self._http_client is not None:
             return await self._http_client.post(url, headers=headers, json=json)
-        async with httpx.AsyncClient(timeout=self._settings.http_timeout_seconds) as client:
+        async with httpx.AsyncClient(
+            timeout=self._settings.http_timeout_seconds,
+            trust_env=self._settings.http_trust_env_proxy,
+        ) as client:
             return await client.post(url, headers=headers, json=json)
 
     async def _get(
@@ -250,11 +279,15 @@ class ResendEmailClient:
         *,
         url: str,
         headers: dict[str, str],
+        params: dict[str, str | int] | None = None,
     ) -> httpx.Response:
         if self._http_client is not None:
-            return await self._http_client.get(url, headers=headers)
-        async with httpx.AsyncClient(timeout=self._settings.http_timeout_seconds) as client:
-            return await client.get(url, headers=headers)
+            return await self._http_client.get(url, headers=headers, params=params)
+        async with httpx.AsyncClient(
+            timeout=self._settings.http_timeout_seconds,
+            trust_env=self._settings.http_trust_env_proxy,
+        ) as client:
+            return await client.get(url, headers=headers, params=params)
 
     def _transport_error(
         self,
@@ -317,6 +350,15 @@ class EmailService:
 
     async def get_received_email(self, *, email_id: str) -> dict[str, Any] | None:
         return await self._client.get_received_email(email_id=email_id)
+
+    async def list_received_emails(
+        self,
+        *,
+        limit: int = 25,
+        before: str | None = None,
+        after: str | None = None,
+    ) -> dict[str, Any] | None:
+        return await self._client.list_received_emails(limit=limit, before=before, after=after)
 
     async def handle_webhook(
         self,

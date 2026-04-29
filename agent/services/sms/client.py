@@ -213,7 +213,10 @@ class SMSService:
     ) -> httpx.Response:
         if self._http_client is not None:
             return await self._http_client.post(url, headers=headers, data=data)
-        async with httpx.AsyncClient(timeout=self._settings.http_timeout_seconds) as client:
+        async with httpx.AsyncClient(
+            timeout=self._settings.http_timeout_seconds,
+            trust_env=self._settings.http_trust_env_proxy,
+        ) as client:
             return await client.post(url, headers=headers, data=data)
 
     def _transport_error(self, request: OutboundSMSRequest, code: str, message: str) -> ProviderSendResult:

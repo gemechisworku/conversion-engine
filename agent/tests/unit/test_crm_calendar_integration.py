@@ -108,6 +108,58 @@ def test_hubspot_write_includes_enrichment_fields() -> None:
     assert payload["leadership_signal_summary"] == "CTO joined"
 
 
+def test_map_enrichment_payload_includes_crunchbase_core_fields() -> None:
+    payload = map_enrichment_to_crm_payload(
+        lead_id="lead_cb",
+        company_name="Acme AI",
+        company_domain="acme.ai",
+        enrichment_artifact={
+            "signals": {
+                "crunchbase": {
+                    "summary": {
+                        "company_id": "acme_ai",
+                        "company_name": "Acme AI",
+                        "domain": "acme.ai",
+                        "industry": "SaaS",
+                        "industries": ["SaaS", "Developer Tools"],
+                        "location": "San Francisco, CA",
+                        "country_code": "US",
+                        "region": "NA",
+                        "employee_count": "51-100",
+                        "company_type": "for_profit",
+                        "legal_name": "Acme AI, Inc.",
+                        "description": "AI devtools company",
+                        "founded_date": "2018-01-01",
+                        "operating_status": "active",
+                        "funding_round": "Series A",
+                        "funding_amount_usd": "5000000",
+                        "funding_total_usd": "18000000",
+                        "funding_date": "2025-02-01",
+                        "crunchbase_url": "https://www.crunchbase.com/organization/acme-ai",
+                        "funding_events_180d": [{"round": "Series A"}],
+                        "tech_stack": ["OpenAI", "Databricks"],
+                    }
+                }
+            }
+        },
+    )
+
+    assert payload.company_id == "acme_ai"
+    assert payload.industry == "SaaS"
+    assert payload.industries == ["SaaS", "Developer Tools"]
+    assert payload.country_code == "US"
+    assert payload.region == "NA"
+    assert payload.employee_count == "51-100"
+    assert payload.company_type == "for_profit"
+    assert payload.legal_name == "Acme AI, Inc."
+    assert payload.company_description == "AI devtools company"
+    assert payload.funding_round == "Series A"
+    assert payload.funding_total_usd == "18000000"
+    assert payload.funding_event_count_180d == 1
+    assert payload.crunchbase_url == "https://www.crunchbase.com/organization/acme-ai"
+    assert payload.tech_stack == ["OpenAI", "Databricks"]
+
+
 def test_calcom_booking_returns_normalized_object() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/v2/bookings"

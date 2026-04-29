@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+import os
 
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -42,6 +43,8 @@ class Settings(BaseSettings):
         default="resend-signature",
         alias="RESEND_WEBHOOK_SIGNATURE_HEADER",
     )
+    resend_pull_sync_enabled: bool = Field(default=True, alias="RESEND_PULL_SYNC_ENABLED")
+    resend_pull_sync_limit: int = Field(default=25, alias="RESEND_PULL_SYNC_LIMIT")
 
     africastalking_username: str = Field(default="", alias="AFRICASTALKING_USERNAME")
     africastalking_api_key: str = Field(default="", alias="AFRICASTALKING_API_KEY")
@@ -106,6 +109,7 @@ class Settings(BaseSettings):
     layoffs_csv_path: str = Field(default="", alias="LAYOFFS_CSV_PATH")
     layoffs_csv_url: str = Field(default="", alias="LAYOFFS_CSV_URL")
     leadership_feed_url: str = Field(default="", alias="LEADERSHIP_FEED_URL")
+    enrichment_reference_date: str = Field(default="", alias="ENRICHMENT_REFERENCE_DATE")
     cfpb_api_url: str = Field(
         default="https://www.consumerfinance.gov/data-research/consumer-complaints/search/api/v1/",
         alias="CFPB_API_URL",
@@ -118,7 +122,14 @@ class Settings(BaseSettings):
         alias="OPENROUTER_API_URL",
     )
     openrouter_model: str = Field(default="openai/gpt-4.1-mini", alias="OPENROUTER_MODEL")
+    openrouter_trust_env_proxy: bool = Field(default=False, alias="OPENROUTER_TRUST_ENV_PROXY")
     llm_call_log_dir: str = Field(default="outputs/llm_calls", alias="LLM_CALL_LOG_DIR")
+    enrichment_check_llm_connectivity: bool = Field(default=False, alias="ENRICHMENT_CHECK_LLM_CONNECTIVITY")
+    enrichment_require_llm: bool = Field(default=False, alias="ENRICHMENT_REQUIRE_LLM")
+    enrichment_llm_connectivity_timeout_seconds: float = Field(
+        default=8.0,
+        alias="ENRICHMENT_LLM_CONNECTIVITY_TIMEOUT_SECONDS",
+    )
     state_db_path: str = Field(default="outputs/runtime_state.db", alias="STATE_DB_PATH")
     hubspot_mcp_required_tools_csv: str = Field(default="", alias="HUBSPOT_MCP_REQUIRED_TOOLS_CSV")
     hubspot_mcp_required_tool_count: int = Field(default=9, alias="HUBSPOT_MCP_REQUIRED_TOOL_COUNT")
@@ -130,6 +141,7 @@ class Settings(BaseSettings):
     langfuse_host: str = Field(default="https://cloud.langfuse.com", alias="LANGFUSE_HOST")
 
     http_timeout_seconds: float = Field(default=20.0, alias="HTTP_TIMEOUT_SECONDS")
+    http_trust_env_proxy: bool = Field(default=False, alias="HTTP_TRUST_ENV_PROXY")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
     # Orchestration REST (`agent/api/orchestration_app.py`) — SPA / frontend
@@ -154,4 +166,8 @@ class Settings(BaseSettings):
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    return Settings()
+    settings = Settings()
+    if not settings.http_trust_env_proxy:
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+            os.environ.pop(key, None)
+    return settings

@@ -100,6 +100,22 @@ def create_orchestration_app() -> FastAPI:
         )
         return JSONResponse(env.model_dump(mode="json"))
 
+    @app.post(settings.webhook_route_africastalking, tags=["leads"])
+    async def post_africastalking_webhook(request: Request) -> JSONResponse:
+        raw_body = await request.body()
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                payload = {"payload": payload}
+        except Exception:
+            payload = {}
+        env = await request.app.state.runtime.handle_sms_webhook(
+            payload=payload,
+            headers=dict(request.headers),
+            raw_body=raw_body,
+        )
+        return JSONResponse(env.model_dump(mode="json"))
+
     @app.post("/lead/advance", tags=["leads"])
     async def post_lead_advance(req: LeadAdvanceRequest, request: Request) -> JSONResponse:
         env = await request.app.state.runtime.advance_state(req)
@@ -129,8 +145,22 @@ def create_orchestration_app() -> FastAPI:
         lead_id: str,
         request: Request,
         limit: Annotated[int, Query(ge=1, le=500, description="Max message rows (newest first)")] = 200,
+        sync_inbound: Annotated[
+            bool,
+            Query(
+                description=(
+                    "When true (default), pull latest Resend received emails and ingest missing replies "
+                    "before returning conversation state."
+                )
+            ),
+        ] = True,
     ) -> JSONResponse:
+        sync_result: dict[str, object] | None = None
+        if sync_inbound:
+            sync_result = await request.app.state.runtime.sync_resend_received_replies_for_lead(lead_id=lead_id)
         env = request.app.state.runtime.get_lead_conversation(lead_id=lead_id, limit=limit)
+        if sync_result is not None and env.status == "success":
+            env.data["inbound_sync"] = sync_result
         return JSONResponse(env.model_dump(mode="json"))
 
     @app.get("/pipelines", tags=["pipelines"])

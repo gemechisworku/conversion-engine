@@ -86,3 +86,45 @@ def test_icp_layoff_plus_funding_forces_segment_2() -> None:
     )
     c = classify_icp(artifact=artifact, ai_maturity=score)
     assert c.primary_segment == "segment_2_mid_market_restructure"
+
+
+def test_icp_uses_funding_events_when_funding_round_fields_missing() -> None:
+    now = datetime.now(UTC)
+    event_dt = (now - timedelta(days=20)).date().isoformat()
+    artifact = EnrichmentArtifact(
+        company_id="comp_z",
+        generated_at=now,
+        signals={
+            "crunchbase": SignalSnapshot(
+                summary={
+                    "funding_round": None,
+                    "funding_date": None,
+                    "funding_events_180d": [
+                        {
+                            "round": "Series A",
+                            "announced_on": event_dt,
+                            "amount_usd": 12000000,
+                        }
+                    ],
+                },
+                confidence=0.9,
+            ),
+            "job_posts": SignalSnapshot(
+                summary={"engineering_role_count": 7, "ai_adjacent_role_count": 1},
+                confidence=0.82,
+            ),
+            "layoffs": SignalSnapshot(summary={"matched": False}, confidence=0.7),
+            "leadership_changes": SignalSnapshot(summary={"matched": False}, confidence=0.5),
+        },
+        merged_confidence={},
+    )
+    score = AIMaturityScore(
+        score_id="s3",
+        company_id="comp_z",
+        score=1,
+        confidence=0.7,
+        generated_at=now,
+    )
+    c = classify_icp(artifact=artifact, ai_maturity=score)
+    assert c.primary_segment == "segment_1_series_a_b"
+    assert c.abstain is False

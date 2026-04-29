@@ -31,12 +31,34 @@ async def crm_sync_lead_intake_node(*, state: dict[str, Any], hubspot: HubSpotMC
     enriched = LeadGraphState.model_validate(state["enriched_state"])
     artifact = EnrichmentArtifact.model_validate(state["artifact"])
     lead_id = state["lead_id"]
+    message_ctx = enriched.message_context if isinstance(enriched.message_context, dict) else {}
+
+    segment_confidence_value = message_ctx.get("segment_confidence")
+    segment_confidence: float | None = None
+    if segment_confidence_value is not None:
+        try:
+            segment_confidence = float(segment_confidence_value)
+        except (TypeError, ValueError):
+            segment_confidence = None
+
+    ai_score_value = message_ctx.get("ai_maturity_score")
+    ai_maturity_score: int | None = None
+    if ai_score_value is not None:
+        try:
+            ai_maturity_score = int(ai_score_value)
+        except (TypeError, ValueError):
+            ai_maturity_score = None
+
     await hubspot.upsert_contact(
         contact=CRMLeadPayload(
             lead_id=lead_id,
             company_id=state["company_id"],
             company_name=state["company_name"],
             company_domain=state.get("company_domain") or None,
+            segment=str(message_ctx.get("primary_segment") or "").strip() or None,
+            alternate_segment=str(message_ctx.get("alternate_segment") or "").strip() or None,
+            segment_confidence=segment_confidence,
+            ai_maturity_score=ai_maturity_score,
         ),
         trace_id=state["trace_id"],
         idempotency_key=state["idempotency_key"],

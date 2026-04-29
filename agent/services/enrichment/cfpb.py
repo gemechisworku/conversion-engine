@@ -129,7 +129,10 @@ class CFPBComplaintAdapter:
     async def _get(self, *, url: str, params: dict[str, str]) -> httpx.Response:
         if self._http_client is not None:
             return await self._http_client.get(url, params=params, timeout=self._settings.http_timeout_seconds)
-        async with httpx.AsyncClient(timeout=self._settings.http_timeout_seconds) as client:
+        async with httpx.AsyncClient(
+            timeout=self._settings.http_timeout_seconds,
+            trust_env=self._settings.http_trust_env_proxy,
+        ) as client:
             return await client.get(url, params=params)
 
     @staticmethod

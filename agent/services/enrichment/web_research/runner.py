@@ -155,7 +155,11 @@ def _compile_graph(deps: ResearchDeps):
         if not query.strip():
             err_out.append("search:empty_query")
             return {"search_hits": [], "errors": err_out}
-        client = deps.http_client or httpx.AsyncClient(timeout=timeout, headers=default_http_headers())
+        client = deps.http_client or httpx.AsyncClient(
+            timeout=timeout,
+            headers=default_http_headers(),
+            trust_env=deps.settings.http_trust_env_proxy,
+        )
         own_client = deps.http_client is None
         try:
             hits, errs = await aggregate_search_hits(

@@ -143,6 +143,23 @@ async def run_lead_intake(
     lf_trace = trace_hint or None
     state_repo = services.get("state_repo")
 
+    if (
+        isinstance(settings_obj, Settings)
+        and llm_client is not None
+        and getattr(llm_client, "configured", False)
+        and (settings_obj.enrichment_check_llm_connectivity or settings_obj.enrichment_require_llm)
+        and hasattr(llm_client, "check_connectivity")
+    ):
+        llm_ok, llm_reason = await llm_client.check_connectivity(
+            trace_id=trace_hint or None,
+            lead_id=state.lead_id,
+        )
+        if settings_obj.enrichment_require_llm and not llm_ok:
+            raise RuntimeError(
+                "LLM connectivity required but unavailable for enrichment pipeline: "
+                f"{llm_reason or 'unknown_reason'}"
+            )
+
     async def mark_progress(step: str, status: str, objective: str) -> None:
         if state_repo is None:
             return
@@ -298,6 +315,14 @@ async def run_lead_intake(
             "current_stage": "brief_ready",
             "enrichment_refs": [artifact.company_id],
             "brief_refs": [hiring_brief.brief_id, gap_brief.gap_brief_id, ai_maturity.score_id],
+            "message_context": {
+                **(state.message_context or {}),
+                "primary_segment": classification.primary_segment,
+                "alternate_segment": classification.alternate_segment,
+                "segment_confidence": classification.confidence,
+                "ai_maturity_score": ai_maturity.score,
+                "ai_maturity_confidence": ai_maturity.confidence,
+            },
             "next_best_action": "draft",
             "updated_at": hiring_brief.generated_at,
         }

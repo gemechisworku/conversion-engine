@@ -28,7 +28,7 @@ def build_hiring_signal_brief(
     # Schema: hiring_signal_brief.md
     # API: research_api.md
     signals: dict[str, SignalBriefEntry] = {
-        "funding_event": _signal_entry(artifact=artifact, key="crunchbase", summary_key="funding_round"),
+        "funding_event": _funding_signal_entry(artifact=artifact),
         "job_post_velocity": _job_signal_entry(artifact=artifact),
         "layoffs": _signal_entry(artifact=artifact, key="layoffs", summary_key="layoff_date"),
         "leadership_change": _signal_entry(artifact=artifact, key="leadership_changes", summary_key="role_name"),
@@ -115,6 +115,14 @@ async def build_hiring_signal_brief_with_llm(
         return deterministic
     if candidate.lead_id != lead_id or candidate.company_id != company_id:
         return deterministic
+    # Keep ICP-facing fields source-of-truth from classifier output so UI state
+    # remains consistent with the classification step.
+    candidate.primary_segment_hypothesis = classification.primary_segment
+    candidate.alternate_segment_hypothesis = classification.alternate_segment
+    candidate.segment_confidence = classification.confidence
+    if classification.abstain:
+        if "Classification abstained due to low segment confidence." not in candidate.risk_notes:
+            candidate.risk_notes.append("Classification abstained due to low segment confidence.")
     return candidate
 
 
@@ -126,6 +134,41 @@ def _summary_dict(*, artifact: EnrichmentArtifact, key: str) -> dict[str, Any]:
     return summary if isinstance(summary, dict) else {}
 
 
+def _funding_signal_entry(*, artifact: EnrichmentArtifact) -> SignalBriefEntry:
+    snapshot = artifact.signals.get("crunchbase")
+    if snapshot is None:
+        return SignalBriefEntry(present=False, summary="No funding signal available.", confidence=0.2, evidence_refs=[])
+    summary = _summary_dict(artifact=artifact, key="crunchbase")
+    events = summary.get("funding_events_180d") if isinstance(summary.get("funding_events_180d"), list) else []
+    if events:
+        first = events[0] if isinstance(events[0], dict) else {}
+        round_name = str(first.get("round") or "").strip()
+        announced_on = str(first.get("announced_on") or "").strip()
+        detail = round_name or "recent funding"
+        if announced_on:
+            detail = f"{detail} ({announced_on})"
+        return SignalBriefEntry(
+            present=True,
+            summary=f"{len(events)} funding event(s) detected in the configured window; latest: {detail}.",
+            confidence=float(snapshot.confidence),
+            evidence_refs=["crunchbase_signal"],
+        )
+    funding_round = str(summary.get("funding_round") or "").strip()
+    if funding_round:
+        return SignalBriefEntry(
+            present=True,
+            summary=f"Funding round signal detected: {funding_round}.",
+            confidence=float(snapshot.confidence),
+            evidence_refs=["crunchbase_signal"],
+        )
+    return SignalBriefEntry(
+        present=False,
+        summary="No strong public funding signal found in the configured recency window.",
+        confidence=float(snapshot.confidence),
+        evidence_refs=["crunchbase_signal"],
+    )
+
+
 def _signal_entry(*, artifact: EnrichmentArtifact, key: str, summary_key: str) -> SignalBriefEntry:
     snapshot = artifact.signals.get(key)
     if snapshot is None:
@@ -133,9 +176,14 @@ def _signal_entry(*, artifact: EnrichmentArtifact, key: str, summary_key: str) -
     summary = _summary_dict(artifact=artifact, key=key)
     value = summary.get(summary_key)
     present = bool(value) if not isinstance(value, bool) else value
+    if not present and bool(summary.get("matched")):
+        present = True
+    text = str(value or "No strong public signal found.")
+    if present and not value:
+        text = "Public signal detected in available evidence."
     return SignalBriefEntry(
         present=present,
-        summary=str(value or "No strong public signal found."),
+        summary=text,
         confidence=float(snapshot.confidence),
         evidence_refs=[f"{key}_signal"],
     )

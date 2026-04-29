@@ -645,8 +645,45 @@ class HubSpotMCPService:
         if event_type == "enrichment_updated":
             funding = HubSpotMCPService._coerce_str(event_payload.get("funding_signal_summary")) or "n/a"
             hiring = HubSpotMCPService._coerce_str(event_payload.get("job_velocity_summary")) or "n/a"
+            layoffs = HubSpotMCPService._coerce_str(event_payload.get("layoffs_signal_summary")) or "n/a"
             leadership = HubSpotMCPService._coerce_str(event_payload.get("leadership_signal_summary")) or "n/a"
-            properties["description"] = f"enrichment: funding={funding}; hiring={hiring}; leadership={leadership}"
+            industry = HubSpotMCPService._coerce_str(event_payload.get("industry")) or "n/a"
+            employees = HubSpotMCPService._coerce_str(event_payload.get("employee_count")) or "n/a"
+            founded = HubSpotMCPService._coerce_str(event_payload.get("founded_date")) or "n/a"
+            operating_status = HubSpotMCPService._coerce_str(event_payload.get("operating_status")) or "n/a"
+            region = HubSpotMCPService._coerce_str(event_payload.get("region")) or "n/a"
+            country_code = HubSpotMCPService._coerce_str(event_payload.get("country_code")) or "n/a"
+            company_type = HubSpotMCPService._coerce_str(event_payload.get("company_type")) or "n/a"
+            funding_round = HubSpotMCPService._coerce_str(event_payload.get("funding_round")) or "n/a"
+            funding_total = HubSpotMCPService._coerce_str(event_payload.get("funding_total_usd")) or "n/a"
+            funding_events = event_payload.get("funding_event_count_180d")
+            funding_events_text = str(funding_events) if isinstance(funding_events, int) else "n/a"
+            crunchbase_url = HubSpotMCPService._coerce_str(event_payload.get("crunchbase_url")) or "n/a"
+            tech_stack = event_payload.get("tech_stack")
+            tech_text = (
+                ", ".join(str(item) for item in tech_stack[:6])
+                if isinstance(tech_stack, list) and tech_stack
+                else "n/a"
+            )
+            properties["description"] = (
+                "enrichment: "
+                f"industry={industry}; "
+                f"employee_count={employees}; "
+                f"founded={founded}; "
+                f"operating_status={operating_status}; "
+                f"region={region}; "
+                f"country={country_code}; "
+                f"company_type={company_type}; "
+                f"funding_round={funding_round}; "
+                f"funding_total_usd={funding_total}; "
+                f"funding_events_180d={funding_events_text}; "
+                f"funding_signal={funding}; "
+                f"hiring_signal={hiring}; "
+                f"layoffs_signal={layoffs}; "
+                f"leadership_signal={leadership}; "
+                f"crunchbase_url={crunchbase_url}; "
+                f"tech_stack={tech_text}"
+            )
             return properties
 
         if event_type == "lead_stage_updated":
@@ -699,14 +736,61 @@ class HubSpotMCPService:
             hiring = HubSpotMCPService._coerce_str(event_payload.get("job_velocity_summary")) or "n/a"
             layoffs = HubSpotMCPService._coerce_str(event_payload.get("layoffs_signal_summary")) or "n/a"
             leadership = HubSpotMCPService._coerce_str(event_payload.get("leadership_signal_summary")) or "n/a"
+            industry = HubSpotMCPService._coerce_str(event_payload.get("industry")) or "n/a"
+            industries = event_payload.get("industries")
+            industries_text = (
+                ", ".join(str(item) for item in industries[:10])
+                if isinstance(industries, list) and industries
+                else "n/a"
+            )
+            employee_count = HubSpotMCPService._coerce_str(event_payload.get("employee_count")) or "n/a"
+            company_type = HubSpotMCPService._coerce_str(event_payload.get("company_type")) or "n/a"
+            legal_name = HubSpotMCPService._coerce_str(event_payload.get("legal_name")) or "n/a"
+            founded = HubSpotMCPService._coerce_str(event_payload.get("founded_date")) or "n/a"
+            operating_status = HubSpotMCPService._coerce_str(event_payload.get("operating_status")) or "n/a"
+            region = HubSpotMCPService._coerce_str(event_payload.get("region")) or "n/a"
+            country_code = HubSpotMCPService._coerce_str(event_payload.get("country_code")) or "n/a"
+            location = HubSpotMCPService._coerce_str(event_payload.get("location")) or "n/a"
+            funding_round = HubSpotMCPService._coerce_str(event_payload.get("funding_round")) or "n/a"
+            funding_date = HubSpotMCPService._coerce_str(event_payload.get("funding_date")) or "n/a"
+            funding_amount = HubSpotMCPService._coerce_str(event_payload.get("funding_amount_usd")) or "n/a"
+            funding_total = HubSpotMCPService._coerce_str(event_payload.get("funding_total_usd")) or "n/a"
+            crunchbase_url = HubSpotMCPService._coerce_str(event_payload.get("crunchbase_url")) or "n/a"
+            company_description = HubSpotMCPService._coerce_str(event_payload.get("company_description")) or "n/a"
+            events_count = event_payload.get("funding_event_count_180d")
+            events_count_text = str(events_count) if isinstance(events_count, int) else "n/a"
+            tech_stack = event_payload.get("tech_stack")
+            tech_stack_text = (
+                ", ".join(str(item) for item in tech_stack[:10])
+                if isinstance(tech_stack, list) and tech_stack
+                else "n/a"
+            )
             return (
                 f"Enrichment updated\n"
                 f"Lead: {lead_id or 'n/a'}\n"
                 f"Event key: {event_key or 'n/a'}\n"
+                f"Industry: {industry}\n"
+                f"Industries: {industries_text}\n"
+                f"Company type: {company_type}\n"
+                f"Legal name: {legal_name}\n"
+                f"Employee count: {employee_count}\n"
+                f"Founded date: {founded}\n"
+                f"Operating status: {operating_status}\n"
+                f"Region: {region}\n"
+                f"Country: {country_code}\n"
+                f"Location: {location}\n"
+                f"Funding round: {funding_round}\n"
+                f"Funding date: {funding_date}\n"
+                f"Funding amount (USD): {funding_amount}\n"
+                f"Funding total (USD): {funding_total}\n"
+                f"Funding events (180d): {events_count_text}\n"
+                f"Crunchbase URL: {crunchbase_url}\n"
+                f"Company description: {company_description}\n"
                 f"Funding: {funding}\n"
                 f"Hiring: {hiring}\n"
                 f"Layoffs: {layoffs}\n"
-                f"Leadership: {leadership}"
+                f"Leadership: {leadership}\n"
+                f"Tech stack: {tech_stack_text}"
             )
 
         summary = {
@@ -727,38 +811,36 @@ class HubSpotMCPService:
         if not lead_id:
             raise ValueError("Booking/event payload is missing lead_id, cannot build HubSpot associations.")
 
-        target_company_id = await self._find_company_by_domain_or_name(domain=company_domain, name=company_name)
+        resolved_name = company_name
+        resolved_domain = company_domain
+        if not resolved_name and not resolved_domain:
+            # Keep a deterministic anchor when event payloads omit explicit company context
+            # (common for booking webhooks that only include lead_id).
+            resolved_name = f"Lead {lead_id}"
+
+        target_company_id = await self._find_company_by_domain_or_name(domain=resolved_domain, name=resolved_name)
         if target_company_id is not None:
             return target_company_id
 
-        if company_name or company_domain:
-            properties: dict[str, str] = {
-                "description": f"event_anchor_for_lead_id={lead_id}",
-            }
-            if company_name:
-                properties["name"] = company_name
-            if company_domain:
-                properties["domain"] = company_domain
-            create_args = {
-                "createRequest": {
-                    "objects": [
-                        {
-                            "objectType": "companies",
-                            "properties": properties,
-                        }
-                    ]
-                },
-                "confirmationStatus": "CONFIRMATION_WAIVED_FOR_SESSION",
-            }
-            return await self._create_anchor_company(create_args=create_args)
-
-        # Do not create synthetic "Lead <id>" companies; this is noisy for non-technical CRM users.
-        # If we cannot infer company context for this event, skip company association creation.
-        raise _MCPCallError(
-            "Unable to resolve company context for HubSpot event association (missing company_name/company_domain).",
-            retryable=False,
-            details={"lead_id": lead_id},
-        )
+        properties: dict[str, str] = {
+            "description": f"event_anchor_for_lead_id={lead_id}",
+        }
+        if resolved_name:
+            properties["name"] = resolved_name
+        if resolved_domain:
+            properties["domain"] = resolved_domain
+        create_args = {
+            "createRequest": {
+                "objects": [
+                    {
+                        "objectType": "companies",
+                        "properties": properties,
+                    }
+                ]
+            },
+            "confirmationStatus": "CONFIRMATION_WAIVED_FOR_SESSION",
+        }
+        return await self._create_anchor_company(create_args=create_args)
 
     async def _create_anchor_company(self, *, create_args: dict[str, Any]) -> int:
         create_result = await self._call_tool(name="manage_crm_objects", arguments=create_args)
@@ -821,6 +903,8 @@ class HubSpotMCPService:
             return None, None
         company_name = HubSpotMCPService._coerce_str(event_payload.get("company_name"))
         company_domain = HubSpotMCPService._coerce_str(event_payload.get("company_domain"))
+        company_name = company_name or HubSpotMCPService._coerce_str(event_payload.get("crunchbase_company_name"))
+        company_domain = company_domain or HubSpotMCPService._coerce_str(event_payload.get("crunchbase_domain"))
         if company_name or company_domain:
             return company_name, company_domain
         enrichment_brief = event_payload.get("enrichment_brief")
@@ -1002,7 +1086,10 @@ class HubSpotMCPService:
     ) -> httpx.Response:
         if self._http_client is not None:
             return await self._http_client.post(url, headers=headers, json=payload)
-        async with httpx.AsyncClient(timeout=self._settings.http_timeout_seconds) as client:
+        async with httpx.AsyncClient(
+            timeout=self._settings.http_timeout_seconds,
+            trust_env=self._settings.http_trust_env_proxy,
+        ) as client:
             return await client.post(url, headers=headers, json=payload)
 
     async def _get_access_token(self) -> str:
@@ -1040,7 +1127,10 @@ class HubSpotMCPService:
             if self._http_client is not None:
                 response = await self._http_client.post(self._oauth_token_url, headers=headers, data=data)
             else:
-                async with httpx.AsyncClient(timeout=self._settings.http_timeout_seconds) as client:
+                async with httpx.AsyncClient(
+                    timeout=self._settings.http_timeout_seconds,
+                    trust_env=self._settings.http_trust_env_proxy,
+                ) as client:
                     response = await client.post(self._oauth_token_url, headers=headers, data=data)
 
             if not response.is_success:
@@ -1278,15 +1368,72 @@ def map_enrichment_to_crm_payload(
             return None
         raw_summary = signal.get("summary")
         if isinstance(raw_summary, dict):
-            return str(raw_summary)
+            return json.dumps(raw_summary, ensure_ascii=True, sort_keys=True)
         if isinstance(raw_summary, str):
             return raw_summary
         return None
 
+    crunchbase_summary: dict[str, Any] = {}
+    crunchbase_signal = signals.get("crunchbase")
+    if isinstance(crunchbase_signal, dict):
+        raw = crunchbase_signal.get("summary")
+        if isinstance(raw, dict):
+            crunchbase_summary = raw
+
+    def _text(value: Any) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text or text.lower() in {"null", "none", "nan", "n/a", "[]", "{}"}:
+            return None
+        return text
+
+    industries_raw = crunchbase_summary.get("industries")
+    industries: list[str] = []
+    if isinstance(industries_raw, list):
+        for item in industries_raw:
+            cleaned = _text(item)
+            if cleaned:
+                industries.append(cleaned)
+    tech_stack_raw = crunchbase_summary.get("tech_stack")
+    tech_stack: list[str] = []
+    if isinstance(tech_stack_raw, list):
+        for item in tech_stack_raw:
+            cleaned = _text(item)
+            if cleaned:
+                tech_stack.append(cleaned)
+
     return CRMEnrichmentPayload(
         lead_id=lead_id,
-        company_name=company_name,
-        company_domain=company_domain,
+        company_name=company_name or _text(crunchbase_summary.get("company_name")),
+        company_domain=company_domain or _text(crunchbase_summary.get("domain")),
+        company_id=_text(crunchbase_summary.get("company_id")),
+        crunchbase_company_name=_text(crunchbase_summary.get("company_name")),
+        crunchbase_domain=_text(crunchbase_summary.get("domain")),
+        crunchbase_url=_text(
+            crunchbase_summary.get("source_url")
+            or crunchbase_summary.get("crunchbase_url")
+            or crunchbase_summary.get("url")
+        ),
+        industry=_text(crunchbase_summary.get("industry")),
+        industries=industries[:15],
+        location=_text(crunchbase_summary.get("location")),
+        country_code=_text(crunchbase_summary.get("country_code")),
+        region=_text(crunchbase_summary.get("region")),
+        employee_count=_text(crunchbase_summary.get("employee_count")),
+        company_type=_text(crunchbase_summary.get("company_type")),
+        legal_name=_text(crunchbase_summary.get("legal_name")),
+        company_description=_text(crunchbase_summary.get("description")),
+        founded_date=_text(crunchbase_summary.get("founded_date")),
+        operating_status=_text(crunchbase_summary.get("operating_status")),
+        funding_round=_text(crunchbase_summary.get("funding_round")),
+        funding_amount_usd=_text(crunchbase_summary.get("funding_amount_usd")),
+        funding_total_usd=_text(crunchbase_summary.get("funding_total_usd")),
+        funding_date=_text(crunchbase_summary.get("funding_date")),
+        funding_event_count_180d=len(crunchbase_summary.get("funding_events_180d") or [])
+        if isinstance(crunchbase_summary.get("funding_events_180d"), list)
+        else 0,
+        tech_stack=tech_stack[:25],
         funding_signal_summary=summary("crunchbase"),
         job_velocity_summary=summary("job_posts"),
         layoffs_signal_summary=summary("layoffs"),

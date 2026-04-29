@@ -192,8 +192,9 @@ export function LeadDetail({ leadId }: { leadId: string }) {
   const [outreachToEmail, setOutreachToEmail] = useState("");
   const [replyBody, setReplyBody] = useState("");
   const [replySubject, setReplySubject] = useState("");
-  const [replyChannel, setReplyChannel] = useState<"email" | "sms">("email");
   const [replyToEmail, setReplyToEmail] = useState("");
+  const [replyToNumber, setReplyToNumber] = useState("");
+  const [smsReplyBody, setSmsReplyBody] = useState("");
   const [escalationReason, setEscalationReason] = useState("manual_escalation");
   const [escalationSummary, setEscalationSummary] = useState("");
   const [escalationEvidenceRefs, setEscalationEvidenceRefs] = useState("");
@@ -220,7 +221,9 @@ export function LeadDetail({ leadId }: { leadId: string }) {
         orchestrationFetch<EvidenceResponse>(`/memory/evidence/${encodeURIComponent(leadId)}?limit=150`),
         orchestrationFetch<LeadBriefsPayload>(`/lead/${encodeURIComponent(leadId)}/briefs`),
         orchestrationFetch<OutreachDetailPayload>(`/outreachs/${encodeURIComponent(leadId)}`),
-        orchestrationFetch<LeadConversationPayload>(`/lead/${encodeURIComponent(leadId)}/conversation?limit=150`),
+        orchestrationFetch<LeadConversationPayload>(
+          `/lead/${encodeURIComponent(leadId)}/conversation?limit=150&sync_inbound=true`,
+        ),
         orchestrationFetch<MemorySessionPayload>(`/memory/session/${encodeURIComponent(leadId)}`),
       ]);
       setState(stateEnv);
@@ -309,7 +312,17 @@ export function LeadDetail({ leadId }: { leadId: string }) {
         break;
       }
     }
-  }, [conversation, replyBody, replySubject, replyToEmail]);
+    if (!replyToNumber) {
+      for (const row of rows) {
+        if (row.direction !== "inbound" || row.channel !== "sms") continue;
+        const candidate = typeof row.metadata?.from_number === "string" ? row.metadata.from_number : "";
+        if (candidate) {
+          setReplyToNumber(candidate);
+          break;
+        }
+      }
+    }
+  }, [conversation, replyBody, replySubject, replyToEmail, replyToNumber]);
 
   useEffect(() => {
     const nextAction = String((conversation?.session_state as Record<string, unknown> | undefined)?.next_best_action || "");
@@ -422,7 +435,7 @@ export function LeadDetail({ leadId }: { leadId: string }) {
         body: JSON.stringify({
           idempotency_key: makeIdem("ui_lead_respond", leadId),
           lead_id: leadId,
-          channel: replyChannel,
+          channel: "email",
           content: replyBody.trim(),
           subject: replySubject.trim() || undefined,
           to_email: replyToEmail.trim() || undefined,
@@ -433,6 +446,35 @@ export function LeadDetail({ leadId }: { leadId: string }) {
       }
       setSuccess(`Outbound reply queued (${env.data.message_id}).`);
       setReplyBody("");
+      await load();
+    });
+  }
+
+  async function onSendSchedulingSms() {
+    if (!smsReplyBody.trim()) {
+      setActionError("SMS content is required.");
+      return;
+    }
+    if (!replyToNumber.trim()) {
+      setActionError("Recipient phone number is required for SMS.");
+      return;
+    }
+    await withAction("respond_sms", async () => {
+      const env = await orchestrationFetch<LeadRespondPayload>("/lead/respond", {
+        method: "POST",
+        body: JSON.stringify({
+          idempotency_key: makeIdem("ui_lead_respond_sms", leadId),
+          lead_id: leadId,
+          channel: "sms",
+          content: smsReplyBody.trim(),
+          to_number: replyToNumber.trim(),
+        }),
+      });
+      if (env.status !== "success") {
+        throw new Error(env.error?.error_message || "Outbound SMS send failed.");
+      }
+      setSuccess(`Scheduling SMS queued (${env.data.message_id}).`);
+      setSmsReplyBody("");
       await load();
     });
   }
@@ -620,6 +662,12 @@ export function LeadDetail({ leadId }: { leadId: string }) {
   const lastIntent = String(conversationState?.last_customer_intent || "unknown");
   const outboundReplyActions = new Set(["clarify", "qualify", "handle_objection", "nurture"]);
   const replyActionNeeded = outboundReplyActions.has(nextBestAction);
+  const hasWarmSignal = messages.some(
+    (row) =>
+      row.direction === "inbound" &&
+      (row.channel === "email" || row.channel === "sms"),
+  );
+  const smsFollowupEligible = nextBestAction === "schedule" && hasWarmSignal;
   const scheduleSlots = Array.isArray(schedulingContext.slots_proposed)
     ? (schedulingContext.slots_proposed as Array<Record<string, unknown>>)
     : [];
@@ -1024,6 +1072,46 @@ export function LeadDetail({ leadId }: { leadId: string }) {
                         {busyKey === "book_schedule" ? "Booking..." : "Book selected time (Cal + HubSpot)"}
                       </Button>
                     </div>
+                    <div className="rounded-md border border-border bg-background p-2">
+                      <p className="text-xs font-medium text-foreground">Scheduling SMS Follow-up</p>
+                      <p className="mt-1 text-xs text-muted">
+                        SMS is allowed only for warm leads and scheduling follow-ups.
+                      </p>
+                      {smsFollowupEligible ? (
+                        <div className="mt-2 space-y-2">
+                          <label className="block text-xs text-muted">
+                            To number
+                            <input
+                              value={replyToNumber}
+                              onChange={(e) => setReplyToNumber(e.target.value)}
+                              placeholder="+251900000000"
+                              className="mt-1 w-full rounded-md border border-border bg-background px-2 py-2 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/30"
+                            />
+                          </label>
+                          <label className="block text-xs text-muted">
+                            SMS content
+                            <textarea
+                              value={smsReplyBody}
+                              onChange={(e) => setSmsReplyBody(e.target.value)}
+                              rows={4}
+                              className="mt-1 w-full rounded-md border border-border bg-background px-2 py-2 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/30"
+                            />
+                          </label>
+                          <Button
+                            variant="secondary"
+                            size="sm"
+                            onClick={() => void onSendSchedulingSms()}
+                            disabled={busyKey !== null}
+                          >
+                            {busyKey === "respond_sms" ? "Sending SMS..." : "Send scheduling SMS"}
+                          </Button>
+                        </div>
+                      ) : (
+                        <p className="mt-2 text-xs text-muted">
+                          Warm-lead signal is required before SMS follow-up is enabled.
+                        </p>
+                      )}
+                    </div>
                   </>
                 ) : (
                   <>
@@ -1034,16 +1122,6 @@ export function LeadDetail({ leadId }: { leadId: string }) {
                       </p>
                     </div>
                     <div className="grid gap-2 sm:grid-cols-2">
-                      <label className="text-xs text-muted">
-                        Channel
-                        <select
-                          value={replyChannel}
-                          onChange={(e) => setReplyChannel(e.target.value as "email" | "sms")}
-                          className="mt-1 w-full rounded-md border border-border bg-background px-2 py-2 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/30"
-                        >
-                          <option value="email">Email</option>
-                        </select>
-                      </label>
                       <label className="text-xs text-muted">
                         To email
                         <input

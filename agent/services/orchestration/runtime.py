@@ -53,9 +53,13 @@ from agent.services.orchestration.schemas import (
 )
 from agent.services.outreach.outreach_flow import OutreachFlowDeps, run_outreach_draft_only, run_outreach_review_for_lead, run_outreach_send_for_lead
 from agent.services.outreach.outreach_payload import parse_outreach_stored
+from agent.services.policy.channel_policy import LeadChannelState
 from agent.services.policy.outbound_policy import OutboundPolicyService
+from agent.services.sms.client import SMSService
+from agent.services.sms.schemas import OutboundSMSRequest
 
 WEBHOOK_LOGGER = logging.getLogger("agent.webhooks.resend")
+SMS_WEBHOOK_LOGGER = logging.getLogger("agent.webhooks.africastalking")
 
 
 class OrchestrationRuntime:
@@ -72,6 +76,7 @@ class OrchestrationRuntime:
         hubspot_service: HubSpotMCPService | None = None,
         calcom_service: CalComService | None = None,
         email_service: EmailService | None = None,
+        sms_service: SMSService | None = None,
     ) -> None:
         self._settings = settings
         self._state_repo = state_repo
@@ -79,6 +84,7 @@ class OrchestrationRuntime:
         self._hubspot = hubspot_service
         self._calcom = calcom_service
         self._email_service = email_service
+        self._sms_service = sms_service
         self._policy = OutboundPolicyService(settings)
         self._lead_intake_graph = compile_lead_intake_graph(
             LeadIntakeGraphDeps(
@@ -929,6 +935,46 @@ class OrchestrationRuntime:
             return None
         return " ".join(part.capitalize() for part in local.split() if part)
 
+    def _resolve_sms_number_for_send(self, *, lead_id: str, override_number: str | None) -> str:
+        candidate = str(override_number or "").strip()
+        if candidate:
+            return candidate
+        rows = self._state_repo.list_messages(lead_id=lead_id, limit=150)
+        for row in rows:
+            if str(row.get("channel") or "").lower() != "sms":
+                continue
+            if str(row.get("direction") or "").lower() == "inbound":
+                meta = row.get("metadata", {}) if isinstance(row.get("metadata"), dict) else {}
+                inbound_number = str(meta.get("from_number") or "").strip()
+                if inbound_number:
+                    return inbound_number
+            if str(row.get("direction") or "").lower() == "outbound":
+                meta = row.get("metadata", {}) if isinstance(row.get("metadata"), dict) else {}
+                outbound_number = str(meta.get("to_number") or "").strip()
+                if outbound_number:
+                    return outbound_number
+        return ""
+
+    def _lead_channel_state_for_sms(self, *, lead_id: str, session: dict[str, Any]) -> LeadChannelState:
+        inbound_email = self._state_repo.get_latest_inbound_email_for_lead(lead_id=lead_id)
+        messages = self._state_repo.list_messages(lead_id=lead_id, limit=120)
+        has_recent_inbound_sms = any(
+            str(row.get("channel") or "").lower() == "sms" and str(row.get("direction") or "").lower() == "inbound"
+            for row in messages
+        )
+        conversation = self._state_repo.get_conversation_state(lead_id=lead_id) or {}
+        last_intent = str(conversation.get("last_customer_intent") or "").lower()
+        explicit_warm_status = (
+            str(session.get("current_stage") or "") in {"reply_received", "qualifying", "scheduling", "booked", "nurture"}
+            or last_intent in {"interest", "clarification", "objection", "schedule"}
+        )
+        return LeadChannelState(
+            lead_id=lead_id,
+            has_prior_email_reply=inbound_email is not None,
+            explicit_warm_status=explicit_warm_status,
+            has_recent_inbound_sms=has_recent_inbound_sms,
+        )
+
     async def respond_to_lead(self, request: LeadRespondRequest) -> ResponseEnvelope:
         request_id = f"req_{uuid4().hex[:10]}"
         trace_id = f"trace_respond_{uuid4().hex[:12]}"
@@ -945,20 +991,12 @@ class OrchestrationRuntime:
         if cached is not None:
             return ResponseEnvelope.model_validate(cached)
         channel = request.channel.strip().lower()
-        if channel != "email":
+        if channel not in {"email", "sms"}:
             return self._failure(
                 request_id=request_id,
                 trace_id=trace_id,
                 code="INVALID_INPUT",
-                message=f"Unsupported channel '{request.channel}'. Only email replies are supported in this action.",
-                retryable=False,
-            )
-        if self._email_service is None:
-            return self._failure(
-                request_id=request_id,
-                trace_id=trace_id,
-                code="CONFIG_ERROR",
-                message="EmailService not configured.",
+                message=f"Unsupported channel '{request.channel}'. Allowed channels: email, sms.",
                 retryable=False,
             )
         content = request.content.strip()
@@ -970,95 +1008,191 @@ class OrchestrationRuntime:
                 message="Outbound reply content is required.",
                 retryable=False,
             )
-        to_email = (request.to_email or "").strip()
-        if not to_email:
-            latest_inbound = self._state_repo.get_latest_inbound_email_for_lead(lead_id=request.lead_id) or {}
-            to_email = str(latest_inbound.get("from_email") or "").strip()
+
+        sent_message_id = f"reply_sent_{uuid4().hex[:12]}"
+        if channel == "email":
+            if self._email_service is None:
+                return self._failure(
+                    request_id=request_id,
+                    trace_id=trace_id,
+                    code="CONFIG_ERROR",
+                    message="EmailService not configured.",
+                    retryable=False,
+                )
+            to_email = (request.to_email or "").strip()
             if not to_email:
-                rows = self._state_repo.list_messages(lead_id=request.lead_id, limit=100)
-                for row in rows:
-                    if row.get("direction") == "inbound" and row.get("channel") == "email":
-                        meta = row.get("metadata", {}) if isinstance(row.get("metadata"), dict) else {}
-                        candidate = str(meta.get("from_email") or "").strip()
-                        if candidate:
-                            to_email = candidate
-                            break
-        if not to_email or "@" not in to_email:
-            return self._failure(
-                request_id=request_id,
+                latest_inbound = self._state_repo.get_latest_inbound_email_for_lead(lead_id=request.lead_id) or {}
+                to_email = str(latest_inbound.get("from_email") or "").strip()
+                if not to_email:
+                    rows = self._state_repo.list_messages(lead_id=request.lead_id, limit=100)
+                    for row in rows:
+                        if row.get("direction") == "inbound" and row.get("channel") == "email":
+                            meta = row.get("metadata", {}) if isinstance(row.get("metadata"), dict) else {}
+                            candidate = str(meta.get("from_email") or "").strip()
+                            if candidate:
+                                to_email = candidate
+                                break
+            if not to_email or "@" not in to_email:
+                return self._failure(
+                    request_id=request_id,
+                    trace_id=trace_id,
+                    code="INVALID_INPUT",
+                    message="Recipient email could not be resolved. Provide to_email explicitly.",
+                    retryable=False,
+                )
+            latest_inbound = self._state_repo.get_latest_inbound_email_for_lead(lead_id=request.lead_id) or {}
+            inbound_subject = str(latest_inbound.get("subject") or "").strip()
+            subject = (request.subject or "").strip()
+            if not subject:
+                if inbound_subject.lower().startswith("re:"):
+                    subject = inbound_subject
+                elif inbound_subject:
+                    subject = f"Re: {inbound_subject}"
+                else:
+                    subject = "Re: Follow-up"
+            in_reply_to, references = self._state_repo.get_email_thread_reply_headers(lead_id=request.lead_id)
+            outbound = OutboundEmailRequest(
+                lead_id=request.lead_id,
+                draft_id=f"reply_draft_{uuid4().hex[:12]}",
+                review_id=f"ui_reply_review_{uuid4().hex[:12]}",
+                review_status="approved_with_edits",
                 trace_id=trace_id,
-                code="INVALID_INPUT",
-                message="Recipient email could not be resolved. Provide to_email explicitly.",
-                retryable=False,
+                idempotency_key=request.idempotency_key,
+                to_email=to_email,
+                subject=subject,
+                text_body=content,
+                in_reply_to=in_reply_to,
+                references=references,
+                metadata={
+                    "kind": "next_action_reply_send",
+                    "source_next_action": session.get("next_best_action"),
+                    "unsupported_claims": False,
+                    "bench_verified": False,
+                },
             )
-        latest_inbound = self._state_repo.get_latest_inbound_email_for_lead(lead_id=request.lead_id) or {}
-        inbound_subject = str(latest_inbound.get("subject") or "").strip()
-        subject = (request.subject or "").strip()
-        if not subject:
-            if inbound_subject.lower().startswith("re:"):
-                subject = inbound_subject
-            elif inbound_subject:
-                subject = f"Re: {inbound_subject}"
-            else:
-                subject = "Re: Follow-up"
-        in_reply_to, references = self._state_repo.get_email_thread_reply_headers(lead_id=request.lead_id)
-        outbound = OutboundEmailRequest(
-            lead_id=request.lead_id,
-            draft_id=f"reply_draft_{uuid4().hex[:12]}",
-            review_id=f"ui_reply_review_{uuid4().hex[:12]}",
-            review_status="approved_with_edits",
-            trace_id=trace_id,
-            idempotency_key=request.idempotency_key,
-            to_email=to_email,
-            subject=subject,
-            text_body=content,
-            in_reply_to=in_reply_to,
-            references=references,
-            metadata={
-                "kind": "next_action_reply_send",
-                "source_next_action": session.get("next_best_action"),
-                "unsupported_claims": False,
-                "bench_verified": False,
-            },
-        )
-        result = await self._email_service.send_email(outbound)
-        if not result.accepted:
-            return self._failure(
-                request_id=request_id,
+            result = await self._email_service.send_email(outbound)
+            if not result.accepted:
+                return self._failure(
+                    request_id=request_id,
+                    trace_id=trace_id,
+                    code="ORCHESTRATION_FAILED",
+                    message=result.error.error_message if result.error else "Failed to send outbound reply.",
+                    retryable=bool(result.error.retryable) if result.error else False,
+                )
+            sent_message_id = result.provider_message_id or f"reply_sent_{uuid4().hex[:12]}"
+            reply_to_address = build_lead_reply_address(
+                lead_id=request.lead_id,
+                domain=self._settings.resend_reply_domain,
+            )
+            self._state_repo.append_message(
+                lead_id=request.lead_id,
+                channel="email",
+                message_id=sent_message_id,
+                direction="outbound",
+                content=content,
+                metadata={
+                    "kind": "reply_sent",
+                    "subject": subject,
+                    "to_email": to_email,
+                    "in_reply_to": in_reply_to,
+                    "references": references,
+                    "reply_to_address": reply_to_address,
+                    "resend_message_id": result.provider_message_id,
+                    "resend_raw_response": result.raw_response or {},
+                },
+            )
+        else:
+            if self._sms_service is None:
+                return self._failure(
+                    request_id=request_id,
+                    trace_id=trace_id,
+                    code="CONFIG_ERROR",
+                    message="SMS service is not configured.",
+                    retryable=False,
+                )
+            stage = str(session.get("current_stage") or "")
+            next_action = str(session.get("next_best_action") or "")
+            if stage != "scheduling" and next_action != "schedule":
+                return self._failure(
+                    request_id=request_id,
+                    trace_id=trace_id,
+                    code="POLICY_BLOCKED",
+                    message="SMS replies are only allowed for scheduling follow-ups on warm leads.",
+                    retryable=False,
+                )
+            to_number = self._resolve_sms_number_for_send(
+                lead_id=request.lead_id,
+                override_number=request.to_number,
+            )
+            if not to_number:
+                return self._failure(
+                    request_id=request_id,
+                    trace_id=trace_id,
+                    code="INVALID_INPUT",
+                    message="Recipient phone number could not be resolved. Provide to_number explicitly.",
+                    retryable=False,
+                )
+            lead_channel_state = self._lead_channel_state_for_sms(lead_id=request.lead_id, session=session)
+            sms_request = OutboundSMSRequest(
+                lead_id=request.lead_id,
+                draft_id=f"reply_sms_draft_{uuid4().hex[:12]}",
+                review_id=f"ui_reply_sms_review_{uuid4().hex[:12]}",
+                review_status="approved_with_edits",
                 trace_id=trace_id,
-                code="ORCHESTRATION_FAILED",
-                message=result.error.error_message if result.error else "Failed to send outbound reply.",
-                retryable=bool(result.error.retryable) if result.error else False,
+                idempotency_key=request.idempotency_key,
+                to_number=to_number,
+                message=content,
+                lead_channel_state=lead_channel_state,
+                metadata={
+                    "kind": "next_action_reply_send",
+                    "source_next_action": session.get("next_best_action"),
+                    "unsupported_claims": False,
+                    "bench_verified": False,
+                },
             )
-        sent_message_id = result.provider_message_id or f"reply_sent_{uuid4().hex[:12]}"
-        reply_to_address = build_lead_reply_address(
-            lead_id=request.lead_id,
-            domain=self._settings.resend_reply_domain,
-        )
-        self._state_repo.append_message(
-            lead_id=request.lead_id,
-            channel="email",
-            message_id=sent_message_id,
-            direction="outbound",
-            content=content,
-            metadata={
-                "kind": "reply_sent",
-                "subject": subject,
-                "to_email": to_email,
-                "in_reply_to": in_reply_to,
-                "references": references,
-                "reply_to_address": reply_to_address,
-                "resend_message_id": result.provider_message_id,
-                "resend_raw_response": result.raw_response or {},
-            },
-        )
+            try:
+                sms_result = await self._sms_service.send_warm_lead_sms(sms_request)
+            except ValueError as exc:
+                return self._failure(
+                    request_id=request_id,
+                    trace_id=trace_id,
+                    code="CONFIG_ERROR",
+                    message=str(exc),
+                    retryable=False,
+                )
+            if not sms_result.accepted:
+                return self._failure(
+                    request_id=request_id,
+                    trace_id=trace_id,
+                    code=sms_result.error.error_code if sms_result.error is not None else "ORCHESTRATION_FAILED",
+                    message=sms_result.error.error_message if sms_result.error is not None else "Failed to send outbound SMS reply.",
+                    retryable=bool(sms_result.error.retryable) if sms_result.error is not None else False,
+                    details=sms_result.error.details if sms_result.error is not None else None,
+                )
+            sent_message_id = sms_result.provider_message_id or f"sms_reply_sent_{uuid4().hex[:12]}"
+            self._state_repo.bind_phone(lead_id=request.lead_id, phone_number=to_number)
+            self._state_repo.append_message(
+                lead_id=request.lead_id,
+                channel="sms",
+                message_id=sent_message_id,
+                direction="outbound",
+                content=content,
+                metadata={
+                    "kind": "reply_sent",
+                    "to_number": to_number,
+                    "provider": sms_result.provider,
+                    "provider_message_id": sms_result.provider_message_id,
+                    "provider_raw_status": sms_result.raw_status,
+                    "provider_raw_response": sms_result.raw_response or {},
+                },
+            )
         conversation = self._state_repo.get_conversation_state(lead_id=request.lead_id) or {}
         self._state_repo.upsert_conversation_state(
             lead_id=request.lead_id,
             payload={
                 **conversation,
                 "current_stage": "waiting",
-                "current_channel": "email",
+                "current_channel": channel,
                 "last_outbound_message_id": sent_message_id,
                 "pending_actions": [{"action_type": "wait_for_reply", "status": "pending"}],
             },
@@ -1745,6 +1879,274 @@ class OrchestrationRuntime:
             self._serialize_for_log(reply_env.model_dump(mode="json")),
         )
         return reply_env
+
+    async def handle_sms_webhook(
+        self,
+        *,
+        payload: dict[str, Any],
+        headers: dict[str, str] | None,
+        raw_body: bytes | str | None = None,
+    ) -> ResponseEnvelope:
+        request_id = f"req_{uuid4().hex[:10]}"
+        trace_id = f"trace_sms_webhook_{uuid4().hex[:12]}"
+        if self._sms_service is None:
+            return self._failure(
+                request_id=request_id,
+                trace_id=trace_id,
+                code="CONFIG_ERROR",
+                message="SMS service is not configured.",
+                retryable=False,
+            )
+        event = await self._sms_service.handle_inbound_sms(
+            payload=payload,
+            headers=headers,
+            raw_body=raw_body,
+        )
+        SMS_WEBHOOK_LOGGER.info(
+            "africastalking_inbound_event trace_id=%s event=%s",
+            trace_id,
+            self._serialize_for_log(event.model_dump(mode="json")),
+        )
+        if event.event_type != "inbound_sms":
+            return ResponseEnvelope(
+                request_id=request_id,
+                trace_id=trace_id,
+                status="accepted",
+                data={"event_type": event.event_type, "processed": False, "ignored": True},
+            )
+        lead_id = self._state_repo.find_lead_by_phone(phone_number=event.from_number)
+        if not lead_id:
+            return ResponseEnvelope(
+                request_id=request_id,
+                trace_id=trace_id,
+                status="accepted",
+                data={"event_type": event.event_type, "matched": False, "processed": False},
+            )
+        inbound_text = str(event.text or "").strip() or "(empty inbound sms)"
+        inbound_message_id = str(event.provider_message_id or f"sms_in_{uuid4().hex[:12]}").strip()
+        reply_request = LeadReplyRequest(
+            idempotency_key=f"webhook:africastalking:{inbound_message_id}",
+            lead_id=lead_id,
+            channel="sms",
+            message_id=inbound_message_id,
+            content=inbound_text,
+            from_number=event.from_number,
+            received_at=event.received_at,
+        )
+        SMS_WEBHOOK_LOGGER.info(
+            "africastalking_inbound_reply_request trace_id=%s payload=%s",
+            trace_id,
+            self._serialize_for_log(reply_request.model_dump(mode="json")),
+        )
+        reply_env = await self.handle_reply(reply_request)
+        SMS_WEBHOOK_LOGGER.info(
+            "africastalking_inbound_reply_result trace_id=%s response=%s",
+            trace_id,
+            self._serialize_for_log(reply_env.model_dump(mode="json")),
+        )
+        return reply_env
+
+    async def sync_resend_received_replies_for_lead(
+        self,
+        *,
+        lead_id: str,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        """Pull latest inbound replies from Resend Receiving API and ingest missing rows."""
+        if self._email_service is None:
+            return {
+                "enabled": False,
+                "processed": 0,
+                "already_known": 0,
+                "ignored": 0,
+                "errors": 0,
+                "reason": "email_service_not_configured",
+            }
+        if not self._settings.resend_pull_sync_enabled:
+            return {
+                "enabled": False,
+                "processed": 0,
+                "already_known": 0,
+                "ignored": 0,
+                "errors": 0,
+                "reason": "resend_pull_sync_disabled",
+            }
+        session = self._state_repo.get_session_state(lead_id=lead_id)
+        if session is None:
+            return {
+                "enabled": True,
+                "processed": 0,
+                "already_known": 0,
+                "ignored": 0,
+                "errors": 1,
+                "reason": "unknown_lead",
+            }
+        if str(session.get("current_stage") or "") != "awaiting_reply":
+            return {
+                "enabled": True,
+                "processed": 0,
+                "already_known": 0,
+                "ignored": 0,
+                "errors": 0,
+                "reason": "lead_not_waiting_for_reply",
+            }
+
+        fetch_limit = limit if limit is not None else int(self._settings.resend_pull_sync_limit)
+        try:
+            listing = await self._email_service.list_received_emails(limit=max(1, min(100, int(fetch_limit))))
+        except Exception:
+            listing = None
+        if not isinstance(listing, dict):
+            return {
+                "enabled": True,
+                "processed": 0,
+                "already_known": 0,
+                "ignored": 0,
+                "errors": 1,
+                "reason": "list_received_failed",
+            }
+        rows = listing.get("data")
+        if not isinstance(rows, list):
+            rows = []
+
+        stats = {
+            "enabled": True,
+            "processed": 0,
+            "already_known": 0,
+            "ignored": 0,
+            "errors": 0,
+            "reason": "ok",
+            "fetched": len(rows),
+        }
+        trace_id = f"trace_pull_sync_{uuid4().hex[:12]}"
+        for row in rows:
+            if not isinstance(row, dict):
+                stats["ignored"] += 1
+                continue
+            email_id = self._coerce_str(row.get("id"))
+            if not email_id:
+                stats["ignored"] += 1
+                continue
+            if self._state_repo.get_inbound_email(resend_email_id=email_id) is not None:
+                stats["already_known"] += 1
+                continue
+            to_address = self._first_email_address(row.get("to"))
+            if not to_address or "@" not in to_address:
+                stats["ignored"] += 1
+                continue
+            routed_lead_id = extract_lead_id_from_reply_address(
+                to_address,
+                domain=self._settings.resend_reply_domain,
+            )
+            if routed_lead_id != lead_id:
+                stats["ignored"] += 1
+                continue
+
+            status = await self._sync_one_received_email_for_lead(
+                lead_id=lead_id,
+                email_id=email_id,
+                trace_id=trace_id,
+            )
+            if status == "processed":
+                stats["processed"] += 1
+                # One new reply is enough to advance state. Additional replies are picked up on next refresh.
+                break
+            if status == "duplicate":
+                stats["already_known"] += 1
+            elif status == "error":
+                stats["errors"] += 1
+            else:
+                stats["ignored"] += 1
+        return stats
+
+    async def _sync_one_received_email_for_lead(
+        self,
+        *,
+        lead_id: str,
+        email_id: str,
+        trace_id: str,
+    ) -> str:
+        hydrated_raw = await self._hydrate_received_email(email_id=email_id)
+        hydrated = self._extract_received_email_data(hydrated_raw) if isinstance(hydrated_raw, dict) else None
+        if hydrated is None:
+            log_processing_step(
+                component="orchestration",
+                step="sync_resend_replies.fetch_failed",
+                message="Failed to hydrate received email during pull sync",
+                trace_id=trace_id,
+                lead_id=lead_id,
+                resend_email_id=email_id,
+                level=logging.WARNING,
+            )
+            return "error"
+
+        to_address = self._first_email_address(hydrated.get("to"))
+        if not to_address or "@" not in to_address:
+            return "ignored"
+
+        headers_map = self._normalize_received_headers(hydrated.get("headers"))
+        in_reply_to = (
+            self._coerce_str(hydrated.get("in_reply_to"))
+            or self._coerce_str(hydrated.get("inReplyTo"))
+            or headers_map.get("in-reply-to")
+        )
+        references = self._coerce_str(hydrated.get("references")) or headers_map.get("references")
+
+        routed_lead_id = extract_lead_id_from_reply_address(
+            to_address,
+            domain=self._settings.resend_reply_domain,
+        ) or self._state_repo.find_lead_id_by_email_headers(
+            in_reply_to=in_reply_to,
+            references=references,
+        )
+        if routed_lead_id != lead_id:
+            return "ignored"
+
+        if self._state_repo.get_session_state(lead_id=lead_id) is None:
+            return "ignored"
+
+        from_address = self._first_email_address(hydrated.get("from"))
+        subject = self._coerce_str(hydrated.get("subject"))
+        text_body = self._coerce_str(hydrated.get("text"))
+        html_body = self._coerce_str(hydrated.get("html"))
+        rfc_message_id = normalize_message_id(self._coerce_str(hydrated.get("message_id")))
+        received_at = self._coerce_datetime(hydrated.get("received_at") or hydrated.get("created_at"))
+        if received_at is None:
+            received_at = datetime.now(UTC)
+
+        inserted = self._state_repo.upsert_inbound_email(
+            resend_email_id=email_id,
+            lead_id=lead_id,
+            from_email=from_address,
+            to_email=to_address,
+            subject=subject,
+            text_body=text_body,
+            html_body=html_body,
+            headers=headers_map,
+            in_reply_to=in_reply_to,
+            references=references,
+            received_at=received_at,
+        )
+        if not inserted:
+            return "duplicate"
+
+        reply_env = await self.handle_reply(
+            LeadReplyRequest(
+                idempotency_key=f"pullsync:resend:{email_id}",
+                lead_id=lead_id,
+                channel="email",
+                message_id=email_id,
+                content=(text_body or html_body or "").strip() or "(empty inbound email)",
+                subject=subject,
+                rfc_message_id=rfc_message_id,
+                references_for_thread=references,
+                from_email=from_address,
+                received_at=received_at,
+            )
+        )
+        if reply_env.status == "accepted":
+            return "processed"
+        return "error"
 
     async def _hydrate_received_email(
         self,

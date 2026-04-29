@@ -58,6 +58,7 @@ class LeadRespondRequest(BaseModel):
     content: str
     subject: str | None = None
     to_email: str | None = None
+    to_number: str | None = None
 
 
 class LeadSchedulePrepareRequest(BaseModel):

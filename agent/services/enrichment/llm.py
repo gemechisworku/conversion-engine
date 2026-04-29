@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,32 @@ class OpenRouterJSONClient:
     @property
     def configured(self) -> bool:
         return bool(self._settings.openrouter_api_key.strip())
+
+    @staticmethod
+    def _proxy_env_snapshot() -> dict[str, str | None]:
+        return {
+            "HTTP_PROXY": os.environ.get("HTTP_PROXY"),
+            "HTTPS_PROXY": os.environ.get("HTTPS_PROXY"),
+            "ALL_PROXY": os.environ.get("ALL_PROXY"),
+            "NO_PROXY": os.environ.get("NO_PROXY"),
+        }
+
+    def _openrouter_headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self._settings.openrouter_api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "http://localhost/conversion-engine",
+            "X-Title": "Tenacious Conversion Engine",
+        }
+
+    def _models_url(self) -> str:
+        configured = self._settings.openrouter_api_url.strip()
+        if configured:
+            marker = "/chat/completions"
+            if marker in configured:
+                prefix = configured.split(marker, 1)[0].rstrip("/")
+                return f"{prefix}/models"
+        return "https://openrouter.ai/api/v1/models"
 
     def _safe_slug(self, value: str) -> str:
         chars = []
@@ -182,6 +209,8 @@ class OpenRouterJSONClient:
             "response_model": response_model.__name__,
             "openrouter_payload": payload,
             "openrouter_url": self._settings.openrouter_api_url,
+            "openrouter_trust_env_proxy": self._settings.openrouter_trust_env_proxy,
+            "proxy_env_snapshot": self._proxy_env_snapshot(),
         }
         response_status_code: int | None = None
         response_body: dict[str, Any] | str | None = None
@@ -249,12 +278,7 @@ class OpenRouterJSONClient:
             return None
 
     async def _post(self, *, payload: dict[str, Any]) -> httpx.Response:
-        headers = {
-            "Authorization": f"Bearer {self._settings.openrouter_api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "http://localhost/conversion-engine",
-            "X-Title": "Tenacious Conversion Engine",
-        }
+        headers = self._openrouter_headers()
         if self._http_client is not None:
             return await self._http_client.post(
                 self._settings.openrouter_api_url,
@@ -262,5 +286,65 @@ class OpenRouterJSONClient:
                 headers=headers,
                 timeout=self._settings.http_timeout_seconds,
             )
-        async with httpx.AsyncClient(timeout=self._settings.http_timeout_seconds) as client:
+        async with httpx.AsyncClient(
+            timeout=self._settings.http_timeout_seconds,
+            trust_env=self._settings.openrouter_trust_env_proxy,
+        ) as client:
             return await client.post(self._settings.openrouter_api_url, json=payload, headers=headers)
+
+    async def check_connectivity(
+        self,
+        *,
+        trace_id: str | None = None,
+        lead_id: str | None = None,
+    ) -> tuple[bool, str | None]:
+        """Best-effort OpenRouter health check used to fail clearly when LLM is required."""
+        if not self.configured:
+            return False, "openrouter_not_configured"
+        url = self._models_url()
+        headers = self._openrouter_headers()
+        timeout = max(1.0, float(self._settings.enrichment_llm_connectivity_timeout_seconds))
+        try:
+            if self._http_client is not None:
+                response = await self._http_client.get(url, headers=headers, timeout=timeout)
+            else:
+                async with httpx.AsyncClient(timeout=timeout, trust_env=self._settings.openrouter_trust_env_proxy) as client:
+                    response = await client.get(url, headers=headers)
+            if response.is_success:
+                log_processing_step(
+                    component="openrouter",
+                    step="llm.connectivity.ok",
+                    message="OpenRouter connectivity check passed",
+                    trace_id=trace_id,
+                    lead_id=lead_id,
+                    status_code=response.status_code,
+                    models_url=url,
+                    trust_env_proxy=self._settings.openrouter_trust_env_proxy,
+                )
+                return True, None
+            reason = f"openrouter_connectivity_http_{response.status_code}"
+            log_processing_step(
+                component="openrouter",
+                step="llm.connectivity.failed",
+                message="OpenRouter connectivity check returned non-success status",
+                trace_id=trace_id,
+                lead_id=lead_id,
+                status_code=response.status_code,
+                models_url=url,
+                trust_env_proxy=self._settings.openrouter_trust_env_proxy,
+            )
+            return False, reason
+        except httpx.HTTPError as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            log_processing_step(
+                component="openrouter",
+                step="llm.connectivity.failed",
+                message="OpenRouter connectivity check failed",
+                trace_id=trace_id,
+                lead_id=lead_id,
+                error_message=str(exc),
+                models_url=url,
+                trust_env_proxy=self._settings.openrouter_trust_env_proxy,
+                proxy_env_snapshot=self._proxy_env_snapshot(),
+            )
+            return False, reason

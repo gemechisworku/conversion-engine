@@ -254,4 +254,27 @@ describe("LeadDetail", () => {
     expect(body.starts_at_iso).toBe("2026-04-30T09:30:00");
     expect(body.timezone).toBe("Africa/Addis_Ababa");
   });
+
+  it("sends scheduling SMS follow-up when schedule action is active", async () => {
+    const leadId = "lead_test_5";
+    wireDefaultApiMocks(leadId, { nextAction: "schedule" });
+    render(<LeadDetail leadId={leadId} />);
+
+    await screen.findByText("Acme Test");
+    await userEvent.click(screen.getByRole("tab", { name: "Conversation" }));
+
+    await userEvent.type(screen.getByLabelText(/To number/i), "+251900000123");
+    await userEvent.type(screen.getByLabelText(/SMS content/i), "Confirming Tuesday 4 PM EAT.");
+    await userEvent.click(screen.getByRole("button", { name: /Send scheduling SMS/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/Scheduling SMS queued/)).toBeInTheDocument();
+    });
+
+    const respondCall = orchestrationFetchMock.mock.calls.find((call) => call[0] === "/lead/respond");
+    expect(respondCall).toBeTruthy();
+    const body = JSON.parse(String((respondCall?.[1] as { body?: string })?.body || "{}"));
+    expect(body.channel).toBe("sms");
+    expect(body.to_number).toBe("+251900000123");
+  });
 });

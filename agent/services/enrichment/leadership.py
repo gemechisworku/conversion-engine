@@ -23,6 +23,7 @@ class LeadershipChangeDetector:
         self._http_client = http_client
 
     async def collect(self, *, company_name: str, crunchbase_row: dict[str, Any] | None = None) -> SignalSnapshot:
+        reference_now = self._reference_now()
         entries = await self._load_entries()
         if crunchbase_row is not None:
             entries = [*entries, *self._entries_from_crunchbase(row=crunchbase_row)]
@@ -32,7 +33,11 @@ class LeadershipChangeDetector:
             for entry in entries
             if str(entry.get("company") or entry.get("company_name") or "").strip().lower() == normalized
             and self._is_target_role(str(entry.get("role_name") or ""))
-            and self._within_days(entry.get("change_date") or entry.get("date"), days=90)
+            and self._within_days(
+                entry.get("change_date") or entry.get("date"),
+                days=90,
+                reference_now=reference_now,
+            )
         ]
         if not matched:
             return SignalSnapshot(
@@ -118,7 +123,7 @@ class LeadershipChangeDetector:
         return any(token in lower for token in ("cto", "chief technology", "vp engineering", "vp of engineering"))
 
     @staticmethod
-    def _within_days(value: Any, *, days: int) -> bool:
+    def _within_days(value: Any, *, days: int, reference_now: datetime | None = None) -> bool:
         if not value:
             return False
         text = str(value).strip().replace("Z", "+00:00")
@@ -131,10 +136,27 @@ class LeadershipChangeDetector:
                 return False
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=UTC)
-        return parsed.astimezone(UTC) >= datetime.now(UTC) - timedelta(days=days)
+        now = reference_now or datetime.now(UTC)
+        return parsed.astimezone(UTC) >= now - timedelta(days=days)
+
+    def _reference_now(self) -> datetime:
+        value = self._settings.enrichment_reference_date.strip()
+        if not value:
+            return datetime.now(UTC)
+        text = value.replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return datetime.now(UTC)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
 
     async def _get(self, *, url: str) -> httpx.Response:
         if self._http_client is not None:
             return await self._http_client.get(url, timeout=self._settings.http_timeout_seconds)
-        async with httpx.AsyncClient(timeout=self._settings.http_timeout_seconds) as client:
+        async with httpx.AsyncClient(
+            timeout=self._settings.http_timeout_seconds,
+            trust_env=self._settings.http_trust_env_proxy,
+        ) as client:
             return await client.get(url)

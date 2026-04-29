@@ -50,7 +50,7 @@ def _settings() -> Settings:
     )
 
 
-def _runtime(*, email_service=None, hubspot_service=None, calcom_service=None) -> OrchestrationRuntime:
+def _runtime(*, email_service=None, hubspot_service=None, calcom_service=None, sms_service=None) -> OrchestrationRuntime:
     settings = _settings()
     repo = SQLiteStateRepository(db_path=settings.state_db_path)
     async def handler(_: httpx.Request) -> httpx.Response:
@@ -83,6 +83,7 @@ def _runtime(*, email_service=None, hubspot_service=None, calcom_service=None) -
         hubspot_service=hubspot_service,
         calcom_service=calcom_service,
         email_service=email_service,
+        sms_service=sms_service,
     )
 
 
@@ -577,6 +578,91 @@ def test_handle_email_webhook_falls_back_to_thread_headers_when_to_unmatched() -
     assert env.data["lead_id"] == lead_id
 
 
+def test_sync_resend_received_replies_for_lead_ingests_missing_reply() -> None:
+    lead_id = "lead_sync_pull_1"
+
+    class _EmailServiceStub:
+        async def list_received_emails(self, *, limit: int = 25, before=None, after=None):
+            del before, after
+            assert limit == 5
+            return {
+                "object": "list",
+                "data": [
+                    {
+                        "id": "recv_sync_1",
+                        "to": [f"{lead_id}@chuairkoon.resend.app"],
+                        "from": "prospect@example.com",
+                        "subject": "Re: Intro",
+                    }
+                ],
+                "has_more": False,
+            }
+
+        async def get_received_email(self, *, email_id: str):
+            assert email_id == "recv_sync_1"
+            return {
+                "id": "recv_sync_1",
+                "from": "prospect@example.com",
+                "to": [f"{lead_id}@chuairkoon.resend.app"],
+                "subject": "Re: Intro",
+                "text": "Tuesday at 4 PM EAT works for me.",
+                "message_id": "<inbound-sync@example.com>",
+                "headers": {"In-Reply-To": "<outbound@example.com>"},
+                "received_at": "2026-04-27T08:45:00Z",
+            }
+
+    runtime = _runtime(email_service=_EmailServiceStub())
+    runtime._state_repo.upsert_session_state(
+        lead_id=lead_id,
+        payload={
+            "current_stage": "awaiting_reply",
+            "next_best_action": "wait_for_reply",
+            "current_objective": "wait_for_inbound_reply",
+            "brief_refs": [],
+            "kb_refs": [],
+            "pending_actions": [{"action_type": "wait_for_reply", "status": "pending"}],
+            "policy_flags": [],
+            "handoff_required": False,
+        },
+    )
+    stats = asyncio.run(runtime.sync_resend_received_replies_for_lead(lead_id=lead_id, limit=5))
+    assert stats["processed"] == 1
+    stored = runtime._state_repo.get_inbound_email(resend_email_id="recv_sync_1")
+    assert stored is not None
+    assert stored["lead_id"] == lead_id
+    messages = runtime._state_repo.list_messages(lead_id=lead_id, limit=10)
+    assert any(row["direction"] == "inbound" and row["message_id"] == "recv_sync_1" for row in messages)
+
+
+def test_sync_resend_received_replies_skips_when_not_awaiting_reply() -> None:
+    lead_id = "lead_sync_pull_2"
+
+    class _EmailServiceStub:
+        async def list_received_emails(self, *, limit: int = 25, before=None, after=None):
+            raise AssertionError("Should not list received emails when lead is not awaiting reply")
+
+        async def get_received_email(self, *, email_id: str):
+            raise AssertionError("Should not hydrate received emails when lead is not awaiting reply")
+
+    runtime = _runtime(email_service=_EmailServiceStub())
+    runtime._state_repo.upsert_session_state(
+        lead_id=lead_id,
+        payload={
+            "current_stage": "qualifying",
+            "next_best_action": "clarify",
+            "current_objective": "reply_handling",
+            "brief_refs": [],
+            "kb_refs": [],
+            "pending_actions": [],
+            "policy_flags": [],
+            "handoff_required": False,
+        },
+    )
+    stats = asyncio.run(runtime.sync_resend_received_replies_for_lead(lead_id=lead_id, limit=5))
+    assert stats["processed"] == 0
+    assert stats["reason"] == "lead_not_waiting_for_reply"
+
+
 def test_outreach_send_moves_session_to_awaiting_reply() -> None:
     class _EmailServiceStub:
         async def send_email(self, request):
@@ -730,6 +816,127 @@ def test_respond_to_lead_sends_outbound_reply_and_waits_for_followup() -> None:
     assert conversation["last_outbound_message_id"] == "reply_msg_123"
     messages = runtime._state_repo.list_messages(lead_id=lead_id, limit=10)
     assert any(m["message_id"] == "reply_msg_123" and m["direction"] == "outbound" for m in messages)
+
+
+def test_respond_to_lead_sms_scheduling_followup_allowed_for_warm_lead() -> None:
+    class _SMSServiceStub:
+        async def send_warm_lead_sms(self, request):
+            del request
+            return ProviderSendResult(
+                provider="africastalking",
+                provider_message_id="sms_msg_123",
+                accepted=True,
+                raw_status="queued",
+                raw_response={"SMSMessageData": {"Recipients": [{"messageId": "sms_msg_123"}]}},
+            )
+
+    runtime = _runtime(sms_service=_SMSServiceStub())
+    lead_id = "lead_reply_sms_1"
+    runtime._state_repo.upsert_session_state(
+        lead_id=lead_id,
+        payload={
+            "current_stage": "scheduling",
+            "next_best_action": "schedule",
+            "current_objective": "reply_handling",
+            "brief_refs": [],
+            "kb_refs": [],
+            "pending_actions": [{"action_type": "delegate_scheduler", "status": "pending"}],
+            "policy_flags": [],
+            "handoff_required": False,
+        },
+    )
+    runtime._state_repo.upsert_conversation_state(
+        lead_id=lead_id,
+        payload={
+            "current_stage": "inbound_received",
+            "current_channel": "email",
+            "last_inbound_message_id": "msg_in_sms_1",
+            "last_customer_intent": "schedule",
+            "last_customer_sentiment": "neutral",
+            "qualification_status": "likely_qualified",
+            "pending_actions": [{"action_type": "delegate_scheduler", "status": "pending"}],
+            "policy_flags": [],
+            "scheduling_context": {"booking_status": "none", "timezone": None, "slots_proposed": []},
+        },
+    )
+    runtime._state_repo.upsert_inbound_email(
+        resend_email_id="recv_reply_sms_1",
+        lead_id=lead_id,
+        from_email="prospect@example.com",
+        to_email=f"{lead_id}@chuairkoon.resend.app",
+        subject="Re: Intro",
+        text_body="Tuesday works, text me details.",
+        html_body=None,
+        headers={},
+        in_reply_to="<outbound@example.com>",
+        references="<outbound@example.com>",
+        received_at=datetime.now(UTC),
+    )
+
+    env = asyncio.run(
+        runtime.respond_to_lead(
+            LeadRespondRequest(
+                idempotency_key="idem_respond_sms_1",
+                lead_id=lead_id,
+                channel="sms",
+                content="Thanks, confirming Tuesday at 4 PM EAT.",
+                to_number="+251900000001",
+            )
+        )
+    )
+    assert env.status == "success"
+    assert env.data["message_id"] == "sms_msg_123"
+    session = runtime._state_repo.get_session_state(lead_id=lead_id)
+    assert session is not None
+    assert session["current_stage"] == "awaiting_reply"
+    conversation = runtime._state_repo.get_conversation_state(lead_id=lead_id)
+    assert conversation is not None
+    assert conversation["current_channel"] == "sms"
+    assert conversation["last_outbound_message_id"] == "sms_msg_123"
+    messages = runtime._state_repo.list_messages(lead_id=lead_id, limit=10)
+    assert any(m["message_id"] == "sms_msg_123" and m["channel"] == "sms" for m in messages)
+
+
+def test_respond_to_lead_sms_blocked_when_not_scheduling() -> None:
+    class _SMSServiceStub:
+        async def send_warm_lead_sms(self, request):
+            del request
+            return ProviderSendResult(
+                provider="africastalking",
+                provider_message_id="sms_msg_blocked_should_not_send",
+                accepted=True,
+                raw_status="queued",
+            )
+
+    runtime = _runtime(sms_service=_SMSServiceStub())
+    lead_id = "lead_reply_sms_blocked_1"
+    runtime._state_repo.upsert_session_state(
+        lead_id=lead_id,
+        payload={
+            "current_stage": "qualifying",
+            "next_best_action": "clarify",
+            "current_objective": "reply_handling",
+            "brief_refs": [],
+            "kb_refs": [],
+            "pending_actions": [],
+            "policy_flags": [],
+            "handoff_required": False,
+        },
+    )
+    env = asyncio.run(
+        runtime.respond_to_lead(
+            LeadRespondRequest(
+                idempotency_key="idem_respond_sms_blocked_1",
+                lead_id=lead_id,
+                channel="sms",
+                content="Quick follow-up via SMS",
+                to_number="+251900000002",
+            )
+        )
+    )
+    assert env.status == "failure"
+    assert env.error is not None
+    assert env.error.error_code == "POLICY_BLOCKED"
 
 
 def test_prepare_scheduling_extracts_meeting_time_from_history() -> None:
