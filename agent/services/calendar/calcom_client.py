@@ -41,6 +41,14 @@ class CalComService:
         self._max_retries = max_retries
 
     async def get_available_slots(self, request: AvailabilityRequest) -> list[CalendarSlot]:
+        tool_name = "calcom.get_slots"
+        log_trace_event(
+            event_type="tool_start",
+            trace_id=request.trace_id,
+            lead_id=request.lead_id,
+            status="success",
+            payload={"tool_name": tool_name, "timezone": request.timezone},
+        )
         self._settings.require("calcom_api_key")
         selector = self._resolve_event_selector()
         url = f"{self._settings.calcom_api_url.rstrip('/')}/slots"
@@ -67,6 +75,14 @@ class CalComService:
                 details={"response": raw},
             )
             log_trace_event(
+                event_type="tool_error",
+                trace_id=request.trace_id,
+                lead_id=request.lead_id,
+                status="failure",
+                payload={"tool_name": tool_name, "timezone": request.timezone},
+                error={"type": error.error_code, "message": error.error_message, "retryable": error.retryable},
+            )
+            log_trace_event(
                 event_type="calendar_slots_failed",
                 trace_id=request.trace_id,
                 lead_id=request.lead_id,
@@ -91,6 +107,13 @@ class CalComService:
                 slot_id = str(entry.get("slot_id") or entry.get("id") or start_at.isoformat()).strip()
                 slots.append(CalendarSlot(slot_id=slot_id, start_at=start_at, end_at=end_at))
         log_trace_event(
+            event_type="tool_end",
+            trace_id=request.trace_id,
+            lead_id=request.lead_id,
+            status="success",
+            payload={"tool_name": tool_name, "slot_count": len(slots), "timezone": request.timezone},
+        )
+        log_trace_event(
             event_type="calendar_slots_loaded",
             trace_id=request.trace_id,
             lead_id=request.lead_id,
@@ -100,11 +123,27 @@ class CalComService:
         return slots
 
     async def book_discovery_call(self, request: BookingRequest) -> BookingResult:
+        tool_name = "calcom.book_discovery_call"
+        log_trace_event(
+            event_type="tool_start",
+            trace_id=request.trace_id,
+            lead_id=request.lead_id,
+            status="success",
+            payload={"tool_name": tool_name, "slot_id": request.slot_id},
+        )
         if not request.confirmed_by_prospect:
             error = ErrorEnvelope(
                 error_code="POLICY_BLOCKED",
                 error_message="Booking blocked: prospect confirmation is required.",
                 retryable=False,
+            )
+            log_trace_event(
+                event_type="tool_error",
+                trace_id=request.trace_id,
+                lead_id=request.lead_id,
+                status="failure",
+                payload={"tool_name": tool_name, "slot_id": request.slot_id},
+                error={"type": error.error_code, "message": error.error_message, "retryable": error.retryable},
             )
             return BookingResult(
                 lead_id=request.lead_id,
@@ -125,6 +164,14 @@ class CalComService:
                 error_message=blocked.reason,
                 retryable=False,
                 details={"policy_type": blocked.policy_type},
+            )
+            log_trace_event(
+                event_type="tool_error",
+                trace_id=request.trace_id,
+                lead_id=request.lead_id,
+                status="failure",
+                payload={"tool_name": tool_name, "slot_id": request.slot_id},
+                error={"type": error.error_code, "message": error.error_message, "retryable": error.retryable},
             )
             return BookingResult(
                 lead_id=request.lead_id,
@@ -167,6 +214,14 @@ class CalComService:
                 retryable=response.status_code >= 500,
                 details={"response": raw, "provider_message": provider_message},
             )
+            log_trace_event(
+                event_type="tool_error",
+                trace_id=request.trace_id,
+                lead_id=request.lead_id,
+                status="failure",
+                payload={"tool_name": tool_name, "slot_id": request.slot_id},
+                error={"type": error.error_code, "message": error.error_message, "retryable": error.retryable},
+            )
             return BookingResult(
                 lead_id=request.lead_id,
                 slot_id=request.slot_id,
@@ -184,6 +239,14 @@ class CalComService:
                 error_message="Cal.com booking failed.",
                 retryable=False,
                 details={"response": raw},
+            )
+            log_trace_event(
+                event_type="tool_error",
+                trace_id=request.trace_id,
+                lead_id=request.lead_id,
+                status="failure",
+                payload={"tool_name": tool_name, "slot_id": request.slot_id},
+                error={"type": error.error_code, "message": error.error_message, "retryable": error.retryable},
             )
             return BookingResult(
                 lead_id=request.lead_id,
@@ -209,6 +272,13 @@ class CalComService:
             ends_at=request.ends_at,
             confirmed_by_prospect=True,
             raw_response=raw,
+        )
+        log_trace_event(
+            event_type="tool_end",
+            trace_id=request.trace_id,
+            lead_id=request.lead_id,
+            status="success",
+            payload={"tool_name": tool_name, "booking_id": booking_id, "slot_id": request.slot_id},
         )
         log_trace_event(
             event_type="booking_confirmed",

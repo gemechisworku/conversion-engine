@@ -13,7 +13,13 @@ from agent.graphs.transitions import validate_lead_transition
 from agent.services.calendar.calcom_client import CalComService, book_and_sync_crm
 from agent.services.crm.hubspot_mcp import HubSpotMCPService
 from agent.services.calendar.schemas import BookingRequest, LinkedBookingResult
-from agent.services.observability.events import log_processing_step
+from agent.services.observability.events import (
+    log_graph_end,
+    log_graph_start,
+    log_node_end,
+    log_node_start,
+    log_processing_step,
+)
 
 
 class SchedulingGraphLGState(TypedDict, total=False):
@@ -36,6 +42,15 @@ def compile_scheduling_graph(deps: SchedulingGraphDeps):
     graph: StateGraph = StateGraph(SchedulingGraphLGState)
 
     async def book_node(state: SchedulingGraphLGState) -> dict[str, Any]:
+        trace_id = state["booking_request"].get("trace_id")
+        lead_id = state["scheduling_state"].get("lead_id")
+        node_run = log_node_start(
+            trace_id=trace_id,
+            graph_name="graphs.scheduling",
+            node_name="book_and_sync",
+            lead_id=lead_id,
+            input_data=dict(state),
+        )
         st = SchedulingGraphState.model_validate(state["scheduling_state"])
         request = BookingRequest.model_validate(state["booking_request"])
         log_processing_step(
@@ -47,24 +62,55 @@ def compile_scheduling_graph(deps: SchedulingGraphDeps):
             slot_id=request.slot_id,
             idempotency_key=request.idempotency_key,
         )
-        linked = await book_and_sync_crm(
-            lead_id=st.lead_id,
-            booking_request=request,
-            calcom_service=deps.calcom,
-            hubspot_service=deps.hubspot,
-        )
-        log_processing_step(
-            component="graphs.scheduling",
-            step="book_and_sync.done",
-            message="Booking + CRM calls finished",
-            lead_id=st.lead_id,
-            trace_id=request.trace_id,
-            booking_status=linked.booking.status,
-            crm_write_status=linked.crm_write.status if linked.crm_write else None,
-        )
-        return {"linked_result": linked.model_dump(mode="json")}
+        try:
+            linked = await book_and_sync_crm(
+                lead_id=st.lead_id,
+                booking_request=request,
+                calcom_service=deps.calcom,
+                hubspot_service=deps.hubspot,
+            )
+            log_processing_step(
+                component="graphs.scheduling",
+                step="book_and_sync.done",
+                message="Booking + CRM calls finished",
+                lead_id=st.lead_id,
+                trace_id=request.trace_id,
+                booking_status=linked.booking.status,
+                crm_write_status=linked.crm_write.status if linked.crm_write else None,
+            )
+            out = {"linked_result": linked.model_dump(mode="json")}
+            log_node_end(
+                trace_id=request.trace_id,
+                run_id=node_run,
+                graph_name="graphs.scheduling",
+                node_name="book_and_sync",
+                lead_id=st.lead_id,
+                output_data=out,
+                status="success",
+            )
+            return out
+        except Exception as exc:
+            log_node_end(
+                trace_id=trace_id,
+                run_id=node_run,
+                graph_name="graphs.scheduling",
+                node_name="book_and_sync",
+                lead_id=lead_id,
+                status="failure",
+                error={"type": type(exc).__name__, "message": str(exc), "retryable": True},
+            )
+            raise
 
     async def transition_node(state: SchedulingGraphLGState) -> dict[str, Any]:
+        trace_id = state["booking_request"].get("trace_id")
+        lead_id = state["scheduling_state"].get("lead_id")
+        node_run = log_node_start(
+            trace_id=trace_id,
+            graph_name="graphs.scheduling",
+            node_name="transition",
+            lead_id=lead_id,
+            input_data=dict(state),
+        )
         linked = LinkedBookingResult.model_validate(state["linked_result"])
         st = SchedulingGraphState.model_validate(state["scheduling_state"])
         next_stage = "booked" if linked.booking.succeeded else "scheduling"
@@ -76,9 +122,31 @@ def compile_scheduling_graph(deps: SchedulingGraphDeps):
             from_stage=st.current_stage,
             to_stage=next_stage,
         )
-        validate_lead_transition(from_state=st.current_stage, to_state=next_stage)
-        updated = st.model_copy(update={"current_stage": next_stage})
-        return {"updated_scheduling_state": updated.model_dump(mode="json")}
+        try:
+            validate_lead_transition(from_state=st.current_stage, to_state=next_stage)
+            updated = st.model_copy(update={"current_stage": next_stage})
+            out = {"updated_scheduling_state": updated.model_dump(mode="json")}
+            log_node_end(
+                trace_id=trace_id,
+                run_id=node_run,
+                graph_name="graphs.scheduling",
+                node_name="transition",
+                lead_id=lead_id,
+                output_data=out,
+                status="success",
+            )
+            return out
+        except Exception as exc:
+            log_node_end(
+                trace_id=trace_id,
+                run_id=node_run,
+                graph_name="graphs.scheduling",
+                node_name="transition",
+                lead_id=lead_id,
+                status="failure",
+                error={"type": type(exc).__name__, "message": str(exc), "retryable": False},
+            )
+            raise
 
     graph.add_node("book_and_sync", book_node)
     graph.add_node("transition", transition_node)
@@ -94,6 +162,15 @@ async def invoke_scheduling_graph(
     state: SchedulingGraphState,
     request: BookingRequest,
 ) -> tuple[SchedulingGraphState, LinkedBookingResult]:
+    graph_ctx = log_graph_start(
+        trace_id=request.trace_id,
+        graph_name="graphs.scheduling",
+        lead_id=state.lead_id,
+        input_data={
+            "scheduling_state": state.model_dump(mode="json"),
+            "booking_request": request.model_dump(mode="json"),
+        },
+    )
     log_processing_step(
         component="graphs.scheduling",
         step="graph.invoke",
@@ -107,14 +184,33 @@ async def invoke_scheduling_graph(
         "booking_request": request.model_dump(mode="json"),
         "errors": [],
     }
-    final = await graph.ainvoke(initial)
-    linked = LinkedBookingResult.model_validate(final["linked_result"])
-    log_processing_step(
-        component="graphs.scheduling",
-        step="graph.done",
-        message="Scheduling LangGraph completed",
-        lead_id=state.lead_id,
-        trace_id=request.trace_id,
-        booking_status=linked.booking.status,
-    )
-    return (SchedulingGraphState.model_validate(final["updated_scheduling_state"]), linked)
+    try:
+        final = await graph.ainvoke(initial)
+        linked = LinkedBookingResult.model_validate(final["linked_result"])
+        log_processing_step(
+            component="graphs.scheduling",
+            step="graph.done",
+            message="Scheduling LangGraph completed",
+            lead_id=state.lead_id,
+            trace_id=request.trace_id,
+            booking_status=linked.booking.status,
+        )
+        log_graph_end(
+            trace_id=request.trace_id,
+            run_id=graph_ctx.get("run_id"),
+            graph_name="graphs.scheduling",
+            lead_id=state.lead_id,
+            output_data=final,
+            status="success",
+        )
+        return (SchedulingGraphState.model_validate(final["updated_scheduling_state"]), linked)
+    except Exception as exc:
+        log_graph_end(
+            trace_id=request.trace_id,
+            run_id=graph_ctx.get("run_id"),
+            graph_name="graphs.scheduling",
+            lead_id=state.lead_id,
+            status="failure",
+            error={"type": type(exc).__name__, "message": str(exc), "retryable": True},
+        )
+        raise

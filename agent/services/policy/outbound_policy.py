@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from agent.config.settings import Settings
 from agent.services.common.schemas import PolicyDecision
+from agent.services.observability.events import log_policy_decision
 
 
 class OutboundPolicyService:
@@ -14,16 +15,41 @@ class OutboundPolicyService:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
 
+    def _decision(
+        self,
+        *,
+        policy_type: str,
+        decision: str,
+        reason: str,
+        trace_id: str,
+        lead_id: str,
+    ) -> PolicyDecision:
+        result = PolicyDecision(
+            policy_type=policy_type,  # type: ignore[arg-type]
+            decision=decision,  # type: ignore[arg-type]
+            reason=reason,
+            trace_id=trace_id,
+            lead_id=lead_id,
+        )
+        log_policy_decision(
+            trace_id=trace_id,
+            lead_id=lead_id,
+            policy_input={"policy_type": policy_type},
+            policy_output=result.model_dump(mode="json"),
+            status="blocked" if decision in {"blocked", "fail"} else ("failure" if decision == "escalate" else "success"),
+        )
+        return result
+
     def check_kill_switch(self, *, trace_id: str, lead_id: str) -> PolicyDecision:
         if self._settings.kill_switch_enabled:
-            return PolicyDecision(
+            return self._decision(
                 policy_type="kill_switch",
                 decision="blocked",
                 reason="Global kill switch is enabled.",
                 trace_id=trace_id,
                 lead_id=lead_id,
             )
-        return PolicyDecision(
+        return self._decision(
             policy_type="kill_switch",
             decision="pass",
             reason="Kill switch is disabled.",
@@ -33,14 +59,14 @@ class OutboundPolicyService:
 
     def check_sink_routing(self, *, trace_id: str, lead_id: str) -> PolicyDecision:
         if not self._settings.sink_routing_enabled and self._settings.challenge_mode:
-            return PolicyDecision(
+            return self._decision(
                 policy_type="sink_routing",
                 decision="blocked",
                 reason="Sink routing is required in challenge mode.",
                 trace_id=trace_id,
                 lead_id=lead_id,
             )
-        return PolicyDecision(
+        return self._decision(
             policy_type="sink_routing",
             decision="pass",
             reason="Sink routing check passed.",
@@ -63,7 +89,7 @@ class OutboundPolicyService:
         review_status: str,
     ) -> PolicyDecision:
         if not review_id.strip():
-            return PolicyDecision(
+            return self._decision(
                 policy_type="claim_validation",
                 decision="blocked",
                 reason="Missing review_id; outbound send requires completed review.",
@@ -71,14 +97,14 @@ class OutboundPolicyService:
                 lead_id=lead_id,
             )
         if review_status not in {"approved", "approved_with_edits"}:
-            return PolicyDecision(
+            return self._decision(
                 policy_type="claim_validation",
                 decision="blocked",
                 reason=f"Review status '{review_status}' is not send-eligible.",
                 trace_id=trace_id,
                 lead_id=lead_id,
             )
-        return PolicyDecision(
+        return self._decision(
             policy_type="claim_validation",
             decision="pass",
             reason="Review approval check passed.",
@@ -97,14 +123,14 @@ class OutboundPolicyService:
         commitment_terms = ("exact team", "5-person", "can start next week", "guaranteed capacity")
         lowered = message.lower()
         if any(term in lowered for term in commitment_terms) and not bench_verified:
-            return PolicyDecision(
+            return self._decision(
                 policy_type="bench_commitment",
                 decision="blocked",
                 reason="Bench commitment language detected without verification.",
                 trace_id=trace_id,
                 lead_id=lead_id,
             )
-        return PolicyDecision(
+        return self._decision(
             policy_type="bench_commitment",
             decision="pass",
             reason="Bench commitment check passed.",
@@ -120,14 +146,14 @@ class OutboundPolicyService:
         unsupported_claims: bool,
     ) -> PolicyDecision:
         if unsupported_claims:
-            return PolicyDecision(
+            return self._decision(
                 policy_type="claim_validation",
                 decision="blocked",
                 reason="Unsupported claims were flagged for this draft.",
                 trace_id=trace_id,
                 lead_id=lead_id,
             )
-        return PolicyDecision(
+        return self._decision(
             policy_type="claim_validation",
             decision="pass",
             reason="Claim grounding check passed.",
@@ -144,14 +170,14 @@ class OutboundPolicyService:
         reason: str = "",
     ) -> PolicyDecision:
         if needs_human_handoff:
-            return PolicyDecision(
+            return self._decision(
                 policy_type="escalation",
                 decision="escalate",
                 reason=reason or "Human handoff required by policy trigger.",
                 trace_id=trace_id,
                 lead_id=lead_id,
             )
-        return PolicyDecision(
+        return self._decision(
             policy_type="escalation",
             decision="pass",
             reason="No escalation trigger detected.",

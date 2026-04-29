@@ -33,7 +33,13 @@ from agent.services.email.reply_address import build_lead_reply_address, extract
 from agent.services.email.rfc_ids import merge_references_header, normalize_message_id
 from agent.services.email.schemas import OutboundEmailRequest
 from agent.services.enrichment.schemas import EnrichmentArtifact
-from agent.services.observability.events import log_processing_step, log_trace_event
+from agent.services.observability.events import (
+    log_graph_end,
+    log_graph_start,
+    log_processing_step,
+    log_state_transition,
+    log_trace_event,
+)
 from agent.services.observability.langfuse_llm import langfuse_workflow_span
 from agent.services.orchestration.schemas import (
     LeadAdvanceRequest,
@@ -138,6 +144,13 @@ class OrchestrationRuntime:
                 },
             )
             validate_lead_transition(from_state="new_lead", to_state="enriching")
+            log_state_transition(
+                trace_id=trace_id,
+                lead_id=lead_id,
+                state_before={"lead_state": "new_lead"},
+                state_after={"lead_state": "enriching"},
+                metadata={"status": "success"},
+            )
             self._state_repo.upsert_session_state(
                 lead_id=lead_id,
                 payload={
@@ -168,24 +181,58 @@ class OrchestrationRuntime:
                         message=f"HubSpot MCP readiness failed: {readiness}",
                         retryable=False,
                     )
+            graph_ctx = log_graph_start(
+                trace_id=trace_id,
+                graph_name="graphs.lead_intake",
+                lead_id=lead_id,
+                company_id=request.company_id,
+                input_data={
+                    "lead_id": lead_id,
+                    "company_id": request.company_id,
+                    "company_name": company_name,
+                    "company_domain": company_domain,
+                    "idempotency_key": request.idempotency_key,
+                },
+            )
             with langfuse_workflow_span(
                 self._settings,
                 trace_id=trace_id,
                 lead_id=lead_id,
                 name="graphs.lead_intake",
             ):
-                graph_out = await self._lead_intake_graph.ainvoke(
-                    {
-                        "lead_id": lead_id,
-                        "company_id": request.company_id,
-                        "company_name": company_name,
-                        "company_domain": company_domain,
-                        "trace_id": trace_id,
-                        "idempotency_key": request.idempotency_key,
-                        "lead_state": state.model_dump(mode="json"),
-                        "errors": [],
-                    }
-                )
+                try:
+                    graph_out = await self._lead_intake_graph.ainvoke(
+                        {
+                            "lead_id": lead_id,
+                            "company_id": request.company_id,
+                            "company_name": company_name,
+                            "company_domain": company_domain,
+                            "trace_id": trace_id,
+                            "idempotency_key": request.idempotency_key,
+                            "lead_state": state.model_dump(mode="json"),
+                            "errors": [],
+                        }
+                    )
+                    log_graph_end(
+                        trace_id=trace_id,
+                        run_id=graph_ctx.get("run_id"),
+                        graph_name="graphs.lead_intake",
+                        lead_id=lead_id,
+                        company_id=request.company_id,
+                        output_data=graph_out,
+                        status="success",
+                    )
+                except Exception as exc:
+                    log_graph_end(
+                        trace_id=trace_id,
+                        run_id=graph_ctx.get("run_id"),
+                        graph_name="graphs.lead_intake",
+                        lead_id=lead_id,
+                        company_id=request.company_id,
+                        status="failure",
+                        error={"type": type(exc).__name__, "message": str(exc), "retryable": True},
+                    )
+                    raise
             enriched_state = LeadGraphState.model_validate(graph_out["enriched_state"])
             artifact = EnrichmentArtifact.model_validate(graph_out["artifact"])
             log_processing_step(
@@ -319,6 +366,13 @@ class OrchestrationRuntime:
             return ResponseEnvelope.model_validate(cached)
         try:
             validate_lead_transition(from_state=session["current_stage"], to_state="reply_received")
+            log_state_transition(
+                trace_id=trace_id,
+                lead_id=request.lead_id,
+                state_before={"lead_state": session["current_stage"]},
+                state_after={"lead_state": "reply_received"},
+                metadata={"status": "success"},
+            )
             if request.channel.lower() == "email":
                 self._state_repo.ensure_email_thread(lead_id=request.lead_id)
             self._state_repo.append_message(
@@ -334,6 +388,13 @@ class OrchestrationRuntime:
                     "rfc_message_id": request.rfc_message_id,
                     "references_for_thread": request.references_for_thread,
                 },
+            )
+            log_trace_event(
+                event_type="reply_received",
+                trace_id=trace_id,
+                lead_id=request.lead_id,
+                status="success",
+                payload={"channel": request.channel, "message_id": request.message_id},
             )
             if request.channel.lower() == "email" and request.rfc_message_id:
                 self._state_repo.email_thread_record_inbound(
@@ -357,25 +418,55 @@ class OrchestrationRuntime:
             hiring = briefs_all.get("hiring_signal_brief")
             hiring_dict = hiring if isinstance(hiring, dict) else {}
             transcript_for_route = self._conversation_transcript_for_reply_routing(lead_id=request.lead_id)
+            graph_ctx = log_graph_start(
+                trace_id=trace_id,
+                graph_name="graphs.reply_route",
+                lead_id=request.lead_id,
+                input_data={
+                    "lead_id": request.lead_id,
+                    "channel": request.channel,
+                    "message_id": request.message_id,
+                    "subject": request.subject,
+                },
+            )
             with langfuse_workflow_span(
                 self._settings,
                 trace_id=trace_id,
                 lead_id=request.lead_id,
                 name="graphs.reply_route",
             ):
-                route_out = await self._reply_route_graph.ainvoke(
-                    {
-                        "lead_id": request.lead_id,
-                        "trace_id": trace_id,
-                        "channel": request.channel,
-                        "content": request.content,
-                        "subject": request.subject,
-                        "company_name": request.company_name or "",
-                        "hiring_signal_brief": hiring_dict,
-                        "recent_outbound_snippet": self._recent_outbound_email_snippet(lead_id=request.lead_id),
-                        "conversation_transcript": transcript_for_route or None,
-                    }
-                )
+                try:
+                    route_out = await self._reply_route_graph.ainvoke(
+                        {
+                            "lead_id": request.lead_id,
+                            "trace_id": trace_id,
+                            "channel": request.channel,
+                            "content": request.content,
+                            "subject": request.subject,
+                            "company_name": request.company_name or "",
+                            "hiring_signal_brief": hiring_dict,
+                            "recent_outbound_snippet": self._recent_outbound_email_snippet(lead_id=request.lead_id),
+                            "conversation_transcript": transcript_for_route or None,
+                        }
+                    )
+                    log_graph_end(
+                        trace_id=trace_id,
+                        run_id=graph_ctx.get("run_id"),
+                        graph_name="graphs.reply_route",
+                        lead_id=request.lead_id,
+                        output_data=route_out,
+                        status="success",
+                    )
+                except Exception as exc:
+                    log_graph_end(
+                        trace_id=trace_id,
+                        run_id=graph_ctx.get("run_id"),
+                        graph_name="graphs.reply_route",
+                        lead_id=request.lead_id,
+                        status="failure",
+                        error={"type": type(exc).__name__, "message": str(exc), "retryable": True},
+                    )
+                    raise
             intent = str(route_out.get("intent") or "unclear")
             next_action = str(route_out.get("next_action") or "clarify")
             next_state = str(route_out.get("next_state") or "qualifying")
@@ -444,6 +535,13 @@ class OrchestrationRuntime:
                 next_state=next_state,
                 channel=request.channel,
                 llm_email=email_interp is not None,
+            )
+            log_state_transition(
+                trace_id=trace_id,
+                lead_id=request.lead_id,
+                state_before={"lead_state": "reply_received"},
+                state_after={"lead_state": next_state},
+                metadata={"status": "success"},
             )
             validate_lead_transition(from_state="reply_received", to_state=next_state)
 
@@ -1200,6 +1298,13 @@ class OrchestrationRuntime:
         next_stage = session.get("current_stage", "qualifying")
         try:
             validate_lead_transition(from_state=next_stage, to_state="awaiting_reply")
+            log_state_transition(
+                trace_id=trace_id,
+                lead_id=request.lead_id,
+                state_before={"lead_state": next_stage},
+                state_after={"lead_state": "awaiting_reply"},
+                metadata={"status": "success"},
+            )
             next_stage = "awaiting_reply"
         except InvalidStateTransitionError:
             pass
@@ -1420,6 +1525,7 @@ class OrchestrationRuntime:
             or str(scheduling_ctx_dict.get("timezone") or "").strip()
             or "UTC"
         )
+        timezone_text = self._normalize_timezone_name(timezone_text)
         if starts_at is not None and starts_at.tzinfo is None:
             starts_at = starts_at.replace(tzinfo=date_tz.gettz(timezone_text) or UTC)
         if starts_at is None:
@@ -1514,6 +1620,13 @@ class OrchestrationRuntime:
                 details=booking.error.details if booking.error is not None else None,
             )
 
+        log_state_transition(
+            trace_id=trace_id,
+            lead_id=request.lead_id,
+            state_before={"lead_state": session["current_stage"]},
+            state_after={"lead_state": "booked"},
+            metadata={"status": "success"},
+        )
         next_session = {
             **session,
             "current_stage": "booked",
@@ -2293,6 +2406,13 @@ class OrchestrationRuntime:
             if session["current_stage"] != request.from_state:
                 raise InvalidStateTransitionError(from_state=session["current_stage"], to_state=request.to_state)
             validate_lead_transition(from_state=request.from_state, to_state=request.to_state)
+            log_state_transition(
+                trace_id=trace_id,
+                lead_id=request.lead_id,
+                state_before={"lead_state": request.from_state},
+                state_after={"lead_state": request.to_state},
+                metadata={"status": "success"},
+            )
             if (request.from_state, request.to_state) == ("in_review", "queued_to_send"):
                 send_err = await self._send_approved_outreach_if_configured(request=request, trace_id=trace_id)
                 if send_err:
@@ -3119,6 +3239,7 @@ class OrchestrationRuntime:
     ) -> tuple[CalendarSlot | None, ErrorEnvelope | None]:
         if self._calcom is None or not hasattr(self._calcom, "get_available_slots"):
             return None, None
+        timezone_text = self._normalize_timezone_name(timezone_text)
         tzinfo = date_tz.gettz(timezone_text) or UTC
         local_start = starts_at.astimezone(tzinfo)
         day_start = local_start.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -3148,6 +3269,24 @@ class OrchestrationRuntime:
         )
         if matched is not None:
             return matched, None
+        log_trace_event(
+            event_type="error",
+            trace_id=trace_id,
+            lead_id=lead_id,
+            status="failure",
+            payload={
+                "reason": "requested_slot_unavailable",
+                "tool_name": "calcom.get_slots",
+                "requested_start_at": starts_at.isoformat(),
+                "requested_end_at": ends_at.isoformat(),
+                "timezone": timezone_text,
+            },
+            error={
+                "type": "BOOKING_FAILED",
+                "message": "Requested time is not currently available in Cal.com.",
+                "retryable": False,
+            },
+        )
         return None, ErrorEnvelope(
             error_code="BOOKING_FAILED",
             error_message=(
@@ -3186,6 +3325,29 @@ class OrchestrationRuntime:
         return None
 
     @staticmethod
+    def _normalize_timezone_name(timezone_text: str) -> str:
+        raw = (timezone_text or "").strip()
+        if not raw:
+            return "UTC"
+        key = raw.upper()
+        aliases = {
+            "EAT": "Africa/Addis_Ababa",
+            "EEST": "Europe/Helsinki",
+            "EET": "Europe/Helsinki",
+            "EST": "America/New_York",
+            "EDT": "America/New_York",
+            "CST": "America/Chicago",
+            "CDT": "America/Chicago",
+            "MST": "America/Denver",
+            "MDT": "America/Denver",
+            "PST": "America/Los_Angeles",
+            "PDT": "America/Los_Angeles",
+            "GMT": "Etc/GMT",
+            "UTC": "UTC",
+        }
+        return aliases.get(key, raw)
+
+    @staticmethod
     def _lead_id_for_company(*, company_id: str) -> str:
         digest = hashlib.sha256(company_id.encode("utf-8")).hexdigest()[:10]
         return f"lead_{digest}"
@@ -3200,6 +3362,14 @@ class OrchestrationRuntime:
         retryable: bool,
         details: dict[str, Any] | None = None,
     ) -> ResponseEnvelope:
+        log_trace_event(
+            event_type="error",
+            trace_id=trace_id,
+            lead_id=None,
+            status="failure",
+            payload={"error_code": code, "details": details or {}},
+            error={"type": code, "message": message, "retryable": retryable},
+        )
         log_processing_step(
             component="orchestration",
             step="response.failure",

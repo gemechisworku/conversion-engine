@@ -15,7 +15,11 @@ from agent.nodes.intake import intake_initialize_node
 from agent.repositories.state_repo import SQLiteStateRepository
 from agent.services.crm.hubspot_mcp import HubSpotMCPService
 from agent.services.enrichment.schemas import EnrichmentArtifact
-from agent.services.observability.events import log_processing_step
+from agent.services.observability.events import (
+    log_node_end,
+    log_node_start,
+    log_processing_step,
+)
 
 
 class LeadIntakeGraphState(TypedDict, total=False):
@@ -50,6 +54,14 @@ def compile_lead_intake_graph(deps: LeadIntakeGraphDeps):
     graph: StateGraph = StateGraph(LeadIntakeGraphState)
 
     async def intake_node(state: LeadIntakeGraphState) -> dict[str, Any]:
+        node_run = log_node_start(
+            trace_id=state.get("trace_id"),
+            graph_name="graphs.lead_intake",
+            node_name="intake",
+            lead_id=state.get("lead_id"),
+            company_id=state.get("company_id"),
+            input_data=dict(state),
+        )
         log_processing_step(
             component="graphs.lead_intake",
             step="intake.start",
@@ -57,9 +69,41 @@ def compile_lead_intake_graph(deps: LeadIntakeGraphDeps):
             lead_id=state.get("lead_id"),
             trace_id=state.get("trace_id"),
         )
-        return await intake_initialize_node(dict(state))
+        try:
+            out = await intake_initialize_node(dict(state))
+            log_node_end(
+                trace_id=state.get("trace_id"),
+                run_id=node_run,
+                graph_name="graphs.lead_intake",
+                node_name="intake",
+                lead_id=state.get("lead_id"),
+                company_id=state.get("company_id"),
+                output_data=out,
+                status="success",
+            )
+            return out
+        except Exception as exc:
+            log_node_end(
+                trace_id=state.get("trace_id"),
+                run_id=node_run,
+                graph_name="graphs.lead_intake",
+                node_name="intake",
+                lead_id=state.get("lead_id"),
+                company_id=state.get("company_id"),
+                status="failure",
+                error={"type": type(exc).__name__, "message": str(exc), "retryable": True},
+            )
+            raise
 
     async def enrich_node(state: LeadIntakeGraphState) -> dict[str, Any]:
+        node_run = log_node_start(
+            trace_id=state.get("trace_id"),
+            graph_name="graphs.lead_intake",
+            node_name="enrich",
+            lead_id=state.get("lead_id"),
+            company_id=state.get("company_id"),
+            input_data=dict(state),
+        )
         lead_state = LeadGraphState.model_validate(state["lead_state"])
         log_processing_step(
             component="graphs.lead_intake",
@@ -74,29 +118,85 @@ def compile_lead_intake_graph(deps: LeadIntakeGraphDeps):
         enrich_services = deps.services_for_enrich()
         enrich_services["trace_id"] = state.get("trace_id", "")
         enrich_services["lead_id"] = state.get("lead_id", "")
-        enriched, artifact = await run_lead_intake(
-            state=lead_state,
-            company_name=state["company_name"],
-            company_domain=state["company_domain"],
-            services=enrich_services,
-        )
-        log_processing_step(
-            component="graphs.lead_intake",
-            step="enrich.done",
-            message="Lead enrichment finished",
-            lead_id=state.get("lead_id"),
-            trace_id=state.get("trace_id"),
-            stage=enriched.current_stage,
-            brief_refs_count=len(enriched.brief_refs),
-            company_id=enriched.company_id,
-        )
-        return {
-            "enriched_state": enriched.model_dump(mode="json"),
-            "artifact": artifact.model_dump(mode="json"),
-        }
+        try:
+            enriched, artifact = await run_lead_intake(
+                state=lead_state,
+                company_name=state["company_name"],
+                company_domain=state["company_domain"],
+                services=enrich_services,
+            )
+            log_processing_step(
+                component="graphs.lead_intake",
+                step="enrich.done",
+                message="Lead enrichment finished",
+                lead_id=state.get("lead_id"),
+                trace_id=state.get("trace_id"),
+                stage=enriched.current_stage,
+                brief_refs_count=len(enriched.brief_refs),
+                company_id=enriched.company_id,
+            )
+            out = {
+                "enriched_state": enriched.model_dump(mode="json"),
+                "artifact": artifact.model_dump(mode="json"),
+            }
+            log_node_end(
+                trace_id=state.get("trace_id"),
+                run_id=node_run,
+                graph_name="graphs.lead_intake",
+                node_name="enrich",
+                lead_id=state.get("lead_id"),
+                company_id=state.get("company_id"),
+                output_data=out,
+                status="success",
+            )
+            return out
+        except Exception as exc:
+            log_node_end(
+                trace_id=state.get("trace_id"),
+                run_id=node_run,
+                graph_name="graphs.lead_intake",
+                node_name="enrich",
+                lead_id=state.get("lead_id"),
+                company_id=state.get("company_id"),
+                status="failure",
+                error={"type": type(exc).__name__, "message": str(exc), "retryable": True},
+            )
+            raise
 
     async def crm_sync_node(state: LeadIntakeGraphState) -> dict[str, Any]:
-        return await crm_sync_lead_intake_node(state=dict(state), hubspot=deps.hubspot)
+        node_run = log_node_start(
+            trace_id=state.get("trace_id"),
+            graph_name="graphs.lead_intake",
+            node_name="crm_sync",
+            lead_id=state.get("lead_id"),
+            company_id=state.get("company_id"),
+            input_data=dict(state),
+        )
+        try:
+            out = await crm_sync_lead_intake_node(state=dict(state), hubspot=deps.hubspot)
+            log_node_end(
+                trace_id=state.get("trace_id"),
+                run_id=node_run,
+                graph_name="graphs.lead_intake",
+                node_name="crm_sync",
+                lead_id=state.get("lead_id"),
+                company_id=state.get("company_id"),
+                output_data=out,
+                status="success",
+            )
+            return out
+        except Exception as exc:
+            log_node_end(
+                trace_id=state.get("trace_id"),
+                run_id=node_run,
+                graph_name="graphs.lead_intake",
+                node_name="crm_sync",
+                lead_id=state.get("lead_id"),
+                company_id=state.get("company_id"),
+                status="failure",
+                error={"type": type(exc).__name__, "message": str(exc), "retryable": True},
+            )
+            raise
 
     graph.add_node("intake", intake_node)
     graph.add_node("enrich", enrich_node)

@@ -134,7 +134,22 @@ const DEFAULT_SCHEDULE_TIME = "09:00";
 function normalizeScheduleTimezone(raw?: string | null): string {
   const value = (raw || "").trim();
   if (!value || value.toLowerCase() === "unknown") return "UTC";
-  return value;
+  const aliases: Record<string, string> = {
+    EAT: "Africa/Addis_Ababa",
+    EEST: "Europe/Helsinki",
+    EET: "Europe/Helsinki",
+    EST: "America/New_York",
+    EDT: "America/New_York",
+    CST: "America/Chicago",
+    CDT: "America/Chicago",
+    MST: "America/Denver",
+    MDT: "America/Denver",
+    PST: "America/Los_Angeles",
+    PDT: "America/Los_Angeles",
+    GMT: "Etc/GMT",
+    UTC: "UTC",
+  };
+  return aliases[value.toUpperCase()] || value;
 }
 
 function todayIsoDate(): string {

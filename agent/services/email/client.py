@@ -39,6 +39,14 @@ class ResendEmailClient:
         self._max_retries = max_retries
 
     async def send_email(self, request: OutboundEmailRequest) -> ProviderSendResult:
+        tool_name = "resend.send_email"
+        log_trace_event(
+            event_type="tool_start",
+            trace_id=request.trace_id,
+            lead_id=request.lead_id,
+            status="success",
+            payload={"tool_name": tool_name, "draft_id": request.draft_id},
+        )
         self._settings.require("resend_api_key")
         metadata = request.metadata or {}
         reply_to_address = str(metadata.get("reply_to_address") or "").strip() or build_lead_reply_address(
@@ -80,6 +88,18 @@ class ResendEmailClient:
                 error_message=blocked.reason,
                 retryable=False,
                 details={"policy_type": blocked.policy_type},
+            )
+            log_trace_event(
+                event_type="tool_error",
+                trace_id=request.trace_id,
+                lead_id=request.lead_id,
+                status="failure",
+                payload={"tool_name": tool_name, "draft_id": request.draft_id},
+                error={
+                    "type": error.error_code,
+                    "message": error.error_message,
+                    "retryable": error.retryable,
+                },
             )
             log_trace_event(
                 event_type="email_send_blocked",
@@ -165,6 +185,13 @@ class ResendEmailClient:
                         raw_response=response_meta,
                     )
                     log_trace_event(
+                        event_type="tool_end",
+                        trace_id=request.trace_id,
+                        lead_id=request.lead_id,
+                        status="success",
+                        payload={"tool_name": tool_name, "provider_message_id": provider_message_id},
+                    )
+                    log_trace_event(
                         event_type="email_send_succeeded",
                         trace_id=request.trace_id,
                         lead_id=request.lead_id,
@@ -181,6 +208,18 @@ class ResendEmailClient:
                     error_message=f"Resend returned HTTP {response.status_code}.",
                     retryable=retryable,
                     details={"response": raw_response, "attempt": attempt},
+                )
+                log_trace_event(
+                    event_type="tool_error",
+                    trace_id=request.trace_id,
+                    lead_id=request.lead_id,
+                    status="failure",
+                    payload={"tool_name": tool_name, "draft_id": request.draft_id},
+                    error={
+                        "type": error.error_code,
+                        "message": error.error_message,
+                        "retryable": error.retryable,
+                    },
                 )
                 log_trace_event(
                     event_type="email_send_failed",
@@ -300,6 +339,14 @@ class ResendEmailClient:
             error_code=error_code,
             error_message=message,
             retryable=True,
+        )
+        log_trace_event(
+            event_type="tool_error",
+            trace_id=request.trace_id,
+            lead_id=request.lead_id,
+            status="failure",
+            payload={"tool_name": "resend.send_email", "draft_id": request.draft_id},
+            error={"type": error.error_code, "message": error.error_message, "retryable": error.retryable},
         )
         log_trace_event(
             event_type="email_send_failed",

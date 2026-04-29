@@ -1,4 +1,4 @@
-"""LangGraph: inbound reply → intent → optional email LLM → routed session stage."""
+"""LangGraph: inbound reply -> intent -> optional email LLM -> routed session stage."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from agent.graphs.reply_routing import (
 from agent.repositories.state_repo import SQLiteStateRepository
 from agent.services.conversation.email_llm import interpret_inbound_email_and_draft_reply
 from agent.services.enrichment.llm import OpenRouterJSONClient
-from agent.services.observability.events import log_processing_step
+from agent.services.observability.events import log_node_end, log_node_start, log_processing_step
 
 
 class ReplyRouteGraphState(TypedDict, total=False):
@@ -51,6 +51,13 @@ def compile_reply_route_graph(deps: ReplyRouteGraphDeps):
     graph: StateGraph = StateGraph(ReplyRouteGraphState)
 
     async def classify_heuristic(state: ReplyRouteGraphState) -> dict[str, Any]:
+        node_run = log_node_start(
+            trace_id=state.get("trace_id"),
+            graph_name="graphs.reply_route",
+            node_name="classify_heuristic",
+            lead_id=state.get("lead_id"),
+            input_data=dict(state),
+        )
         parts: list[str] = []
         transcript = (state.get("conversation_transcript") or "").strip()
         if transcript:
@@ -70,62 +77,155 @@ def compile_reply_route_graph(deps: ReplyRouteGraphDeps):
             intent=intent,
             next_action=next_action,
         )
-        return {"intent": intent, "next_action": next_action}
+        out = {"intent": intent, "next_action": next_action}
+        log_node_end(
+            trace_id=state.get("trace_id"),
+            run_id=node_run,
+            graph_name="graphs.reply_route",
+            node_name="classify_heuristic",
+            lead_id=state.get("lead_id"),
+            output_data=out,
+            status="success",
+        )
+        return out
 
     async def refine_email_llm(state: ReplyRouteGraphState) -> dict[str, Any]:
+        node_run = log_node_start(
+            trace_id=state.get("trace_id"),
+            graph_name="graphs.reply_route",
+            node_name="refine_email_llm",
+            lead_id=state.get("lead_id"),
+            input_data=dict(state),
+        )
         if (state.get("channel") or "").lower() != "email":
-            return {}
+            out: dict[str, Any] = {}
+            log_node_end(
+                trace_id=state.get("trace_id"),
+                run_id=node_run,
+                graph_name="graphs.reply_route",
+                node_name="refine_email_llm",
+                lead_id=state.get("lead_id"),
+                output_data=out,
+                status="skipped",
+            )
+            return out
         llm = deps.llm
         if llm is None or not llm.configured:
-            return {}
+            out = {}
+            log_node_end(
+                trace_id=state.get("trace_id"),
+                run_id=node_run,
+                graph_name="graphs.reply_route",
+                node_name="refine_email_llm",
+                lead_id=state.get("lead_id"),
+                output_data=out,
+                status="skipped",
+            )
+            return out
         hiring = state.get("hiring_signal_brief") or {}
-        email_interp = await interpret_inbound_email_and_draft_reply(
-            settings=deps.settings,
-            llm=llm,
-            company_name=state.get("company_name") or "",
-            inbound_subject=state.get("subject") or "(no subject)",
-            inbound_body=state.get("content") or "",
-            recent_outbound_context=state.get("recent_outbound_snippet"),
-            conversation_transcript=state.get("conversation_transcript"),
-            hiring_signal_brief=hiring if isinstance(hiring, dict) else {},
-            trace_id=state.get("trace_id"),
-            lead_id=state.get("lead_id"),
-        )
-        if email_interp is None:
-            return {}
-        allowed_actions = {
-            "schedule",
-            "qualify",
-            "clarify",
-            "handle_objection",
-            "nurture",
-            "escalate",
-        }
-        next_action = email_interp.next_best_action
-        if next_action not in allowed_actions:
-            next_action = next_action_for_intent(email_interp.intent)
-        log_processing_step(
-            component="graphs.reply_route",
-            step="classify.llm_email",
-            message="LLM refined inbound email interpretation",
-            lead_id=state.get("lead_id"),
-            trace_id=state.get("trace_id"),
-            intent=email_interp.intent,
-            next_action=next_action,
-        )
-        return {
-            "intent": email_interp.intent,
-            "next_action": next_action,
-            "email_interp": email_interp.model_dump(mode="json"),
-        }
+        try:
+            email_interp = await interpret_inbound_email_and_draft_reply(
+                settings=deps.settings,
+                llm=llm,
+                company_name=state.get("company_name") or "",
+                inbound_subject=state.get("subject") or "(no subject)",
+                inbound_body=state.get("content") or "",
+                recent_outbound_context=state.get("recent_outbound_snippet"),
+                conversation_transcript=state.get("conversation_transcript"),
+                hiring_signal_brief=hiring if isinstance(hiring, dict) else {},
+                trace_id=state.get("trace_id"),
+                lead_id=state.get("lead_id"),
+            )
+            if email_interp is None:
+                out = {}
+                log_node_end(
+                    trace_id=state.get("trace_id"),
+                    run_id=node_run,
+                    graph_name="graphs.reply_route",
+                    node_name="refine_email_llm",
+                    lead_id=state.get("lead_id"),
+                    output_data=out,
+                    status="skipped",
+                )
+                return out
+            allowed_actions = {
+                "schedule",
+                "qualify",
+                "clarify",
+                "handle_objection",
+                "nurture",
+                "escalate",
+            }
+            next_action = email_interp.next_best_action
+            if next_action not in allowed_actions:
+                next_action = next_action_for_intent(email_interp.intent)
+            log_processing_step(
+                component="graphs.reply_route",
+                step="classify.llm_email",
+                message="LLM refined inbound email interpretation",
+                lead_id=state.get("lead_id"),
+                trace_id=state.get("trace_id"),
+                intent=email_interp.intent,
+                next_action=next_action,
+            )
+            out = {
+                "intent": email_interp.intent,
+                "next_action": next_action,
+                "email_interp": email_interp.model_dump(mode="json"),
+            }
+            log_node_end(
+                trace_id=state.get("trace_id"),
+                run_id=node_run,
+                graph_name="graphs.reply_route",
+                node_name="refine_email_llm",
+                lead_id=state.get("lead_id"),
+                output_data=out,
+                status="success",
+            )
+            return out
+        except Exception as exc:
+            log_node_end(
+                trace_id=state.get("trace_id"),
+                run_id=node_run,
+                graph_name="graphs.reply_route",
+                node_name="refine_email_llm",
+                lead_id=state.get("lead_id"),
+                status="failure",
+                error={"type": type(exc).__name__, "message": str(exc), "retryable": True},
+            )
+            raise
 
     def route_session_stage(state: ReplyRouteGraphState) -> dict[str, Any]:
+        node_run = log_node_start(
+            trace_id=state.get("trace_id"),
+            graph_name="graphs.reply_route",
+            node_name="route_session_stage",
+            lead_id=state.get("lead_id"),
+            input_data=dict(state),
+        )
         next_action = state.get("next_action") or "clarify"
         next_state = session_stage_for_next_action(next_action)
-        return {"next_state": next_state}
+        out = {"next_state": next_state}
+        log_node_end(
+            trace_id=state.get("trace_id"),
+            run_id=node_run,
+            graph_name="graphs.reply_route",
+            node_name="route_session_stage",
+            lead_id=state.get("lead_id"),
+            output_data=out,
+            status="success",
+        )
+        return out
 
     def emit_branch_playbook(state: ReplyRouteGraphState) -> dict[str, Any]:
-        """reply_handling.md §7 — branch-specific next playbook (pending_actions)."""
+        """reply_handling.md section 7: branch-specific next playbook (pending_actions)."""
+        node_run = log_node_start(
+            trace_id=state.get("trace_id"),
+            graph_name="graphs.reply_route",
+            node_name="emit_branch_playbook",
+            lead_id=state.get("lead_id"),
+            input_data=dict(state),
+        )
         na = state.get("next_action") or "clarify"
         playbooks: dict[str, tuple[str, list[dict[str, Any]]]] = {
             "schedule": (
@@ -160,7 +260,17 @@ def compile_reply_route_graph(deps: ReplyRouteGraphDeps):
             reply_branch=branch,
             next_action=na,
         )
-        return {"reply_branch": branch, "branch_pending": pending}
+        out = {"reply_branch": branch, "branch_pending": pending}
+        log_node_end(
+            trace_id=state.get("trace_id"),
+            run_id=node_run,
+            graph_name="graphs.reply_route",
+            node_name="emit_branch_playbook",
+            lead_id=state.get("lead_id"),
+            output_data=out,
+            status="success",
+        )
+        return out
 
     graph.add_node("classify_heuristic", classify_heuristic)
     graph.add_node("refine_email_llm", refine_email_llm)
@@ -172,3 +282,4 @@ def compile_reply_route_graph(deps: ReplyRouteGraphDeps):
     graph.add_edge("route_session_stage", "emit_branch_playbook")
     graph.add_edge("emit_branch_playbook", END)
     return graph.compile()
+

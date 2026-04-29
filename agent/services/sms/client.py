@@ -45,6 +45,14 @@ class SMSService:
         self._max_retries = max_retries
 
     async def send_warm_lead_sms(self, request: OutboundSMSRequest) -> ProviderSendResult:
+        tool_name = "africastalking.send_sms"
+        log_trace_event(
+            event_type="tool_start",
+            trace_id=request.trace_id,
+            lead_id=request.lead_id,
+            status="success",
+            payload={"tool_name": tool_name, "draft_id": request.draft_id},
+        )
         self._settings.require("africastalking_username", "africastalking_api_key")
         metadata = request.metadata or {}
         decisions = self._policy_service.check_email_send(trace_id=request.trace_id, lead_id=request.lead_id)
@@ -89,6 +97,14 @@ class SMSService:
                 error_message=blocked.reason,
                 retryable=False,
                 details={"policy_type": blocked.policy_type},
+            )
+            log_trace_event(
+                event_type="tool_error",
+                trace_id=request.trace_id,
+                lead_id=request.lead_id,
+                status="failure",
+                payload={"tool_name": tool_name, "draft_id": request.draft_id},
+                error={"type": error.error_code, "message": error.error_message, "retryable": error.retryable},
             )
             log_trace_event(
                 event_type="sms_send_blocked",
@@ -139,6 +155,13 @@ class SMSService:
                         raw_response=raw_response,
                     )
                     log_trace_event(
+                        event_type="tool_end",
+                        trace_id=request.trace_id,
+                        lead_id=request.lead_id,
+                        status="success",
+                        payload={"tool_name": tool_name, "provider_message_id": provider_message_id},
+                    )
+                    log_trace_event(
                         event_type="sms_send_succeeded",
                         trace_id=request.trace_id,
                         lead_id=request.lead_id,
@@ -157,6 +180,14 @@ class SMSService:
                     error_message=f"Africa's Talking returned HTTP {response.status_code}.",
                     retryable=retryable,
                     details={"response": raw_response, "attempt": attempt},
+                )
+                log_trace_event(
+                    event_type="tool_error",
+                    trace_id=request.trace_id,
+                    lead_id=request.lead_id,
+                    status="failure",
+                    payload={"tool_name": tool_name, "draft_id": request.draft_id},
+                    error={"type": error.error_code, "message": error.error_message, "retryable": error.retryable},
                 )
                 log_trace_event(
                     event_type="sms_send_failed",
@@ -221,6 +252,14 @@ class SMSService:
 
     def _transport_error(self, request: OutboundSMSRequest, code: str, message: str) -> ProviderSendResult:
         error = ErrorEnvelope(error_code=code, error_message=message, retryable=True)
+        log_trace_event(
+            event_type="tool_error",
+            trace_id=request.trace_id,
+            lead_id=request.lead_id,
+            status="failure",
+            payload={"tool_name": "africastalking.send_sms", "draft_id": request.draft_id},
+            error={"type": error.error_code, "message": error.error_message, "retryable": error.retryable},
+        )
         log_trace_event(
             event_type="sms_send_failed",
             trace_id=request.trace_id,

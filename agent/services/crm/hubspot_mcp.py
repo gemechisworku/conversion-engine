@@ -270,6 +270,13 @@ class HubSpotMCPService:
                     operation=operation,
                     payload=payload,
                 )
+                log_trace_event(
+                    event_type="tool_start",
+                    trace_id=trace_id,
+                    lead_id=lead_id,
+                    status="success",
+                    payload={"tool_name": tool_name, "operation": operation},
+                )
                 projection_summary: dict[str, Any] | None = None
                 if operation == "append_event":
                     projection_summary = await self._apply_best_effort_event_projection(
@@ -281,6 +288,14 @@ class HubSpotMCPService:
                 raw_tool_result = await self._call_tool(name=tool_name, arguments=tool_arguments)
                 tool_error = self._tool_error_message(raw_tool_result)
                 if tool_error:
+                    log_trace_event(
+                        event_type="tool_error",
+                        trace_id=trace_id,
+                        lead_id=lead_id,
+                        status="failure",
+                        payload={"tool_name": tool_name, "operation": operation},
+                        error={"type": "MCPToolError", "message": tool_error, "retryable": False},
+                    )
                     raise _MCPCallError(
                         f"HubSpot MCP tool '{tool_name}' failed: {tool_error}",
                         retryable=False,
@@ -296,6 +311,13 @@ class HubSpotMCPService:
                     record_id=record_id,
                     event_id=event_id,
                     raw_response=raw,
+                )
+                log_trace_event(
+                    event_type="tool_end",
+                    trace_id=trace_id,
+                    lead_id=lead_id,
+                    status="success",
+                    payload={"tool_name": tool_name, "operation": operation},
                 )
                 log_trace_event(
                     event_type="crm_write_succeeded",
