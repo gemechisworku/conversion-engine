@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from agent.config.settings import Settings
 import json
@@ -12,9 +13,10 @@ import httpx
 from agent.services.enrichment.ai_maturity import score_ai_maturity, score_ai_maturity_with_llm
 from agent.services.enrichment.competitor_gap import CompetitorGapAnalyst
 from agent.services.enrichment.icp_classifier import classify_icp
-from agent.services.enrichment.llm import OpenRouterJSONClient
+from agent.services.enrichment.llm import OpenRouterJSONClient, _JSON_OUTPUT_CONSTRAINTS
 import agent.services.enrichment.competitor_gap as competitor_gap_module
 from agent.services.enrichment.schemas import EnrichmentArtifact, SignalSnapshot
+from pydantic import BaseModel
 
 
 FIXTURE_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "enrichment"
@@ -108,6 +110,54 @@ def test_ai_maturity_scoring_can_use_openrouter_json() -> None:
 
     assert score.score == 3
     assert score.confidence == 0.81
+
+
+def test_openrouter_generate_model_reinforces_constraints_after_user_json(tmp_path: Path) -> None:
+    """User message appends the same JSON/evidence rules as the system block (constraint sandwiching)."""
+
+    class _Tiny(BaseModel):
+        score: int
+
+    captured: dict[str, Any] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        captured["messages"] = body["messages"]
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": '{"score": 1}'}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    settings = Settings(
+        crunchbase_dataset_path=str(FIXTURE_DIR / "crunchbase_sample.json"),
+        openrouter_api_key="test_key",
+        openrouter_api_url="https://openrouter.test/chat/completions",
+        llm_call_log_dir=str(tmp_path / "llm_calls"),
+    )
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    llm = OpenRouterJSONClient(settings=settings, http_client=http_client)
+    out = asyncio.run(
+        llm.generate_model(
+            system_prompt="You are a unit test stub.",
+            user_payload={"k": "v"},
+            response_model=_Tiny,
+            purpose="openrouter.json.test",
+        )
+    )
+    asyncio.run(http_client.aclose())
+
+    assert isinstance(out, _Tiny)
+    msgs = captured["messages"]
+    assert msgs[0]["role"] == "system"
+    assert _JSON_OUTPUT_CONSTRAINTS in msgs[0]["content"]
+    user_text = msgs[1]["content"]
+    prefix, sep, suffix = user_text.partition("\n\n")
+    assert sep == "\n\n"
+    assert json.loads(prefix) == {"k": "v"}
+    assert suffix == _JSON_OUTPUT_CONSTRAINTS
 
 
 def test_openrouter_generate_model_writes_per_call_log_success(tmp_path: Path) -> None:

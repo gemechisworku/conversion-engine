@@ -19,6 +19,13 @@ from agent.services.observability.langfuse_llm import (
     update_langfuse_generation_success,
 )
 
+# Global + tail placement: same constraints in system and after the user JSON so
+# decode-time attention keeps JSON-only / evidence rules locally accessible (see question.md).
+_JSON_OUTPUT_CONSTRAINTS = (
+    "Return only valid JSON. Do not include markdown. "
+    "Do not invent evidence; use only supplied evidence_refs and source summaries."
+)
+
 
 class OpenRouterJSONClient:
     # Implements: FR-3, FR-4, FR-6
@@ -187,18 +194,18 @@ class OpenRouterJSONClient:
                 started_at=started_at,
             )
             return None
+        user_json = json.dumps(user_payload, default=str)
         payload = {
             "model": self._settings.openrouter_model,
             "messages": [
                 {
                     "role": "system",
-                    "content": (
-                        f"{system_prompt}\n"
-                        "Return only valid JSON. Do not include markdown. "
-                        "Do not invent evidence; use only supplied evidence_refs and source summaries."
-                    ),
+                    "content": f"{system_prompt.rstrip()}\n{_JSON_OUTPUT_CONSTRAINTS}",
                 },
-                {"role": "user", "content": json.dumps(user_payload, default=str)},
+                {
+                    "role": "user",
+                    "content": f"{user_json}\n\n{_JSON_OUTPUT_CONSTRAINTS}",
+                },
             ],
             "temperature": 0.1,
             "response_format": {"type": "json_object"},
