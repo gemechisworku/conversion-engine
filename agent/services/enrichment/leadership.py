@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 
 from agent.config.settings import Settings
+from agent.services.enrichment.event_extractor import EventExtractor
 from agent.services.enrichment.schemas import SignalSnapshot, SourceRef
 
 
@@ -21,12 +22,14 @@ class LeadershipChangeDetector:
     def __init__(self, *, settings: Settings, http_client: httpx.AsyncClient | None = None) -> None:
         self._settings = settings
         self._http_client = http_client
+        self._event_extractor = EventExtractor()
 
     async def collect(self, *, company_name: str, crunchbase_row: dict[str, Any] | None = None) -> SignalSnapshot:
         reference_now = self._reference_now()
         entries = await self._load_entries()
         if crunchbase_row is not None:
             entries = [*entries, *self._entries_from_crunchbase(row=crunchbase_row)]
+            entries = [*entries, *self._entries_from_event_extractor(row=crunchbase_row, reference_now=reference_now)]
         normalized = company_name.strip().lower()
         matched = [
             entry
@@ -59,6 +62,7 @@ class LeadershipChangeDetector:
                 "person": latest.get("person"),
                 "change_type": latest.get("change_type"),
                 "date": latest.get("change_date"),
+                "source_url": latest.get("source_url"),
                 "window_days": 90,
             },
             confidence=confidence,
@@ -113,6 +117,28 @@ class LeadershipChangeDetector:
                     "change_type": item.get("change_type") or "leadership_hire",
                     "change_date": item.get("date") or item.get("announced_on") or item.get("created_at"),
                     "source_url": row.get("url"),
+                }
+            )
+        return entries
+
+    def _entries_from_event_extractor(self, *, row: dict[str, Any], reference_now: datetime) -> list[dict[str, Any]]:
+        candidates = self._event_extractor.normalize(
+            row=row,
+            source_url=str(row.get("url") or row.get("source_url") or "") or None,
+        )
+        events = self._event_extractor.extract_leadership_events(candidates=candidates)
+        events = self._event_extractor.events_within_days(events=events, days=90, reference_now=reference_now)
+        entries: list[dict[str, Any]] = []
+        for event in events:
+            extracted = event.extracted_values
+            entries.append(
+                {
+                    "company": row.get("name") or row.get("company_name"),
+                    "role_name": extracted.get("role"),
+                    "person": extracted.get("person_name"),
+                    "change_type": event.event_type,
+                    "change_date": event.event_date,
+                    "source_url": event.source_url or row.get("url") or row.get("source_url"),
                 }
             )
         return entries

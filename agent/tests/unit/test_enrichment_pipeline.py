@@ -90,6 +90,25 @@ def test_layoffs_adapter_uses_reference_date_window() -> None:
     assert summary["matched"] is True
 
 
+def test_layoffs_adapter_marks_crunchbase_fallback_source() -> None:
+    adapter = LayoffsAdapter(settings=_settings(layoffs_csv_path="", layoffs_csv_url=""))
+    snapshot = asyncio.run(
+        adapter.collect(
+            company_name="Acme AI",
+            crunchbase_row={
+                "name": "Acme AI",
+                "url": "https://www.crunchbase.com/organization/acme-ai",
+                "layoff": '[{"key_event_date":"2026-01-15","affected_count":45,"link":"https://news.example/layoff"}]',
+            },
+        )
+    )
+    summary = snapshot.summary if isinstance(snapshot.summary, dict) else {}
+
+    assert summary["matched"] is True
+    assert summary["source_url"] == "https://news.example/layoff"
+    assert snapshot.source_refs[0].source_name == "crunchbase_fallback"
+
+
 def test_leadership_adapter_detects_change() -> None:
     adapter = LeadershipChangeDetector(settings=_settings())
     snapshot = asyncio.run(adapter.collect(company_name="Acme AI"))
@@ -166,6 +185,28 @@ def test_jobs_adapter_respects_robots_block() -> None:
     summary = snapshot.summary if isinstance(snapshot.summary, dict) else {}
 
     assert "https://acme.ai/careers" in summary["robots_blocked_urls"]
+
+
+def test_jobs_adapter_adds_linkedin_public_source_from_company_profile() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nAllow: /\n")
+        return httpx.Response(200, text="<div>Senior Software Engineer</div>", headers={"Content-Type": "text/html"})
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    collector = JobsPlaywrightCollector(settings=_settings(), http_client=http_client)
+    snapshot = asyncio.run(
+        collector.collect(
+            company_domain="acme.ai",
+            company_name="Acme AI",
+            company_profile={"social_media_links": '["https://www.linkedin.com/company/acme-ai/"]'},
+        )
+    )
+    asyncio.run(http_client.aclose())
+    summary = snapshot.summary if isinstance(snapshot.summary, dict) else {}
+    source_urls = summary.get("source_urls", [])
+
+    assert any("linkedin.com/company/acme-ai/jobs" in str(url) for url in source_urls)
 
 
 def test_crunchbase_collect_includes_recent_funding_events() -> None:
@@ -300,3 +341,33 @@ def test_crunchbase_collect_normalizes_csv_specific_core_fields() -> None:
     assert summary["funding_round"] == "Series A"
     assert summary["funding_amount_usd"] == 5000000
     assert summary["funding_total_usd"] == 7000000
+
+
+def test_crunchbase_collect_falls_back_to_news_for_recent_funding() -> None:
+    path = Path("outputs/test-fixtures/crunchbase_news_funding.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        """
+        [{
+          "id": "news_funding_co",
+          "name": "News Funding Co",
+          "website": "https://newsfund.example",
+          "news": "[{\\"date\\":\\"2025-10-20\\",\\"publisher\\":\\"PR Newswire\\",\\"title\\":\\"News Funding Co raises growth funding\\",\\"url\\":\\"https://prnewswire.example/news-funding\\"}]"
+        }]
+        """.strip(),
+        encoding="utf-8",
+    )
+    snapshot = asyncio.run(
+        CrunchbaseAdapter(
+            settings=_settings(
+                crunchbase_dataset_path=str(path),
+                enrichment_reference_date="2025-11-03T00:00:00Z",
+            )
+        ).collect(company_id="news_funding_co", company_domain="newsfund.example")
+    )
+    summary = snapshot.summary if isinstance(snapshot.summary, dict) else {}
+    events = summary.get("funding_events_180d") if isinstance(summary.get("funding_events_180d"), list) else []
+
+    assert len(events) == 1
+    assert events[0]["round"] == "press_release_funding"
+    assert events[0]["evidence_url"] == "https://prnewswire.example/news-funding"

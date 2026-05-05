@@ -4,6 +4,7 @@ from .act2_pipeline import ActIIEnrichmentPipeline
 from .artifact_writer import EnrichmentArtifactWriter
 from .cfpb import CFPBComplaintAdapter
 from .crunchbase import CrunchbaseAdapter
+from .event_extractor import EventExtractor
 from .jobs_playwright import JobsPlaywrightCollector
 from .layoffs import LayoffsAdapter
 from .leadership import LeadershipChangeDetector
@@ -17,6 +18,7 @@ __all__ = [
     "EnrichmentArtifactWriter",
     "CFPBComplaintAdapter",
     "CrunchbaseAdapter",
+    "EventExtractor",
     "JobsPlaywrightCollector",
     "LayoffsAdapter",
     "LeadershipChangeDetector",

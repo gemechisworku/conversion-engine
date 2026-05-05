@@ -82,7 +82,7 @@ async def enrich_company(
         "enrichment.job_posts",
         "enrichment.jobs.collect",
         "Collect public job-post signals",
-        jobs.collect(company_domain=company_domain, company_name=company_name),
+        jobs.collect(company_domain=company_domain, company_name=company_name, company_profile=crunchbase_row),
     )
     layoffs_signal = await _step(
         "enrichment.layoffs",

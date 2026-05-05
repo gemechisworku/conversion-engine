@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 from uuid import uuid4
 
@@ -101,7 +102,7 @@ def score_ai_maturity(*, company_id: str, artifact: EnrichmentArtifact) -> AIMat
         )
 
     tech_stack = [str(item).lower() for item in _as_list(crunchbase_summary.get("tech_stack"))]
-    ai_tech = [item for item in tech_stack if any(token in item for token in ("openai", "machine learning", "ml", "ai", "tensorflow", "pytorch", "databricks"))]
+    ai_tech = [item for item in tech_stack if _looks_like_ai_tech(item)]
     if ai_tech:
         numeric_score += 1.0
         signals.append(
@@ -110,6 +111,45 @@ def score_ai_maturity(*, company_id: str, artifact: EnrichmentArtifact) -> AIMat
                 weight="high",
                 summary=f"Public technology profile includes AI/data tooling: {', '.join(ai_tech[:3])}.",
                 evidence_refs=["crunchbase_signal"],
+            )
+        )
+        evidential_confidences.append(float(artifact.signals["crunchbase"].confidence))
+
+    github_url = _as_str(crunchbase_summary.get("github_org_url"))
+    if github_url:
+        numeric_score += 0.35
+        signals.append(
+            WeightedSignal(
+                signal_type="github_org_presence",
+                weight="medium",
+                summary="Public GitHub organization/reference is available.",
+                evidence_refs=[github_url],
+            )
+        )
+        evidential_confidences.append(float(artifact.signals["crunchbase"].confidence))
+
+    press_urls = [str(url).strip() for url in _as_list(crunchbase_summary.get("press_release_urls")) if str(url).strip()]
+    if press_urls:
+        numeric_score += 0.35
+        signals.append(
+            WeightedSignal(
+                signal_type="press_or_blog_ai_signal",
+                weight="medium",
+                summary=f"Public press/blog references found ({len(press_urls)}).",
+                evidence_refs=press_urls[:3],
+            )
+        )
+        evidential_confidences.append(float(artifact.signals["crunchbase"].confidence))
+
+    leadership_events = _as_list(crunchbase_summary.get("leadership_hire"))
+    if any(_looks_like_exec_talk_or_ai_leader(event) for event in leadership_events):
+        numeric_score += 0.35
+        signals.append(
+            WeightedSignal(
+                signal_type="executive_ai_signal",
+                weight="medium",
+                summary="Leadership/public executive activity indicates AI or technology emphasis.",
+                evidence_refs=["leadership_signal"],
             )
         )
         evidential_confidences.append(float(artifact.signals["crunchbase"].confidence))
@@ -201,6 +241,41 @@ def _as_str(value: Any) -> str:
 
 def _as_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else []
+
+
+def _looks_like_ai_tech(value: str) -> bool:
+    text = value.lower().strip()
+    if not text:
+        return False
+    patterns = (
+        r"\bopenai\b",
+        r"\banthropic\b",
+        r"\bmachine learning\b",
+        r"\bartificial intelligence\b",
+        r"\bmlops\b",
+        r"\bllm\b",
+        r"\btensorflow\b",
+        r"\bpytorch\b",
+        r"\bdatabricks\b",
+        r"\bvertex ai\b",
+        r"\bbedrock\b",
+        r"\bsnowflake\b",
+    )
+    if any(re.search(pattern, text) for pattern in patterns):
+        return True
+    return bool(re.search(r"\bai\b", text) and any(token in text for token in ("platform", "model", "assistant", "agent")))
+
+
+def _looks_like_exec_talk_or_ai_leader(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    blob = " ".join(
+        str(value.get(key) or "")
+        for key in ("label", "title", "role_name", "person")
+    ).lower()
+    if not blob.strip():
+        return False
+    return any(token in blob for token in ("ai", "machine learning", "chief ai", "cto", "technology officer"))
 
 
 def _confidence(*, evidential_confidences: list[float], signal_count: int) -> float:

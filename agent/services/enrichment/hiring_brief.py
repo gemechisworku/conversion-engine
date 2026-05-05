@@ -147,25 +147,27 @@ def _funding_signal_entry(*, artifact: EnrichmentArtifact) -> SignalBriefEntry:
         detail = round_name or "recent funding"
         if announced_on:
             detail = f"{detail} ({announced_on})"
+        refs = _funding_evidence_refs(artifact=artifact, event=first)
         return SignalBriefEntry(
             present=True,
             summary=f"{len(events)} funding event(s) detected in the configured window; latest: {detail}.",
             confidence=float(snapshot.confidence),
-            evidence_refs=["crunchbase_signal"],
+            evidence_refs=refs,
         )
     funding_round = str(summary.get("funding_round") or "").strip()
     if funding_round:
+        refs = _source_urls(artifact=artifact, key="crunchbase")
         return SignalBriefEntry(
             present=True,
             summary=f"Funding round signal detected: {funding_round}.",
             confidence=float(snapshot.confidence),
-            evidence_refs=["crunchbase_signal"],
+            evidence_refs=refs or ["crunchbase_signal"],
         )
     return SignalBriefEntry(
         present=False,
         summary="No strong public funding signal found in the configured recency window.",
         confidence=float(snapshot.confidence),
-        evidence_refs=["crunchbase_signal"],
+        evidence_refs=_source_urls(artifact=artifact, key="crunchbase") or ["crunchbase_signal"],
     )
 
 
@@ -181,11 +183,15 @@ def _signal_entry(*, artifact: EnrichmentArtifact, key: str, summary_key: str) -
     text = str(value or "No strong public signal found.")
     if present and not value:
         text = "Public signal detected in available evidence."
+    refs = _source_urls(artifact=artifact, key=key)
+    source_url = str(summary.get("source_url") or "").strip()
+    if source_url and source_url not in refs:
+        refs = [source_url, *refs]
     return SignalBriefEntry(
         present=present,
         summary=text,
         confidence=float(snapshot.confidence),
-        evidence_refs=[f"{key}_signal"],
+        evidence_refs=refs or [f"{key}_signal"],
     )
 
 
@@ -198,11 +204,12 @@ def _job_signal_entry(*, artifact: EnrichmentArtifact) -> SignalBriefEntry:
     ai_adjacent = int(summary.get("ai_adjacent_role_count") or 0)
     present = engineering > 0
     text = f"{engineering} engineering roles, {ai_adjacent} AI-adjacent roles observed."
+    refs = _source_urls(artifact=artifact, key="job_posts")
     return SignalBriefEntry(
         present=present,
         summary=text,
         confidence=float(snapshot.confidence),
-        evidence_refs=["job_posts_signal"],
+        evidence_refs=refs or ["job_posts_signal"],
     )
 
 
@@ -220,8 +227,28 @@ def _tech_stack_entry(*, artifact: EnrichmentArtifact) -> SignalBriefEntry:
         present=present,
         summary=summary,
         confidence=confidence,
-        evidence_refs=["tech_stack_signal"] if present else [],
+        evidence_refs=_source_urls(artifact=artifact, key="tech_stack") if present else [],
     )
+
+
+def _source_urls(*, artifact: EnrichmentArtifact, key: str) -> list[str]:
+    snapshot = artifact.signals.get(key)
+    if snapshot is None:
+        return []
+    refs: list[str] = []
+    for source in snapshot.source_refs:
+        url = str(source.source_url or "").strip()
+        if url and url not in refs:
+            refs.append(url)
+    return refs
+
+
+def _funding_evidence_refs(*, artifact: EnrichmentArtifact, event: dict[str, Any]) -> list[str]:
+    refs = _source_urls(artifact=artifact, key="crunchbase")
+    evidence_url = str(event.get("evidence_url") or "").strip()
+    if evidence_url and evidence_url not in refs:
+        refs.insert(0, evidence_url)
+    return refs or ["crunchbase_signal"]
 
 
 def _required_skills(*, artifact: EnrichmentArtifact) -> list[str]:

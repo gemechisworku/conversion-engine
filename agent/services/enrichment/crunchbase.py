@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 import httpx
 
 from agent.config.settings import Settings
+from agent.services.enrichment.event_extractor import EventExtractor
 from agent.services.enrichment.schemas import EnrichmentBrief, Firmographics, SignalSnapshot, SourceRef
 
 DEFAULT_CRUNCHBASE_DATASET_PATH = "tenacious_sales_data/crunchbase-companies-information.csv"
@@ -30,6 +31,7 @@ class CrunchbaseAdapter:
     ) -> None:
         self._settings = settings
         self._http_client = http_client
+        self._event_extractor = EventExtractor()
 
     async def collect(self, *, company_id: str, company_domain: str | None = None) -> SignalSnapshot:
         record = await self._load_record(company_id=company_id, company_domain=company_domain)
@@ -44,22 +46,29 @@ class CrunchbaseAdapter:
         record_id = str(record.get("company_id") or record.get("id") or "").strip()
         confidence = 0.95 if record_id == company_id else 0.8
         reference_now = self._reference_now()
-        funding_events_180d = self._funding_events(
-            row=record,
-            lookback_days=180,
+        crunchbase_url = self._clean_text(record.get("url")) or self._clean_text(record.get("source_url"))
+        normalized_candidates = self._event_extractor.normalize(row=record, source_url=crunchbase_url or None)
+        funding_event_records = self._event_extractor.extract_funding_events(candidates=normalized_candidates)
+        funding_event_records = self._event_extractor.events_within_days(
+            events=funding_event_records,
+            days=180,
             reference_now=reference_now,
         )
+        funding_events_180d = [self._to_funding_summary_event(item) for item in funding_event_records]
         funding_round = self._funding_round(row=record, events=funding_events_180d)
         funding_amount_usd = self._funding_amount_usd(row=record, events=funding_events_180d)
         funding_date = self._funding_date(row=record, events=funding_events_180d)
         funding_total_usd = self._funding_total_usd(row=record)
+        source_url = crunchbase_url or self._settings.crunchbase_dataset_url or self._dataset_ref() or ""
+        social_links = self._social_links(record)
+        news_items = self._news_items(record)
         return SignalSnapshot(
             summary={
                 "company_id": record.get("company_id") or company_id,
                 "company_name": self._company_name(record),
                 "domain": self._domain(record),
-                "source_url": self._clean_text(record.get("source_url")) or self._clean_text(record.get("url")),
-                "crunchbase_url": self._clean_text(record.get("url")) or self._clean_text(record.get("source_url")),
+                "source_url": source_url,
+                "crunchbase_url": crunchbase_url,
                 "industry": self._industry(record),
                 "industries": self._industry_values(record),
                 "country_code": self._clean_text(record.get("country_code")),
@@ -69,23 +78,29 @@ class CrunchbaseAdapter:
                 "description": self._description(record),
                 "founded_date": self._clean_text(record.get("founded_date")),
                 "operating_status": self._clean_text(record.get("operating_status")),
+                "data_timestamp": self._clean_text(record.get("timestamp")),
                 "funding_round": funding_round,
                 "funding_amount_usd": funding_amount_usd,
                 "funding_total_usd": funding_total_usd,
                 "funding_date": funding_date,
                 "funding_events_180d": funding_events_180d,
+                "funding_event_candidates": [self._to_event_payload(item) for item in funding_event_records[:20]],
+                "press_release_urls": self._press_release_urls(news_items),
                 "location": self._location_text(record),
                 "employee_count": record.get("num_employees"),
                 "tech_stack": self._tech_stack(row=record),
                 "leadership_hire": self._jsonish(record.get("leadership_hire")),
                 "layoff": self._jsonish(record.get("layoff")),
-                "news": self._jsonish(record.get("news")),
+                "news": news_items,
+                "social_media_links": social_links,
+                "linkedin_company_url": self._linkedin_company_url(social_links),
+                "github_org_url": self._github_org_url(social_links),
             },
             confidence=confidence,
             source_refs=[
                 SourceRef(
                     source_name="crunchbase",
-                    source_url=str(record.get("source_url") or self._settings.crunchbase_dataset_url or ""),
+                    source_url=source_url or None,
                 )
             ],
         )
@@ -331,7 +346,7 @@ class CrunchbaseAdapter:
 
     @staticmethod
     def _company_name(row: dict[str, Any]) -> str:
-        return CrunchbaseAdapter._clean_text(row.get("company_name") or row.get("name"))
+        return CrunchbaseAdapter._clean_text(row.get("company_name") or row.get("name") or row.get("legal_name"))
 
     @staticmethod
     def _domain(row: dict[str, Any]) -> str:
@@ -443,9 +458,73 @@ class CrunchbaseAdapter:
                     "announced_on": event_date.date().isoformat(),
                     "amount_usd": cls._nested_amount_usd(item),
                     "evidence_ref": "crunchbase_signal",
+                    "evidence_url": cls._clean_text(item.get("url") or item.get("link")),
                 }
             )
+        if not events:
+            events = cls._funding_events_from_news(row=row, lookback_days=lookback_days, reference_now=reference_now)
         events.sort(key=lambda item: str(item.get("announced_on") or ""), reverse=True)
+        return events
+
+    @staticmethod
+    def _to_funding_summary_event(event: Any) -> dict[str, Any]:
+        extracted = event.extracted_values if hasattr(event, "extracted_values") else {}
+        return {
+            "round": getattr(event, "event_type", None),
+            "announced_on": getattr(event, "event_date", None),
+            "amount_usd": extracted.get("amount"),
+            "evidence_ref": "crunchbase_signal",
+            "evidence_url": getattr(event, "source_url", None) or "",
+            "confidence": getattr(event, "confidence", None),
+            "source_strength": getattr(event, "source_strength", None),
+            "event_category": getattr(event, "event_category", None),
+            "evidence_fields": list(getattr(event, "evidence_fields", []) or []),
+        }
+
+    @staticmethod
+    def _to_event_payload(event: Any) -> dict[str, Any]:
+        return {
+            "event_category": getattr(event, "event_category", None),
+            "event_type": getattr(event, "event_type", None),
+            "event_date": getattr(event, "event_date", None),
+            "confidence": getattr(event, "confidence", None),
+            "evidence_fields": list(getattr(event, "evidence_fields", []) or []),
+            "raw_supporting_text": getattr(event, "raw_supporting_text", "")[:240],
+            "extracted_values": dict(getattr(event, "extracted_values", {}) or {}),
+            "source_strength": getattr(event, "source_strength", None),
+            "source_url": getattr(event, "source_url", None),
+        }
+
+    @classmethod
+    def _funding_events_from_news(
+        cls,
+        *,
+        row: dict[str, Any],
+        lookback_days: int,
+        reference_now: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        keywords = ("funding", "raises", "raised", "series a", "series b", "seed round", "venture")
+        now = reference_now or datetime.now(UTC)
+        cutoff = now - timedelta(days=lookback_days)
+        events: list[dict[str, Any]] = []
+        for item in cls._news_items(row):
+            if not isinstance(item, dict):
+                continue
+            title = cls._clean_text(item.get("title")).lower()
+            if not title or not any(keyword in title for keyword in keywords):
+                continue
+            published_on = cls._parse_dt(cls._clean_text(item.get("date") or item.get("published_at")))
+            if published_on is None or published_on < cutoff:
+                continue
+            events.append(
+                {
+                    "round": "press_release_funding",
+                    "announced_on": published_on.date().isoformat(),
+                    "amount_usd": None,
+                    "evidence_ref": "crunchbase_signal",
+                    "evidence_url": cls._clean_text(item.get("url")),
+                }
+            )
         return events
 
     @staticmethod
@@ -577,7 +656,7 @@ class CrunchbaseAdapter:
         if isinstance(parsed, list):
             for item in parsed:
                 if isinstance(item, dict):
-                    name = cls._clean_text(item.get("name") or item.get("value"))
+                    name = cls._clean_text(item.get("name") or item.get("title") or item.get("value"))
                 else:
                     name = cls._clean_text(item)
                 if name and name not in values:
@@ -588,6 +667,63 @@ class CrunchbaseAdapter:
                 if value and name and name not in values:
                     values.append(name)
         return values[:25]
+
+    @classmethod
+    def _news_items(cls, row: dict[str, Any]) -> list[dict[str, Any]]:
+        parsed = cls._jsonish(row.get("news"))
+        if not isinstance(parsed, list):
+            return []
+        cleaned: list[dict[str, Any]] = []
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            url = cls._clean_text(item.get("url"))
+            title = cls._clean_text(item.get("title"))
+            date = cls._clean_text(item.get("date") or item.get("published_at"))
+            publisher = cls._clean_text(item.get("publisher"))
+            cleaned.append({"url": url, "title": title, "date": date, "publisher": publisher})
+        return cleaned
+
+    @classmethod
+    def _social_links(cls, row: dict[str, Any]) -> list[str]:
+        raw = row.get("social_media_links")
+        parsed = cls._jsonish(raw)
+        if not isinstance(parsed, list):
+            return []
+        links: list[str] = []
+        for item in parsed:
+            link = cls._clean_text(item)
+            if link and link not in links:
+                links.append(link)
+        return links
+
+    @classmethod
+    def _linkedin_company_url(cls, links: list[str]) -> str | None:
+        for link in links:
+            if "linkedin.com/company/" in link.lower():
+                return link
+        return None
+
+    @classmethod
+    def _github_org_url(cls, links: list[str]) -> str | None:
+        for link in links:
+            if "github.com/" in link.lower():
+                return link
+        return None
+
+    @classmethod
+    def _press_release_urls(cls, news_items: list[dict[str, Any]]) -> list[str]:
+        press_tokens = ("prnewswire", "press release", "businesswire", "globenewswire")
+        urls: list[str] = []
+        for item in news_items:
+            title = cls._clean_text(item.get("title")).lower()
+            publisher = cls._clean_text(item.get("publisher")).lower()
+            url = cls._clean_text(item.get("url"))
+            if not url:
+                continue
+            if any(token in title or token in publisher or token in url.lower() for token in press_tokens):
+                urls.append(url)
+        return urls[:10]
 
     @staticmethod
     def _digits(value: str) -> str:

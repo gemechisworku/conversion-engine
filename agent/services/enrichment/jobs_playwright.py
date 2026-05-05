@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import sys
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 from urllib.robotparser import RobotFileParser
 from datetime import UTC, datetime
 from typing import Any
@@ -74,21 +75,18 @@ class JobsPlaywrightCollector:
         self._playwright_attempt_lock = asyncio.Lock()
         self._subprocess_supported: bool | None = None
 
-    async def collect(self, *, company_domain: str, company_name: str | None = None) -> SignalSnapshot:
-        slug = self._slug(company_name or company_domain)
-        urls = [
-            f"https://{company_domain}/careers",
-            f"https://{company_domain}/jobs",
-            f"https://{company_domain}/careers/jobs",
-            f"https://{company_domain}/about/careers",
-        ]
-        if slug and len(slug) >= 4:
-            urls.extend(
-                [
-                    f"https://builtin.com/company/{slug}/jobs",
-                    f"https://wellfound.com/company/{slug}/jobs",
-                ]
-            )
+    async def collect(
+        self,
+        *,
+        company_domain: str,
+        company_name: str | None = None,
+        company_profile: dict[str, Any] | None = None,
+    ) -> SignalSnapshot:
+        urls = self._candidate_urls(
+            company_domain=company_domain,
+            company_name=company_name,
+            company_profile=company_profile,
+        )
         html_pages: list[tuple[str, str]] = []
         blocked_urls: list[str] = []
         per_request_timeout = min(float(self._settings.http_timeout_seconds), MAX_JOB_SOURCE_TIMEOUT_SECONDS)
@@ -132,7 +130,10 @@ class JobsPlaywrightCollector:
                     "window_days": 60,
                 },
                 confidence=0.35 if blocked_urls else 0.3,
-                source_refs=[SourceRef(source_name="jobs_playwright", source_url=url) for url in urls],
+                source_refs=[
+                    SourceRef(source_name=self._source_name_for_url(url), source_url=url)
+                    for url in urls
+                ],
             )
 
         role_titles = self._extract_role_titles([html for _, html in html_pages])
@@ -150,7 +151,10 @@ class JobsPlaywrightCollector:
                 "window_days": 60,
             },
             confidence=confidence,
-            source_refs=[SourceRef(source_name="jobs_playwright", source_url=url) for url, _ in html_pages],
+            source_refs=[
+                SourceRef(source_name=self._source_name_for_url(url), source_url=url)
+                for url, _ in html_pages
+            ],
         )
 
     async def _fetch_html(
@@ -328,3 +332,83 @@ class JobsPlaywrightCollector:
         parsed = urlparse(value if "://" in value else f"https://{value}")
         base = (parsed.netloc or parsed.path).removeprefix("www.").split(".")[0]
         return re.sub(r"[^a-z0-9]+", "-", base.lower()).strip("-") or "company"
+
+    def _candidate_urls(
+        self,
+        *,
+        company_domain: str,
+        company_name: str | None,
+        company_profile: dict[str, Any] | None,
+    ) -> list[str]:
+        slug = self._slug(company_name or company_domain)
+        urls = [
+            f"https://{company_domain}/careers",
+            f"https://{company_domain}/jobs",
+            f"https://{company_domain}/careers/jobs",
+            f"https://{company_domain}/about/careers",
+            f"https://www.linkedin.com/company/{slug}/jobs/",
+            f"https://www.linkedin.com/jobs/search/?keywords={quote_plus(company_name or slug)}",
+        ]
+        if slug and len(slug) >= 4:
+            urls.extend(
+                [
+                    f"https://builtin.com/company/{slug}/jobs",
+                    f"https://wellfound.com/company/{slug}/jobs",
+                ]
+            )
+        urls.extend(self._urls_from_company_profile(company_profile=company_profile))
+        return self._dedupe_urls(urls)
+
+    @staticmethod
+    def _urls_from_company_profile(*, company_profile: dict[str, Any] | None) -> list[str]:
+        if not company_profile:
+            return []
+        raw_links = company_profile.get("social_media_links")
+        parsed_links: list[str] = []
+        if isinstance(raw_links, list):
+            parsed_links = [str(item).strip() for item in raw_links if str(item).strip()]
+        elif isinstance(raw_links, str) and raw_links.strip():
+            try:
+                loaded = json.loads(raw_links)
+            except ValueError:
+                loaded = []
+            if isinstance(loaded, list):
+                parsed_links = [str(item).strip() for item in loaded if str(item).strip()]
+
+        results: list[str] = []
+        for link in parsed_links:
+            parsed = urlparse(link)
+            if "linkedin.com" not in parsed.netloc.lower():
+                continue
+            path = parsed.path.strip("/")
+            if not path.startswith("company/"):
+                continue
+            parts = [part for part in path.split("/") if part]
+            if len(parts) < 2:
+                continue
+            company_slug = parts[1]
+            results.append(f"https://www.linkedin.com/company/{company_slug}/jobs/")
+        return results
+
+    @staticmethod
+    def _source_name_for_url(url: str) -> str:
+        host = urlparse(url).netloc.lower()
+        if "linkedin.com" in host:
+            return "jobs_linkedin_public"
+        if "builtin.com" in host:
+            return "jobs_builtin_public"
+        if "wellfound.com" in host:
+            return "jobs_wellfound_public"
+        return "jobs_company_site"
+
+    @staticmethod
+    def _dedupe_urls(urls: list[str]) -> list[str]:
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for url in urls:
+            normalized = url.strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            ordered.append(normalized)
+        return ordered

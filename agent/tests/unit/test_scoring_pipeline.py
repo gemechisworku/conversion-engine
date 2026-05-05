@@ -187,6 +187,30 @@ def test_icp_classifier_output() -> None:
     assert 0 <= classification.confidence <= 1
 
 
+def test_ai_maturity_ignores_non_ai_tech_noise() -> None:
+    artifact = EnrichmentArtifact(
+        company_id="noise_co",
+        generated_at=datetime.now(UTC),
+        signals={
+            "crunchbase": SignalSnapshot(
+                summary={
+                    "tech_stack": ["Domain Not Resolving", "WordPress", "Cloudflare Hosting"],
+                    "news": [],
+                    "funding_round": None,
+                },
+                confidence=0.9,
+            ),
+            "job_posts": SignalSnapshot(summary={"engineering_role_count": 0, "ai_adjacent_role_count": 0}, confidence=0.5),
+            "layoffs": SignalSnapshot(summary={"matched": False}, confidence=0.5),
+            "leadership_changes": SignalSnapshot(summary={"matched": False}, confidence=0.5),
+        },
+        merged_confidence={},
+    )
+    score = score_ai_maturity(company_id="noise_co", artifact=artifact)
+
+    assert all(signal.signal_type != "public_ai_or_data_stack" for signal in score.signals)
+
+
 def test_competitor_gap_brief_generation() -> None:
     artifact = _artifact()
     score = score_ai_maturity(company_id="comp_123", artifact=artifact)
