@@ -1,0 +1,5 @@
+# Grounding commit
+
+**Artifact:** [`agent/services/enrichment/llm.py`](agent/services/enrichment/llm.py) — `OpenRouterJSONClient.generate_model` (and tests in [`agent/tests/unit/test_scoring_pipeline.py`](agent/tests/unit/test_scoring_pipeline.py), `test_openrouter_generate_model_reinforces_constraints_after_user_json`).
+
+The edit introduces a single shared constant for the global JSON and evidence rules, keeps those rules on the system message as before, and **appends the same text after the serialized user JSON** in the user message (`user_json` + blank line + constraints). That implements the “constraint sandwiching” described in [`fix_prompt_structure.md`](fix_prompt_structure.md) and motivated by [`question.md`](question.md): long user JSON can dilute late-in-context instructions during decode, so repeating the compact “valid JSON only / no markdown / don’t invent evidence” block immediately before the model starts generating the assistant reply makes those constraints both globally visible (system) and locally retrievable (tail of user), at the cost of a small increase in prompt tokens.

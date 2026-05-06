@@ -48,6 +48,18 @@ class InboundEmailInterpretLLM(BaseModel):
             "CONVERSATION_THREAD or the latest inbound, copy it verbatim here; otherwise null."
         ),
     )
+    has_clarification_request: bool = Field(
+        default=False,
+        description="True if the prospect asks a substantive question (product, scope, onboarding, etc.).",
+    )
+    scheduling_completeness: Literal["executable", "accepted_incomplete", "not_applicable"] = Field(
+        default="not_applicable",
+        description=(
+            "When scheduling is in play: executable = concrete day/time (or equivalent) to book; "
+            "accepted_incomplete = positive toward meeting but missing required slot fields; "
+            "not_applicable = no scheduling intent."
+        ),
+    )
 
 
 async def draft_first_touch_email_with_llm(
@@ -159,6 +171,15 @@ async def interpret_inbound_email_and_draft_reply(
             "nurture",
             "escalate",
         ],
+        "OUTPUT_EXTRA_FIELDS": {
+            "has_clarification_request": "boolean — true if they ask any substantive question (scope, onboarding, pricing mechanism, etc.).",
+            "scheduling_completeness": (
+                "one of: executable | accepted_incomplete | not_applicable. "
+                "Use executable only when day+time window (or equivalent) is explicit enough for a human to book without guessing. "
+                "Use accepted_incomplete when they agree to meet or propose a vague window (e.g. 'next week') without executable details. "
+                "Use not_applicable when next_best_action is not schedule."
+            ),
+        },
     }
     return await llm.generate_model(
         system_prompt=(
@@ -168,6 +189,9 @@ async def interpret_inbound_email_and_draft_reply(
             "or timezone in an earlier message or the latest inbound, you MUST reflect it in meeting_time_from_thread "
             "and in suggested_reply_body when next_best_action is schedule (confirm that exact preference; do not invent a different slot). "
             "Classify intent conservatively from the latest inbound in light of the thread. "
+            "Set has_clarification_request true whenever they ask a substantive question, even if they also accept a meeting. "
+            "Set scheduling_completeness to executable only when booking fields are concrete; if they are positive but vague "
+            "(e.g. 'next week', 'soon') use accepted_incomplete. If there is no scheduling angle, use not_applicable. "
             "Map intent to next_best_action: "
             "schedule->schedule, interest->qualify, clarification->clarify, objection->handle_objection, "
             "decline->nurture, unclear->clarify. "

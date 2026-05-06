@@ -1,4 +1,4 @@
-"""LangGraph: inbound reply -> intent -> optional email LLM -> routed session stage."""
+"""LangGraph: inbound reply -> intent -> optional email LLM -> boundary ratify -> routed session stage."""
 
 from __future__ import annotations
 
@@ -10,7 +10,9 @@ from langgraph.graph import END, StateGraph
 from agent.config.settings import Settings
 from agent.graphs.reply_routing import (
     classify_intent_from_text,
+    default_branch_playbook,
     next_action_for_intent,
+    ratify_reply_route,
     session_stage_for_next_action,
 )
 from agent.repositories.state_repo import SQLiteStateRepository
@@ -38,6 +40,8 @@ class ReplyRouteGraphState(TypedDict, total=False):
     email_interp: dict[str, Any] | None
     reply_branch: str
     branch_pending: list[dict[str, Any]]
+    routing_flags: dict[str, Any]
+    playbook_override: dict[str, Any] | None
 
 
 @dataclass
@@ -45,6 +49,17 @@ class ReplyRouteGraphDeps:
     settings: Settings
     llm: OpenRouterJSONClient | None
     state_repo: SQLiteStateRepository
+
+
+def _combined_reply_text(state: ReplyRouteGraphState) -> str:
+    parts: list[str] = []
+    transcript = (state.get("conversation_transcript") or "").strip()
+    if transcript:
+        parts.append(transcript)
+    body = (state.get("content") or "").strip()
+    if body:
+        parts.append(body)
+    return "\n\n".join(parts) if parts else ""
 
 
 def compile_reply_route_graph(deps: ReplyRouteGraphDeps):
@@ -58,14 +73,7 @@ def compile_reply_route_graph(deps: ReplyRouteGraphDeps):
             lead_id=state.get("lead_id"),
             input_data=dict(state),
         )
-        parts: list[str] = []
-        transcript = (state.get("conversation_transcript") or "").strip()
-        if transcript:
-            parts.append(transcript)
-        body = (state.get("content") or "").strip()
-        if body:
-            parts.append(body)
-        combined = "\n\n".join(parts) if parts else ""
+        combined = _combined_reply_text(state)
         intent = classify_intent_from_text(combined)
         next_action = next_action_for_intent(intent)
         log_processing_step(
@@ -195,6 +203,53 @@ def compile_reply_route_graph(deps: ReplyRouteGraphDeps):
             )
             raise
 
+    def ratify_reply_boundary(state: ReplyRouteGraphState) -> dict[str, Any]:
+        node_run = log_node_start(
+            trace_id=state.get("trace_id"),
+            graph_name="graphs.reply_route",
+            node_name="ratify_reply_boundary",
+            lead_id=state.get("lead_id"),
+            input_data=dict(state),
+        )
+        combined = _combined_reply_text(state)
+        raw_interp = state.get("email_interp")
+        interp: dict[str, Any] | None = raw_interp if isinstance(raw_interp, dict) and raw_interp else None
+        intent = str(state.get("intent") or "unclear")
+        next_action = str(state.get("next_action") or "clarify")
+        ratified, flags, override = ratify_reply_route(
+            combined_text=combined,
+            intent=intent,
+            next_action=next_action,
+            email_interp=interp,
+        )
+        log_processing_step(
+            component="graphs.reply_route",
+            step="ratify.reply_boundary",
+            message="Scaffolding ratification for reply route",
+            lead_id=state.get("lead_id"),
+            trace_id=state.get("trace_id"),
+            ratified_next_action=ratified,
+            ratified=bool(flags.get("ratified")),
+            reason=flags.get("reason"),
+        )
+        out: dict[str, Any] = {
+            "next_action": ratified,
+            "routing_flags": flags,
+        }
+        if override is not None:
+            branch, pending = override
+            out["playbook_override"] = {"reply_branch": branch, "branch_pending": pending}
+        log_node_end(
+            trace_id=state.get("trace_id"),
+            run_id=node_run,
+            graph_name="graphs.reply_route",
+            node_name="ratify_reply_boundary",
+            lead_id=state.get("lead_id"),
+            output_data=out,
+            status="success",
+        )
+        return out
+
     def route_session_stage(state: ReplyRouteGraphState) -> dict[str, Any]:
         node_run = log_node_start(
             trace_id=state.get("trace_id"),
@@ -227,30 +282,12 @@ def compile_reply_route_graph(deps: ReplyRouteGraphDeps):
             input_data=dict(state),
         )
         na = state.get("next_action") or "clarify"
-        playbooks: dict[str, tuple[str, list[dict[str, Any]]]] = {
-            "schedule": (
-                "schedule",
-                [{"action_type": "delegate_scheduler", "status": "pending", "branch": "schedule"}],
-            ),
-            "qualify": (
-                "interest",
-                [{"action_type": "continue_qualification", "status": "pending", "branch": "interest"}],
-            ),
-            "clarify": (
-                "clarify",
-                [{"action_type": "answer_clarification", "status": "pending", "branch": "clarify"}],
-            ),
-            "handle_objection": (
-                "objection",
-                [{"action_type": "handle_objection", "status": "pending", "branch": "objection"}],
-            ),
-            "nurture": ("decline", [{"action_type": "nurture", "status": "pending", "branch": "decline"}]),
-            "escalate": (
-                "escalate",
-                [{"action_type": "escalate", "status": "pending", "branch": "escalate"}],
-            ),
-        }
-        branch, pending = playbooks.get(na, playbooks["clarify"])
+        override = state.get("playbook_override")
+        if isinstance(override, dict) and override.get("branch_pending"):
+            branch = str(override.get("reply_branch") or "clarify")
+            pending = list(override.get("branch_pending") or [])
+        else:
+            branch, pending = default_branch_playbook(na)
         log_processing_step(
             component="graphs.reply_route",
             step="branch.playbook",
@@ -274,12 +311,13 @@ def compile_reply_route_graph(deps: ReplyRouteGraphDeps):
 
     graph.add_node("classify_heuristic", classify_heuristic)
     graph.add_node("refine_email_llm", refine_email_llm)
+    graph.add_node("ratify_reply_boundary", ratify_reply_boundary)
     graph.add_node("route_session_stage", route_session_stage)
     graph.add_node("emit_branch_playbook", emit_branch_playbook)
     graph.set_entry_point("classify_heuristic")
     graph.add_edge("classify_heuristic", "refine_email_llm")
-    graph.add_edge("refine_email_llm", "route_session_stage")
+    graph.add_edge("refine_email_llm", "ratify_reply_boundary")
+    graph.add_edge("ratify_reply_boundary", "route_session_stage")
     graph.add_edge("route_session_stage", "emit_branch_playbook")
     graph.add_edge("emit_branch_playbook", END)
     return graph.compile()
-

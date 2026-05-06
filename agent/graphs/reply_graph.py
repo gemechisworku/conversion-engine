@@ -5,6 +5,7 @@ from __future__ import annotations
 from agent.graphs.reply_routing import (
     classify_intent_from_text,
     next_action_for_intent,
+    ratify_reply_route,
     session_stage_for_next_action,
 )
 from agent.graphs.state import ReplyGraphState
@@ -36,14 +37,21 @@ def run_reply_handling(
         text = _inbound_text(inbound_event)
         intent = classify_intent_from_text(text)
         next_action = next_action_for_intent(intent)
-        next_session = session_stage_for_next_action(next_action)
+        ratified, routing_flags, _ = ratify_reply_route(
+            combined_text=text,
+            intent=intent,
+            next_action=next_action,
+            email_interp=None,
+        )
+        next_session = session_stage_for_next_action(ratified)
         pending.append(
             {
                 "action_type": "classify_intent",
                 "status": "done",
                 "intent": intent,
-                "next_action": next_action,
+                "next_action": ratified,
                 "next_session_stage_hint": next_session,
+                "routing_flags": routing_flags,
             }
         )
     return state.model_copy(
